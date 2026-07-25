@@ -1,0 +1,37 @@
+# Acceptance-only overlay for stopping the deterministic slot-zero consolidation-intent proposer.
+# Both controls are required: the bootstrap gate stops all BA traffic before proposal/prevote/
+# precommit, while the ordinary consolidation gate holds the replacement certificate before any
+# FROST nonce is created so the stopped proposer can restart and catch up safely.
+services:
+  p1:
+    environment:
+      TM_ACCEPTANCE_ENABLE_CONSOLIDATION_BOOTSTRAP_GATE: "1"
+      TM_ACCEPTANCE_ENABLE_CONSOLIDATION_GATE: "1"
+  p2:
+    environment:
+      TM_ACCEPTANCE_ENABLE_CONSOLIDATION_BOOTSTRAP_GATE: "1"
+      TM_ACCEPTANCE_ENABLE_CONSOLIDATION_GATE: "1"
+  p3:
+    environment:
+      TM_ACCEPTANCE_ENABLE_CONSOLIDATION_BOOTSTRAP_GATE: "1"
+      TM_ACCEPTANCE_ENABLE_CONSOLIDATION_GATE: "1"
+  p4:
+    environment:
+      TM_ACCEPTANCE_ENABLE_CONSOLIDATION_BOOTSTRAP_GATE: "1"
+      TM_ACCEPTANCE_ENABLE_CONSOLIDATION_GATE: "1"
+  p5:
+    environment:
+      TM_ACCEPTANCE_ENABLE_CONSOLIDATION_BOOTSTRAP_GATE: "1"
+      TM_ACCEPTANCE_ENABLE_CONSOLIDATION_GATE: "1"
+  p6:
+    environment:
+      TM_ACCEPTANCE_ENABLE_CONSOLIDATION_BOOTSTRAP_GATE: "1"
+      TM_ACCEPTANCE_ENABLE_CONSOLIDATION_GATE: "1"
+  p7:
+    environment:
+      TM_ACCEPTANCE_ENABLE_CONSOLIDATION_BOOTSTRAP_GATE: "1"
+      TM_ACCEPTANCE_ENABLE_CONSOLIDATION_GATE: "1"
+  p8:
+    environment:
+      TM_ACCEPTANCE_ENABLE_CONSOLIDATION_BOOTSTRAP_GATE: "1"
+      TM_ACCEPTANCE_ENABLE_CONSOLIDATION_GATE: "1"

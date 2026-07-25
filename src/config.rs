@@ -1,0 +1,1110 @@
+use std::{
+    collections::BTreeSet,
+    path::{Path, PathBuf},
+};
+
+use rustls::pki_types::ServerName;
+use serde::{Deserialize, Serialize};
+use thiserror::Error;
+use url::Url;
+
+use crate::{
+    avss::{AvssError, MAX_AVSS_DEALERS, preflight_avss_resources},
+    committee::{
+        Committee, CommitteeError, MAX_COMMITTEE_MEMBERS, MAX_COMMITTEE_THRESHOLD, Member, PartyId,
+    },
+    key_rotation::{
+        KeyRotationError, KeyRotationTargetPolicy, eligibility_reference_key,
+        valid_x25519_public_key,
+    },
+};
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum NetworkKind {
+    Regtest,
+    Testnet,
+    Mainnet,
+}
+
+/// Canonical Monero mainnet genesis block hash returned by `on_get_block_hash(0)`.
+///
+/// Source: Monero's `GENESIS_TX`/`GENESIS_NONCE = 10000` network configuration. This constant is
+/// deliberately kept in RPC byte order so it can be compared directly with monero-oxide.
+pub const MONERO_MAINNET_GENESIS_HASH: [u8; 32] = [
+    0x41, 0x80, 0x15, 0xbb, 0x9a, 0xe9, 0x82, 0xa1, 0x97, 0x5d, 0xa7, 0xd7, 0x92, 0x77, 0xc2, 0x70,
+    0x57, 0x27, 0xa5, 0x68, 0x94, 0xba, 0x0f, 0xb2, 0x46, 0xad, 0xaa, 0xbb, 0x1f, 0x46, 0x32, 0xe3,
+];
+
+/// Canonical Monero public-testnet genesis block hash returned by `on_get_block_hash(0)`.
+///
+/// Source: Monero's `GENESIS_TX`/`GENESIS_NONCE = 10001` testnet configuration.
+pub const MONERO_TESTNET_GENESIS_HASH: [u8; 32] = [
+    0x48, 0xca, 0x7c, 0xd3, 0xc8, 0xde, 0x5b, 0x6a, 0x4d, 0x53, 0xd2, 0x86, 0x1f, 0xbd, 0xae, 0xdc,
+    0xa1, 0x41, 0x55, 0x35, 0x59, 0xf9, 0xbe, 0x95, 0x20, 0x06, 0x80, 0x53, 0xcd, 0xa8, 0x43, 0x0b,
+];
+
+/// Default hard ceiling for one autonomous deposit-consolidation fee.
+pub const DEFAULT_DEPOSIT_MAXIMUM_FEE_ATOMIC_UNITS: u64 = 1_000_000_000;
+
+/// Default interval between proactive share refreshes once an epoch is active.
+///
+/// The interval is committed by [`Scenario::quic_network_id`]. Parties configured with different
+/// refresh clocks therefore cannot accidentally join one protocol network.
+pub const DEFAULT_PROACTIVE_REFRESH_INTERVAL_SECONDS: u64 = 24 * 60 * 60;
+
+/// Only accepted scenario schema. Earlier schemas are intentionally unsupported.
+pub const SCENARIO_SCHEMA_VERSION: u16 = 6;
+
+/// Hard deployment bound for independently addressed daemon fallbacks assigned to one party.
+///
+/// Failover is deliberately small: one deposit operation has a finite RPC deadline and rotates
+/// to the next endpoint after a failed attempt. An unbounded endpoint list would turn recovery
+/// into an attacker-controlled availability loop.
+pub const MAX_MONEROD_ENDPOINTS_PER_PARTY: usize = 4;
+
+/// A zero interval would disable the mobile-adversary boundary while looking like a configured
+/// refresh policy. Keep the on-wire policy explicit and positive instead.
+pub const MIN_PROACTIVE_REFRESH_INTERVAL_SECONDS: u64 = 1;
+
+/// Resource-policy ceiling rather than a cryptographic limit. Longer intervals can be represented
+/// by stopping the service; a live configured network is expected to refresh at least yearly.
+pub const MAX_PROACTIVE_REFRESH_INTERVAL_SECONDS: u64 = 365 * 24 * 60 * 60;
+
+impl NetworkKind {
+    /// Exact `get_info.nettype` value required from the configured daemon.
+    ///
+    /// Monero reports private regtest/fakechain nodes as `fakechain`. Fakechain deliberately reuses
+    /// mainnet's genesis block, so this value must be checked in addition to the genesis hash.
+    #[must_use]
+    pub const fn daemon_nettype(self) -> &'static str {
+        match self {
+            Self::Regtest => "fakechain",
+            Self::Testnet => "testnet",
+            Self::Mainnet => "mainnet",
+        }
+    }
+
+    /// Canonical genesis hash for this logical Monero network.
+    ///
+    /// Regtest/fakechain inherits Monero's mainnet genesis configuration; `daemon_nettype` keeps
+    /// those otherwise-identical genesis domains distinct.
+    #[must_use]
+    pub const fn genesis_hash(self) -> [u8; 32] {
+        match self {
+            Self::Regtest | Self::Mainnet => MONERO_MAINNET_GENESIS_HASH,
+            Self::Testnet => MONERO_TESTNET_GENESIS_HASH,
+        }
+    }
+
+    pub(crate) const fn daemon_network_flags(self) -> (bool, bool, bool) {
+        match self {
+            Self::Regtest => (false, false, false),
+            Self::Testnet => (false, true, false),
+            Self::Mainnet => (true, false, false),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Operation {
+    Dkg,
+    Reshare,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Hex32(pub [u8; 32]);
+
+impl Serialize for Hex32 {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&hex::encode(self.0))
+    }
+}
+
+/// Deployment-wide Monero wallet birth checkpoint. It is part of the QUIC trust-domain digest so
+/// parties configured with different scan origins cannot communicate as one committee network.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DepositBirthAnchor {
+    pub height: u64,
+    pub hash: Hex32,
+}
+
+impl<'de> Deserialize<'de> for Hex32 {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = String::deserialize(deserializer)?;
+        let bytes = hex::decode(value).map_err(serde::de::Error::custom)?;
+        let bytes = bytes
+            .try_into()
+            .map_err(|_: Vec<u8>| serde::de::Error::custom("expected exactly 32 bytes"))?;
+        Ok(Self(bytes))
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ScenarioParty {
+    pub id: PartyId,
+    /// Local operator/control endpoint. This route is never part of a committee digest and must
+    /// not be used for party-to-party protocol delivery.
+    pub admin_endpoint: Url,
+    /// UDP endpoint used by the mutually authenticated QUIC peer transport.
+    pub quic_endpoint: Url,
+    /// DNS name verified by rustls when this party is the QUIC server.
+    pub quic_server_name: String,
+    /// Public leaf certificate loaded and exactly pinned for this party.
+    pub quic_certificate_file: PathBuf,
+    /// Independently administered Monero RPC endpoints used by this party's local application
+    /// predicate. The first endpoint is primary; bounded reconnect rotates through the remainder.
+    ///
+    /// Every URL in the scenario must be globally unique. Sharing an observer across parties
+    /// would collapse independent n-f validation into a common-mode trust dependency.
+    pub monerod_rpc_urls: Vec<Url>,
+    pub signing_key: Hex32,
+    /// Separately provisioned genesis-only X25519 key. Every activated successor key comes from a
+    /// fresh durable advertisement and never from this value.
+    pub bootstrap_encryption_key: Hex32,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CommitteeSpec {
+    pub epoch: u64,
+    pub operation: Operation,
+    pub threshold: u16,
+    /// Explicit Byzantine bound used by CKLS AVSS; it is intentionally not inferred from `n`.
+    pub fault_bound: u16,
+    /// Preferred stable identities defining the desired committee size and threshold layout.
+    /// Receiver-key agreement may substitute another freshly advertising identity from
+    /// `eligible_members`; no key from a missing preferred member is carried forward.
+    pub members: Vec<PartyId>,
+    /// Canonical stable-identity pool authorized to advertise for this epoch. A post-genesis pool
+    /// must contain at least `members.len() + fault_bound` identities.
+    pub eligible_members: Vec<PartyId>,
+    /// For a reshare, the canonical old-epoch candidates allowed to start AVSS. The exact
+    /// `old.threshold` interpolation subset is chosen later from availability-certified dealers.
+    #[serde(default)]
+    pub old_dealers: Vec<PartyId>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Scenario {
+    pub schema_version: u16,
+    #[serde(default)]
+    pub demo_only: bool,
+    pub network: NetworkKind,
+    #[serde(default)]
+    pub deposit_birth_anchor: Option<DepositBirthAnchor>,
+    /// Private-Regtest mining/submission RPC used only by the one-shot acceptance driver.
+    ///
+    /// Signer parties never use this endpoint for their chain observations.
+    pub acceptance_monerod_rpc_url: Url,
+    pub parties: Vec<ScenarioParty>,
+    pub committees: Vec<CommitteeSpec>,
+    pub funding_blocks: u64,
+    pub confirmation_blocks: u64,
+    /// Hard policy ceiling for one autonomous deposit-consolidation transaction fee.
+    pub deposit_maximum_fee_atomic_units: u64,
+    pub poll_interval_ms: u64,
+    pub protocol_timeout_seconds: u64,
+    /// Fixed, scenario-bound wall-clock interval for proactive resharing. The deadline itself is
+    /// persisted locally against the active activation certificate so a restart cannot reset it.
+    pub proactive_refresh_interval_seconds: u64,
+}
+
+#[derive(Debug, Error)]
+pub enum ConfigError {
+    #[error("I/O error: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("invalid JSON: {0}")]
+    Json(#[from] serde_json::Error),
+    #[error("unsupported scenario schema version {0}")]
+    Schema(u16),
+    #[error("committee error: {0}")]
+    Committee(#[from] CommitteeError),
+    #[error("AVSS resource configuration error: {0}")]
+    Avss(#[from] AvssError),
+    #[error("key-rotation policy error: {0}")]
+    KeyRotation(#[from] KeyRotationError),
+    #[error("unknown party {0} in scenario")]
+    UnknownParty(PartyId),
+    #[error("duplicate party {0} in scenario")]
+    DuplicateParty(PartyId),
+    #[error("party {0} has an invalid bootstrap X25519 public key")]
+    InvalidBootstrapEncryptionKey(PartyId),
+    #[error("bootstrap X25519 public keys must be unique across parties")]
+    DuplicateBootstrapEncryptionKey,
+    #[error("stable Ed25519 public keys must be unique across parties")]
+    DuplicateSigningKey,
+    #[error("party {0} has an invalid admin HTTP endpoint")]
+    InvalidAdminEndpoint(PartyId),
+    #[error("party {0} has an invalid QUIC UDP endpoint")]
+    InvalidQuicEndpoint(PartyId),
+    #[error("party {0} has an invalid QUIC TLS server name")]
+    InvalidQuicServerName(PartyId),
+    #[error("party {0} must use an absolute QUIC certificate path")]
+    InvalidQuicCertificateFile(PartyId),
+    #[error("party {0} must configure 1..={MAX_MONEROD_ENDPOINTS_PER_PARTY} Monero RPC URLs")]
+    InvalidMonerodEndpointCount(PartyId),
+    #[error("party {0} has an invalid Monero HTTP RPC endpoint")]
+    InvalidMonerodEndpoint(PartyId),
+    #[error("acceptance and party Monero RPC endpoints must all be unique")]
+    DuplicateMonerodEndpoint,
+    #[error("acceptance Monero RPC endpoint is invalid")]
+    InvalidAcceptanceMonerodEndpoint,
+    #[error("deposit wallet birth anchor has an all-zero block hash")]
+    InvalidDepositBirthAnchor,
+    #[error("deposit maximum fee must be positive")]
+    InvalidDepositMaximumFee,
+    #[error(
+        "proactive refresh interval must be in {MIN_PROACTIVE_REFRESH_INTERVAL_SECONDS}..={MAX_PROACTIVE_REFRESH_INTERVAL_SECONDS} seconds"
+    )]
+    InvalidProactiveRefreshInterval,
+    #[error("QUIC endpoints must be unique across parties")]
+    DuplicateQuicEndpoint,
+    #[error("QUIC TLS server names must be unique across parties")]
+    DuplicateQuicServerName,
+    #[error("QUIC certificate paths must be unique across parties")]
+    DuplicateQuicCertificateFile,
+    #[error("committee epochs must be contiguous from zero")]
+    NonContiguousEpochs,
+    #[error("epoch zero must be a DKG and later epochs must be reshares")]
+    InvalidOperations,
+    #[error(
+        "reshare epoch {epoch} needs at least {minimum} eligible old dealers and at most {maximum}, found {actual}"
+    )]
+    WrongDealerCount { epoch: u64, minimum: u16, maximum: u16, actual: usize },
+    #[error("reshare epoch {epoch} old dealer candidates must be unique and canonical")]
+    NonCanonicalDealers { epoch: u64 },
+    #[error("epoch {epoch} eligible target candidates must be unique and canonical")]
+    NonCanonicalEligibleMembers { epoch: u64 },
+    #[error("epoch {epoch} desired target members are not all eligible")]
+    DesiredMemberNotEligible { epoch: u64 },
+    #[error("epoch zero eligible candidates must exactly equal its DKG committee")]
+    GenesisEligibleMembersDiffer,
+    #[error("epoch {epoch} has {actual} AVSS dealers; maximum is {maximum}")]
+    TooManyDealers { epoch: u64, actual: usize, maximum: usize },
+}
+
+impl Scenario {
+    pub async fn read(path: impl AsRef<Path>) -> Result<Self, ConfigError> {
+        let bytes = tokio::fs::read(path).await?;
+        let scenario: Self = serde_json::from_slice(&bytes)?;
+        scenario.validate()?;
+        Ok(scenario)
+    }
+
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        if self.schema_version != SCENARIO_SCHEMA_VERSION {
+            return Err(ConfigError::Schema(self.schema_version));
+        }
+        if self.deposit_birth_anchor.is_some_and(|anchor| anchor.hash.0 == [0_u8; 32]) {
+            return Err(ConfigError::InvalidDepositBirthAnchor);
+        }
+        if self.deposit_maximum_fee_atomic_units == 0 {
+            return Err(ConfigError::InvalidDepositMaximumFee);
+        }
+        if !(MIN_PROACTIVE_REFRESH_INTERVAL_SECONDS..=MAX_PROACTIVE_REFRESH_INTERVAL_SECONDS)
+            .contains(&self.proactive_refresh_interval_seconds)
+        {
+            return Err(ConfigError::InvalidProactiveRefreshInterval);
+        }
+        if !valid_monerod_endpoint(&self.acceptance_monerod_rpc_url) {
+            return Err(ConfigError::InvalidAcceptanceMonerodEndpoint);
+        }
+        self.validate_parties()?;
+        let mut committees = self.committees.clone();
+        committees.sort_by_key(|committee| committee.epoch);
+        for (expected, spec) in committees.iter().enumerate() {
+            let current_members = spec.members.iter().copied().collect::<BTreeSet<_>>();
+            let eligible_members = spec.eligible_members.iter().copied().collect::<BTreeSet<_>>();
+            if eligible_members.len() != spec.eligible_members.len()
+                || !spec.eligible_members.windows(2).all(|parties| parties[0] < parties[1])
+            {
+                return Err(ConfigError::NonCanonicalEligibleMembers { epoch: spec.epoch });
+            }
+            if !current_members.is_subset(&eligible_members) {
+                return Err(ConfigError::DesiredMemberNotEligible { epoch: spec.epoch });
+            }
+            if spec.epoch == 0 && spec.eligible_members != spec.members {
+                return Err(ConfigError::GenesisEligibleMembersDiffer);
+            }
+            // Reject allocation-driving dimensions before resolving members or constructing any
+            // AVSS/QUAL state. These are deployment resource caps, not protocol-theory limits.
+            if spec.members.len() > MAX_COMMITTEE_MEMBERS {
+                return Err(CommitteeError::TooManyMembers {
+                    members: spec.members.len(),
+                    maximum: MAX_COMMITTEE_MEMBERS,
+                }
+                .into());
+            }
+            if spec.eligible_members.len() > MAX_COMMITTEE_MEMBERS {
+                return Err(CommitteeError::TooManyMembers {
+                    members: spec.eligible_members.len(),
+                    maximum: MAX_COMMITTEE_MEMBERS,
+                }
+                .into());
+            }
+            if spec.threshold > MAX_COMMITTEE_THRESHOLD {
+                return Err(CommitteeError::ThresholdTooLarge {
+                    threshold: spec.threshold,
+                    maximum: MAX_COMMITTEE_THRESHOLD,
+                }
+                .into());
+            }
+            let dealer_count = match spec.operation {
+                Operation::Dkg => spec.members.len(),
+                Operation::Reshare => spec.old_dealers.len(),
+            };
+            if dealer_count > MAX_AVSS_DEALERS {
+                return Err(ConfigError::TooManyDealers {
+                    epoch: spec.epoch,
+                    actual: dealer_count,
+                    maximum: MAX_AVSS_DEALERS,
+                });
+            }
+            if spec.epoch != expected as u64 {
+                return Err(ConfigError::NonContiguousEpochs);
+            }
+            if (spec.epoch == 0 && spec.operation != Operation::Dkg)
+                || (spec.epoch != 0 && spec.operation != Operation::Reshare)
+            {
+                return Err(ConfigError::InvalidOperations);
+            }
+            let committee = self.configured_committee_shape(spec.epoch)?;
+            committee.validate_async_security_with_faults(spec.fault_bound)?;
+            preflight_avss_resources(&committee, dealer_count)?;
+            if spec.epoch > 0 {
+                let old = self.configured_committee_shape(spec.epoch - 1)?;
+                let configured_policy = self
+                    .configured_key_rotation_target_policy(&old)?
+                    .ok_or(ConfigError::NonContiguousEpochs)?;
+                if configured_policy.target_epoch() != spec.epoch {
+                    return Err(ConfigError::NonContiguousEpochs);
+                }
+                let old_fault_bound = self.committee_spec(spec.epoch - 1)?.fault_bound;
+                let minimum = old.threshold.saturating_add(old_fault_bound);
+                if spec.old_dealers.len() < usize::from(minimum)
+                    || spec.old_dealers.len() > usize::from(old.n())
+                {
+                    return Err(ConfigError::WrongDealerCount {
+                        epoch: spec.epoch,
+                        minimum,
+                        maximum: old.n(),
+                        actual: spec.old_dealers.len(),
+                    });
+                }
+                let mut canonical = spec.old_dealers.clone();
+                canonical.sort_unstable();
+                canonical.dedup();
+                if canonical != spec.old_dealers {
+                    return Err(ConfigError::NonCanonicalDealers { epoch: spec.epoch });
+                }
+                for dealer in &spec.old_dealers {
+                    old.member(*dealer)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Stable trust-domain identifier carried by every party-to-party QUIC frame.
+    ///
+    /// Routing, operator endpoints, daemon URLs, and TLS certificate paths are deliberately
+    /// excluded. They may be rotated without creating a new cryptographic network. Committee
+    /// cryptographic material, Byzantine bounds, transition operations, resharing dealer
+    /// eligibility, deposit birth anchor, and consolidation fee policy are included.
+    ///
+    /// # Errors
+    ///
+    /// Returns a configuration error if an epoch specification cannot be resolved to its
+    /// cryptographic committee.
+    pub fn quic_network_id(&self) -> Result<[u8; 32], ConfigError> {
+        let mut specifications = self.committees.iter().collect::<Vec<_>>();
+        specifications.sort_unstable_by_key(|specification| specification.epoch);
+
+        let mut hasher = blake3::Hasher::new_derive_key("threshold-monero/quic-network-id/v2");
+        hasher.update(&self.schema_version.to_le_bytes());
+        hasher.update(&[match self.network {
+            NetworkKind::Regtest => 0,
+            NetworkKind::Testnet => 1,
+            NetworkKind::Mainnet => 2,
+        }]);
+        // Bind the transport trust domain to the actual chain identity we require the daemon to
+        // prove at startup. The nettype is included because Monero fakechain and mainnet share a
+        // genesis block by design.
+        let daemon_nettype = self.network.daemon_nettype().as_bytes();
+        hasher.update(&(daemon_nettype.len() as u64).to_le_bytes());
+        hasher.update(daemon_nettype);
+        hasher.update(&self.network.genesis_hash());
+        match self.deposit_birth_anchor {
+            Some(anchor) => {
+                hasher.update(&[1]);
+                hasher.update(&anchor.height.to_le_bytes());
+                hasher.update(&anchor.hash.0);
+            }
+            None => {
+                hasher.update(&[0]);
+            }
+        }
+        hasher.update(&self.deposit_maximum_fee_atomic_units.to_le_bytes());
+        hasher.update(&self.proactive_refresh_interval_seconds.to_le_bytes());
+        let mut parties = self.parties.iter().collect::<Vec<_>>();
+        parties.sort_unstable_by_key(|party| party.id);
+        hasher.update(&(parties.len() as u64).to_le_bytes());
+        for party in parties {
+            hasher.update(&party.id.0.to_le_bytes());
+            hasher.update(&party.signing_key.0);
+            hasher.update(&party.bootstrap_encryption_key.0);
+        }
+        hasher.update(&(specifications.len() as u64).to_le_bytes());
+        for specification in specifications {
+            hasher.update(&specification.epoch.to_le_bytes());
+            hasher.update(&[match specification.operation {
+                Operation::Dkg => 0,
+                Operation::Reshare => 1,
+            }]);
+            hasher.update(&specification.fault_bound.to_le_bytes());
+            hasher.update(&self.configured_committee_shape(specification.epoch)?.digest());
+            hasher.update(&(specification.eligible_members.len() as u64).to_le_bytes());
+            for eligible in &specification.eligible_members {
+                hasher.update(&eligible.0.to_le_bytes());
+            }
+            hasher.update(&(specification.old_dealers.len() as u64).to_le_bytes());
+            for dealer in &specification.old_dealers {
+                hasher.update(&dealer.0.to_le_bytes());
+            }
+        }
+        Ok(*hasher.finalize().as_bytes())
+    }
+
+    fn validate_parties(&self) -> Result<(), ConfigError> {
+        let mut ids = BTreeSet::new();
+        let mut quic_endpoints = BTreeSet::new();
+        let mut quic_server_names = BTreeSet::new();
+        let mut quic_certificate_files = BTreeSet::new();
+        let mut monerod_endpoints = BTreeSet::from([self.acceptance_monerod_rpc_url.as_str()]);
+        let mut signing_keys = BTreeSet::new();
+        let mut bootstrap_encryption_keys = BTreeSet::new();
+
+        for party in &self.parties {
+            PartyId::new(party.id.0)?;
+            if !ids.insert(party.id) {
+                return Err(ConfigError::DuplicateParty(party.id));
+            }
+            if !signing_keys.insert(party.signing_key.0) {
+                return Err(ConfigError::DuplicateSigningKey);
+            }
+            if !valid_x25519_public_key(party.bootstrap_encryption_key.0) {
+                return Err(ConfigError::InvalidBootstrapEncryptionKey(party.id));
+            }
+            if !bootstrap_encryption_keys.insert(party.bootstrap_encryption_key.0) {
+                return Err(ConfigError::DuplicateBootstrapEncryptionKey);
+            }
+            if !valid_admin_endpoint(&party.admin_endpoint) {
+                return Err(ConfigError::InvalidAdminEndpoint(party.id));
+            }
+            if !valid_quic_endpoint(&party.quic_endpoint) {
+                return Err(ConfigError::InvalidQuicEndpoint(party.id));
+            }
+            if !matches!(
+                ServerName::try_from(party.quic_server_name.clone()),
+                Ok(ServerName::DnsName(_))
+            ) {
+                return Err(ConfigError::InvalidQuicServerName(party.id));
+            }
+            if !valid_certificate_file(&party.quic_certificate_file) {
+                return Err(ConfigError::InvalidQuicCertificateFile(party.id));
+            }
+            if party.monerod_rpc_urls.is_empty()
+                || party.monerod_rpc_urls.len() > MAX_MONEROD_ENDPOINTS_PER_PARTY
+            {
+                return Err(ConfigError::InvalidMonerodEndpointCount(party.id));
+            }
+            for endpoint in &party.monerod_rpc_urls {
+                if !valid_monerod_endpoint(endpoint) {
+                    return Err(ConfigError::InvalidMonerodEndpoint(party.id));
+                }
+                if !monerod_endpoints.insert(endpoint.as_str()) {
+                    return Err(ConfigError::DuplicateMonerodEndpoint);
+                }
+            }
+            if !quic_endpoints.insert(party.quic_endpoint.as_str()) {
+                return Err(ConfigError::DuplicateQuicEndpoint);
+            }
+            if !quic_server_names.insert(party.quic_server_name.to_ascii_lowercase()) {
+                return Err(ConfigError::DuplicateQuicServerName);
+            }
+            if !quic_certificate_files.insert(&party.quic_certificate_file) {
+                return Err(ConfigError::DuplicateQuicCertificateFile);
+            }
+        }
+        Ok(())
+    }
+
+    pub fn committee_spec(&self, epoch: u64) -> Result<&CommitteeSpec, ConfigError> {
+        self.committees
+            .iter()
+            .find(|committee| committee.epoch == epoch)
+            .ok_or(ConfigError::NonContiguousEpochs)
+    }
+
+    pub fn party(&self, id: PartyId) -> Result<&ScenarioParty, ConfigError> {
+        self.parties.iter().find(|party| party.id == id).ok_or(ConfigError::UnknownParty(id))
+    }
+
+    /// Materialize the only committee whose X25519 keys are configuration-authoritative.
+    pub fn genesis_committee(&self) -> Result<Committee, ConfigError> {
+        self.configured_committee_shape(0)
+    }
+
+    /// Materialize the configured immediate successor policy against a certified source.
+    ///
+    /// Every eligible identity must advertise a fresh durable key to be selected. `members`
+    /// supplies the desired size and threshold layout; `eligible_members` supplies enough stable
+    /// identities to replace up to `f` silent candidates without carrying any source/bootstrap
+    /// receiver key. `None` means the static governance schedule is exhausted.
+    pub fn configured_key_rotation_target_policy(
+        &self,
+        source: &Committee,
+    ) -> Result<Option<KeyRotationTargetPolicy>, ConfigError> {
+        source.validate()?;
+        let target_epoch = source.epoch.checked_add(1).ok_or(ConfigError::NonContiguousEpochs)?;
+        let Ok(spec) = self.committee_spec(target_epoch) else {
+            return Ok(None);
+        };
+        let members = spec
+            .eligible_members
+            .iter()
+            .map(|id| {
+                let party = self.party(*id)?;
+                Ok(Member {
+                    id: *id,
+                    signing_key: party.signing_key.0,
+                    encryption_key: eligibility_reference_key(
+                        target_epoch,
+                        *id,
+                        party.signing_key.0,
+                    ),
+                })
+            })
+            .collect::<Result<Vec<_>, ConfigError>>()?;
+        let eligible = Committee { epoch: target_epoch, threshold: spec.threshold, members };
+        let desired_n =
+            u16::try_from(spec.members.len()).map_err(|_| CommitteeError::TooManyMembers {
+                members: spec.members.len(),
+                maximum: MAX_COMMITTEE_MEMBERS,
+            })?;
+        Ok(Some(KeyRotationTargetPolicy::new(source, eligible, desired_n, spec.fault_bound)?))
+    }
+
+    /// Static membership/threshold resource shape. For epochs after zero, these bootstrap keys are
+    /// validation placeholders only and must never be treated as an activated committee.
+    fn configured_committee_shape(&self, epoch: u64) -> Result<Committee, ConfigError> {
+        let spec = self.committee_spec(epoch)?;
+        let members = spec
+            .members
+            .iter()
+            .map(|id| {
+                let party = self.party(*id)?;
+                Ok(Member {
+                    id: *id,
+                    signing_key: party.signing_key.0,
+                    encryption_key: party.bootstrap_encryption_key.0,
+                })
+            })
+            .collect::<Result<Vec<_>, ConfigError>>()?;
+        Ok(Committee { epoch, threshold: spec.threshold, members }.canonicalized()?)
+    }
+}
+
+fn valid_admin_endpoint(endpoint: &Url) -> bool {
+    matches!(endpoint.scheme(), "http" | "https")
+        && endpoint.host_str().is_some()
+        && endpoint.username().is_empty()
+        && endpoint.password().is_none()
+        && endpoint.query().is_none()
+        && endpoint.fragment().is_none()
+}
+
+fn valid_quic_endpoint(endpoint: &Url) -> bool {
+    endpoint.scheme() == "quic"
+        && endpoint.host_str().is_some()
+        && endpoint.port().is_some_and(|port| port != 0)
+        && endpoint.username().is_empty()
+        && endpoint.password().is_none()
+        && matches!(endpoint.path(), "" | "/")
+        && endpoint.query().is_none()
+        && endpoint.fragment().is_none()
+}
+
+fn valid_monerod_endpoint(endpoint: &Url) -> bool {
+    matches!(endpoint.scheme(), "http" | "https")
+        && endpoint.host_str().is_some()
+        && endpoint.username().is_empty()
+        && endpoint.password().is_none()
+        && matches!(endpoint.path(), "" | "/")
+        && endpoint.query().is_none()
+        && endpoint.fragment().is_none()
+}
+
+fn valid_certificate_file(path: &Path) -> bool {
+    path.is_absolute()
+        && path.components().all(|component| {
+            matches!(component, std::path::Component::RootDir | std::path::Component::Normal(_))
+        })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn scenario() -> Scenario {
+        Scenario {
+            schema_version: SCENARIO_SCHEMA_VERSION,
+            demo_only: true,
+            network: NetworkKind::Regtest,
+            deposit_birth_anchor: None,
+            acceptance_monerod_rpc_url: "http://monerod-miner:18081".parse().unwrap(),
+            parties: (1..=4)
+                .map(|id| ScenarioParty {
+                    id: PartyId(id),
+                    admin_endpoint: format!("http://p{id}:8080").parse().unwrap(),
+                    quic_endpoint: format!("quic://p{id}:8443").parse().unwrap(),
+                    quic_server_name: format!("p{id}.threshold-monero.invalid"),
+                    quic_certificate_file: PathBuf::from(format!(
+                        "/etc/threshold-monero/quic/p{id}-cert.der"
+                    )),
+                    monerod_rpc_urls: vec![format!("http://monerod-p{id}:18081").parse().unwrap()],
+                    signing_key: Hex32([u8::try_from(id).unwrap(); 32]),
+                    bootstrap_encryption_key: Hex32([u8::try_from(id + 10).unwrap(); 32]),
+                })
+                .collect(),
+            committees: vec![CommitteeSpec {
+                epoch: 0,
+                operation: Operation::Dkg,
+                threshold: 2,
+                fault_bound: 1,
+                members: vec![PartyId(1), PartyId(2), PartyId(3), PartyId(4)],
+                eligible_members: vec![PartyId(1), PartyId(2), PartyId(3), PartyId(4)],
+                old_dealers: vec![],
+            }],
+            funding_blocks: 1,
+            confirmation_blocks: 1,
+            deposit_maximum_fee_atomic_units: DEFAULT_DEPOSIT_MAXIMUM_FEE_ATOMIC_UNITS,
+            poll_interval_ms: 1,
+            protocol_timeout_seconds: 1,
+            proactive_refresh_interval_seconds: DEFAULT_PROACTIVE_REFRESH_INTERVAL_SECONDS,
+        }
+    }
+
+    fn scenario_with_parties(count: u16) -> Scenario {
+        let mut scenario = scenario();
+        scenario.parties = (1..=count)
+            .map(|id| ScenarioParty {
+                id: PartyId(id),
+                admin_endpoint: format!("http://p{id}:8080").parse().unwrap(),
+                quic_endpoint: format!("quic://p{id}:8443").parse().unwrap(),
+                quic_server_name: format!("p{id}.threshold-monero.invalid"),
+                quic_certificate_file: PathBuf::from(format!(
+                    "/etc/threshold-monero/quic/p{id}-cert.der"
+                )),
+                monerod_rpc_urls: vec![format!("http://monerod-p{id}:18081").parse().unwrap()],
+                signing_key: Hex32([u8::try_from(id).unwrap(); 32]),
+                bootstrap_encryption_key: Hex32([u8::try_from(id + 32).unwrap(); 32]),
+            })
+            .collect();
+        scenario.committees[0].members = (1..=count).map(PartyId).collect();
+        scenario.committees[0].eligible_members = scenario.committees[0].members.clone();
+        scenario
+    }
+
+    fn reconfiguration_scenario() -> Scenario {
+        let mut scenario = scenario_with_parties(8);
+        scenario.committees = vec![
+            CommitteeSpec {
+                epoch: 0,
+                operation: Operation::Dkg,
+                threshold: 3,
+                fault_bound: 1,
+                members: (1..=5).map(PartyId).collect(),
+                eligible_members: (1..=5).map(PartyId).collect(),
+                old_dealers: vec![],
+            },
+            CommitteeSpec {
+                epoch: 1,
+                operation: Operation::Reshare,
+                threshold: 4,
+                fault_bound: 1,
+                members: (1..=7).map(PartyId).collect(),
+                eligible_members: (1..=8).map(PartyId).collect(),
+                old_dealers: (1..=5).map(PartyId).collect(),
+            },
+            CommitteeSpec {
+                epoch: 2,
+                operation: Operation::Reshare,
+                threshold: 2,
+                fault_bound: 1,
+                members: [2, 4, 6, 7].into_iter().map(PartyId).collect(),
+                eligible_members: [2, 3, 4, 6, 7, 8].into_iter().map(PartyId).collect(),
+                old_dealers: (1..=7).map(PartyId).collect(),
+            },
+        ];
+        scenario
+    }
+
+    #[test]
+    fn rejects_previous_schema_and_removed_fields() {
+        let mut previous = serde_json::to_value(scenario()).unwrap();
+        previous["schema_version"] = serde_json::json!(4);
+        let previous: Scenario = serde_json::from_value(previous).unwrap();
+        assert!(matches!(previous.validate(), Err(ConfigError::Schema(4))));
+
+        let mut shared_daemon = serde_json::to_value(scenario()).unwrap();
+        shared_daemon["monerod_rpc_url"] = serde_json::json!("http://shared-daemon:18081");
+        assert!(serde_json::from_value::<Scenario>(shared_daemon).is_err());
+
+        let mut consensus_gate = serde_json::to_value(scenario()).unwrap();
+        consensus_gate["deposit_consensus_start_epoch"] = serde_json::json!(0);
+        assert!(serde_json::from_value::<Scenario>(consensus_gate).is_err());
+
+        for removed in ["identity_seed_secret", "identity_seed_file", "encryption_keys"] {
+            let mut obsolete_input = serde_json::to_value(scenario()).unwrap();
+            obsolete_input["parties"][0][removed] = serde_json::json!("obsolete");
+            assert!(
+                serde_json::from_value::<Scenario>(obsolete_input).is_err(),
+                "removed field {removed} was accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn scenario_accepts_the_resource_maximum() {
+        let mut maximum = scenario_with_parties(MAX_COMMITTEE_THRESHOLD);
+        maximum.committees[0].threshold = MAX_COMMITTEE_THRESHOLD;
+        maximum.committees[0].fault_bound = 0;
+        maximum.validate().unwrap();
+        let committee = maximum.genesis_committee().unwrap();
+        let bounds = preflight_avss_resources(&committee, MAX_AVSS_DEALERS).unwrap();
+        assert!(bounds.maximum_wire_message_bytes < crate::avss::MAX_AVSS_WIRE_BODY_BYTES);
+        assert!(bounds.maximum_persisted_session_bytes <= crate::storage::MAX_SESSION_STATE_BYTES);
+    }
+
+    #[test]
+    fn scenario_rejects_resource_dimensions_before_protocol_construction() {
+        let oversized_count = MAX_COMMITTEE_THRESHOLD + 1;
+        let mut too_many_members = scenario_with_parties(oversized_count);
+        too_many_members.committees[0].threshold = MAX_COMMITTEE_THRESHOLD;
+        too_many_members.committees[0].fault_bound = 0;
+        assert!(matches!(
+            too_many_members.validate(),
+            Err(ConfigError::Committee(CommitteeError::TooManyMembers {
+                members,
+                maximum: MAX_COMMITTEE_MEMBERS,
+            })) if members == MAX_COMMITTEE_MEMBERS + 1
+        ));
+
+        let mut threshold_too_large = scenario_with_parties(MAX_COMMITTEE_THRESHOLD);
+        threshold_too_large.committees[0].threshold = MAX_COMMITTEE_THRESHOLD + 1;
+        threshold_too_large.committees[0].fault_bound = 0;
+        assert!(matches!(
+            threshold_too_large.validate(),
+            Err(ConfigError::Committee(CommitteeError::ThresholdTooLarge {
+                threshold,
+                maximum: MAX_COMMITTEE_THRESHOLD,
+            })) if threshold == MAX_COMMITTEE_THRESHOLD + 1
+        ));
+
+        let mut too_many_dealers = scenario_with_parties(MAX_COMMITTEE_THRESHOLD);
+        too_many_dealers.committees[0].threshold = MAX_COMMITTEE_THRESHOLD;
+        too_many_dealers.committees[0].fault_bound = 0;
+        too_many_dealers.committees.push(CommitteeSpec {
+            epoch: 1,
+            operation: Operation::Reshare,
+            threshold: MAX_COMMITTEE_THRESHOLD,
+            fault_bound: 0,
+            members: (1..=MAX_COMMITTEE_THRESHOLD).map(PartyId).collect(),
+            eligible_members: (1..=MAX_COMMITTEE_THRESHOLD).map(PartyId).collect(),
+            old_dealers: (1..=MAX_COMMITTEE_THRESHOLD + 1).map(PartyId).collect(),
+        });
+        assert!(matches!(
+            too_many_dealers.validate(),
+            Err(ConfigError::TooManyDealers {
+                epoch: 1,
+                actual,
+                maximum: MAX_AVSS_DEALERS,
+            }) if actual == MAX_AVSS_DEALERS + 1
+        ));
+    }
+
+    #[test]
+    fn routing_is_validated_but_excluded_from_committee_identity() {
+        let original = scenario();
+        original.validate().unwrap();
+        let digest = original.genesis_committee().unwrap().digest();
+        let network_id = original.quic_network_id().unwrap();
+
+        let mut moved = original;
+        moved.parties[0].admin_endpoint = "https://admin.example:9443".parse().unwrap();
+        moved.parties[0].quic_endpoint = "quic://new-route.example:4433".parse().unwrap();
+        moved.parties[0].quic_server_name = "new-route.example".into();
+        moved.parties[0].quic_certificate_file = "/new/cert.der".into();
+        moved.parties[0].monerod_rpc_urls =
+            vec!["https://new-observer.example:18081".parse().unwrap()];
+        moved.acceptance_monerod_rpc_url = "https://new-miner.example:18081".parse().unwrap();
+        moved.validate().unwrap();
+
+        assert_eq!(digest, moved.genesis_committee().unwrap().digest());
+        assert_eq!(network_id, moved.quic_network_id().unwrap());
+    }
+
+    #[test]
+    fn quic_network_id_binds_protocol_trust_configuration() {
+        let original = scenario();
+        let network_id = original.quic_network_id().unwrap();
+
+        let mut changed_fault_bound = original.clone();
+        changed_fault_bound.committees[0].fault_bound = 0;
+        assert_ne!(network_id, changed_fault_bound.quic_network_id().unwrap());
+
+        let mut changed_network = original.clone();
+        changed_network.network = NetworkKind::Testnet;
+        assert_ne!(network_id, changed_network.quic_network_id().unwrap());
+
+        let mut changed_refresh_policy = original.clone();
+        changed_refresh_policy.proactive_refresh_interval_seconds += 1;
+        assert_ne!(network_id, changed_refresh_policy.quic_network_id().unwrap());
+
+        let mut changed_bootstrap = original.clone();
+        changed_bootstrap.parties[0].bootstrap_encryption_key = Hex32([0x61; 32]);
+        assert_ne!(network_id, changed_bootstrap.quic_network_id().unwrap());
+
+        let mut changed_fee_policy = original;
+        changed_fee_policy.deposit_maximum_fee_atomic_units += 1;
+        assert_ne!(network_id, changed_fee_policy.quic_network_id().unwrap());
+
+        let mut changed_birth_anchor = scenario();
+        changed_birth_anchor.deposit_birth_anchor =
+            Some(DepositBirthAnchor { height: 42, hash: Hex32([0x42; 32]) });
+        assert_ne!(network_id, changed_birth_anchor.quic_network_id().unwrap());
+    }
+
+    #[test]
+    fn monero_network_identity_uses_canonical_nettypes_and_genesis_hashes() {
+        assert_eq!(NetworkKind::Regtest.daemon_nettype(), "fakechain");
+        assert_eq!(NetworkKind::Testnet.daemon_nettype(), "testnet");
+        assert_eq!(NetworkKind::Mainnet.daemon_nettype(), "mainnet");
+        assert_eq!(
+            hex::encode(NetworkKind::Mainnet.genesis_hash()),
+            "418015bb9ae982a1975da7d79277c2705727a56894ba0fb246adaabb1f4632e3"
+        );
+        assert_eq!(
+            hex::encode(NetworkKind::Testnet.genesis_hash()),
+            "48ca7cd3c8de5b6a4d53d2861fbdaedca141553559f9be9520068053cda8430b"
+        );
+        assert_eq!(NetworkKind::Regtest.genesis_hash(), NetworkKind::Mainnet.genesis_hash());
+    }
+
+    #[test]
+    fn rejects_zero_deposit_birth_anchor_hash() {
+        let mut invalid = scenario();
+        invalid.deposit_birth_anchor =
+            Some(DepositBirthAnchor { height: 42, hash: Hex32([0; 32]) });
+        assert!(matches!(invalid.validate(), Err(ConfigError::InvalidDepositBirthAnchor)));
+    }
+
+    #[test]
+    fn proactive_refresh_interval_enforces_positive_bounded_policy() {
+        let mut minimum = scenario();
+        minimum.proactive_refresh_interval_seconds = MIN_PROACTIVE_REFRESH_INTERVAL_SECONDS;
+        minimum.validate().unwrap();
+
+        let mut maximum = scenario();
+        maximum.proactive_refresh_interval_seconds = MAX_PROACTIVE_REFRESH_INTERVAL_SECONDS;
+        maximum.validate().unwrap();
+
+        let mut zero = scenario();
+        zero.proactive_refresh_interval_seconds = 0;
+        assert!(matches!(zero.validate(), Err(ConfigError::InvalidProactiveRefreshInterval)));
+
+        let mut above_maximum = scenario();
+        above_maximum.proactive_refresh_interval_seconds =
+            MAX_PROACTIVE_REFRESH_INTERVAL_SECONDS + 1;
+        assert!(matches!(
+            above_maximum.validate(),
+            Err(ConfigError::InvalidProactiveRefreshInterval)
+        ));
+    }
+
+    #[test]
+    fn rejects_zero_deposit_fee_policy() {
+        let mut invalid = scenario();
+        invalid.deposit_maximum_fee_atomic_units = 0;
+        assert!(matches!(invalid.validate(), Err(ConfigError::InvalidDepositMaximumFee)));
+    }
+
+    #[test]
+    fn rejects_wrong_schemes_and_duplicate_certificate_paths() {
+        let mut wrong_scheme = scenario();
+        wrong_scheme.parties[0].quic_endpoint = "http://p1:8443".parse().unwrap();
+        assert!(matches!(
+            wrong_scheme.validate(),
+            Err(ConfigError::InvalidQuicEndpoint(PartyId(1)))
+        ));
+
+        let mut duplicate_pin = scenario();
+        duplicate_pin.parties[1].quic_certificate_file =
+            duplicate_pin.parties[0].quic_certificate_file.clone();
+        assert!(matches!(duplicate_pin.validate(), Err(ConfigError::DuplicateQuicCertificateFile)));
+
+        let mut missing_observer = scenario();
+        missing_observer.parties[0].monerod_rpc_urls.clear();
+        assert!(matches!(
+            missing_observer.validate(),
+            Err(ConfigError::InvalidMonerodEndpointCount(PartyId(1)))
+        ));
+
+        let mut duplicate_observer = scenario();
+        duplicate_observer.parties[1].monerod_rpc_urls =
+            duplicate_observer.parties[0].monerod_rpc_urls.clone();
+        assert!(matches!(
+            duplicate_observer.validate(),
+            Err(ConfigError::DuplicateMonerodEndpoint)
+        ));
+
+        let mut invalid_observer = scenario();
+        invalid_observer.parties[0].monerod_rpc_urls =
+            vec!["file:///tmp/monerod.sock".parse().unwrap()];
+        assert!(matches!(
+            invalid_observer.validate(),
+            Err(ConfigError::InvalidMonerodEndpoint(PartyId(1)))
+        ));
+    }
+
+    #[test]
+    fn rejects_non_dns_tls_name_and_remote_admin_scheme() {
+        let mut ip_server_name = scenario();
+        ip_server_name.parties[0].quic_server_name = "127.0.0.1".into();
+        assert!(matches!(
+            ip_server_name.validate(),
+            Err(ConfigError::InvalidQuicServerName(PartyId(1)))
+        ));
+
+        let mut file_admin = scenario();
+        file_admin.parties[0].admin_endpoint = "file:///tmp/admin.sock".parse().unwrap();
+        assert!(matches!(
+            file_admin.validate(),
+            Err(ConfigError::InvalidAdminEndpoint(PartyId(1)))
+        ));
+
+        let mut relative_certificate = scenario();
+        relative_certificate.parties[0].quic_certificate_file = "quic/p1-cert.der".into();
+        assert!(matches!(
+            relative_certificate.validate(),
+            Err(ConfigError::InvalidQuicCertificateFile(PartyId(1)))
+        ));
+    }
+
+    #[test]
+    fn bootstrap_keys_are_separate_unique_and_current_only() {
+        let scenario = scenario();
+        scenario.validate().unwrap();
+        let genesis = scenario.genesis_committee().unwrap();
+        for member in &genesis.members {
+            assert_eq!(
+                member.encryption_key,
+                scenario.party(member.id).unwrap().bootstrap_encryption_key.0
+            );
+        }
+        assert!(scenario.configured_key_rotation_target_policy(&genesis).unwrap().is_none());
+
+        let mut invalid = scenario.clone();
+        invalid.parties[0].bootstrap_encryption_key = Hex32([0_u8; 32]);
+        assert!(matches!(
+            invalid.validate(),
+            Err(ConfigError::InvalidBootstrapEncryptionKey(PartyId(1)))
+        ));
+
+        let mut duplicate = scenario;
+        duplicate.parties[1].bootstrap_encryption_key =
+            duplicate.parties[0].bootstrap_encryption_key;
+        assert!(matches!(duplicate.validate(), Err(ConfigError::DuplicateBootstrapEncryptionKey)));
+    }
+
+    #[test]
+    fn configured_rotation_policy_materializes_spare_backed_eligible_pools() {
+        let scenario = reconfiguration_scenario();
+        scenario.validate().unwrap();
+
+        let mut source = scenario.genesis_committee().unwrap();
+        for member in &mut source.members {
+            member.encryption_key = [0x40_u8 + u8::try_from(member.id.0).unwrap(); 32];
+        }
+        source.validate().unwrap();
+        let grow = scenario
+            .configured_key_rotation_target_policy(&source)
+            .unwrap()
+            .expect("configured grow policy");
+        assert_eq!(grow.eligible().epoch, 1);
+        assert_eq!(grow.eligible().threshold, 4);
+        assert_eq!(grow.target_fault_bound(), 1);
+        assert_eq!(grow.selection_size(), 7);
+        for party in 1..=8 {
+            let party = PartyId(party);
+            assert_eq!(
+                grow.eligible().member(party).unwrap().encryption_key,
+                eligibility_reference_key(
+                    grow.target_epoch(),
+                    party,
+                    scenario.party(party).unwrap().signing_key.0,
+                )
+            );
+            assert_ne!(
+                grow.eligible().member(party).unwrap().encryption_key,
+                scenario.party(party).unwrap().bootstrap_encryption_key.0
+            );
+        }
+
+        let mut certified_grow = Committee {
+            epoch: grow.target_epoch(),
+            threshold: grow.eligible().threshold,
+            members: grow.eligible().members[..7].to_vec(),
+        };
+        for member in &mut certified_grow.members {
+            member.encryption_key = [0x60_u8 + u8::try_from(member.id.0).unwrap(); 32];
+        }
+        certified_grow.validate().unwrap();
+        let shrink = scenario
+            .configured_key_rotation_target_policy(&certified_grow)
+            .unwrap()
+            .expect("configured shrink policy");
+        assert_eq!(
+            shrink.eligible().members.iter().map(|member| member.id).collect::<Vec<_>>(),
+            vec![PartyId(2), PartyId(3), PartyId(4), PartyId(6), PartyId(7), PartyId(8),]
+        );
+        for member in &shrink.eligible().members {
+            assert_eq!(
+                member.encryption_key,
+                eligibility_reference_key(
+                    shrink.target_epoch(),
+                    member.id,
+                    scenario.party(member.id).unwrap().signing_key.0,
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn configured_party_can_reenter_only_through_the_fresh_advertisement_pool() {
+        let mut scenario = reconfiguration_scenario();
+        scenario.committees[1].members.retain(|party| *party != PartyId(1));
+        scenario.committees[2].members.push(PartyId(1));
+        scenario.committees[2].members.sort_unstable();
+        scenario.committees[2].eligible_members.push(PartyId(1));
+        scenario.committees[2].eligible_members.sort_unstable();
+        scenario.committees[2].old_dealers.retain(|party| *party != PartyId(1));
+        scenario.validate().unwrap();
+    }
+}

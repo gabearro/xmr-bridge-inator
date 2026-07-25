@@ -1,0 +1,140 @@
+{
+  "schema_version": 6,
+  "demo_only": true,
+  "network": "regtest",
+  "acceptance_monerod_rpc_url": "http://monerod-miner:18081",
+  "parties": [
+    {
+      "id": 1,
+      "admin_endpoint": "http://p1-admin:8080",
+      "quic_endpoint": "quic://p1-quic:8443",
+      "quic_server_name": "p1.threshold-monero.invalid",
+      "quic_certificate_file": "/etc/threshold-monero/quic/p1-cert.der",
+      "monerod_rpc_urls": ["http://monerod-p1:18081"],
+      "signing_key": "52265cff71b9005274609c03800b9f910b091203a1c950566e7bcd49b721246c",
+      "bootstrap_encryption_key": "7028919682be5f42c65670a9dd7945f5bebe26b2a6d1576c4987d2531b9a4f55"
+    },
+    {
+      "id": 2,
+      "admin_endpoint": "http://p2-admin:8080",
+      "quic_endpoint": "quic://p2-quic:8443",
+      "quic_server_name": "p2.threshold-monero.invalid",
+      "quic_certificate_file": "/etc/threshold-monero/quic/p2-cert.der",
+      "monerod_rpc_urls": ["http://monerod-p2:18081"],
+      "signing_key": "ed8bfd04dd33c8cecd520d57e2e24094b6d6bcd1a275022307584fa8a088be82",
+      "bootstrap_encryption_key": "b3906cf8e5c65005ea9ec33fb34d212613db2c21abbb7b7b9ec25b4d4f6ee026"
+    },
+    {
+      "id": 3,
+      "admin_endpoint": "http://p3-admin:8080",
+      "quic_endpoint": "quic://p3-quic:8443",
+      "quic_server_name": "p3.threshold-monero.invalid",
+      "quic_certificate_file": "/etc/threshold-monero/quic/p3-cert.der",
+      "monerod_rpc_urls": ["http://monerod-p3:18081"],
+      "signing_key": "fc1cfcfb552f5e27b105147e0f5b2bd5a5f4d97ebbf1818baf8075835fd19a39",
+      "bootstrap_encryption_key": "46993c37a60494572775629dc104f5507ea78f213f30c08dea973fa5fe040916"
+    },
+    {
+      "id": 4,
+      "admin_endpoint": "http://p4-admin:8080",
+      "quic_endpoint": "quic://p4-quic:8443",
+      "quic_server_name": "p4.threshold-monero.invalid",
+      "quic_certificate_file": "/etc/threshold-monero/quic/p4-cert.der",
+      "monerod_rpc_urls": ["http://monerod-p4:18081"],
+      "signing_key": "12a89a9c3a27ce429cb9dfe85f7ffa5c4bcdd1c4f55c84740074eee06bfc8164",
+      "bootstrap_encryption_key": "986021395172f7a925b135edb34999cbe815fb7a0172abef8e177911c5bca300"
+    },
+    {
+      "id": 5,
+      "admin_endpoint": "http://p5-admin:8080",
+      "quic_endpoint": "quic://p5-quic:8443",
+      "quic_server_name": "p5.threshold-monero.invalid",
+      "quic_certificate_file": "/etc/threshold-monero/quic/p5-cert.der",
+      "monerod_rpc_urls": ["http://monerod-p5:18081"],
+      "signing_key": "2d1e19c8d78260883abebda064068b43dd323786e972fb96dafde5a86034ff12",
+      "bootstrap_encryption_key": "ef3c0341a2c94fc36319a8943af9583364dd97221d319f5a6fa65c3ebac64b5b"
+    },
+    {
+      "id": 6,
+      "admin_endpoint": "http://p6-admin:8080",
+      "quic_endpoint": "quic://p6-quic:8443",
+      "quic_server_name": "p6.threshold-monero.invalid",
+      "quic_certificate_file": "/etc/threshold-monero/quic/p6-cert.der",
+      "monerod_rpc_urls": ["http://monerod-p6:18081"],
+      "signing_key": "a0091d64b90edbc118a68239978f0824cf56850bd25d5b7b790e6aebc3b1d61d",
+      "bootstrap_encryption_key": "6ef7eed2dcf54483e76a2aa7feff4f39ff2986807592b1d0578e7a7c96608950"
+    },
+    {
+      "id": 7,
+      "admin_endpoint": "http://p7-admin:8080",
+      "quic_endpoint": "quic://p7-quic:8443",
+      "quic_server_name": "p7.threshold-monero.invalid",
+      "quic_certificate_file": "/etc/threshold-monero/quic/p7-cert.der",
+      "monerod_rpc_urls": ["http://monerod-p7:18081"],
+      "signing_key": "2dddcdc22cf1dfe71b2c7b5b055cb9b611badbb65440690705dbfc0dc8b8dceb",
+      "bootstrap_encryption_key": "1ce1dba6f7a4d251e65ddc24a1f8e9e9bae2507d1dfb96e57b5497c135a5810b"
+    },
+    {
+      "id": 8,
+      "admin_endpoint": "http://p8-admin:8080",
+      "quic_endpoint": "quic://p8-quic:8443",
+      "quic_server_name": "p8.threshold-monero.invalid",
+      "quic_certificate_file": "/etc/threshold-monero/quic/p8-cert.der",
+      "monerod_rpc_urls": ["http://monerod-p8:18081"],
+      "signing_key": "13d9908a70925992ed546007d27f50da68ba7217ef62ac3cca784529ff10471c",
+      "bootstrap_encryption_key": "650de62f273b2001a6bd05beaec51339ce34cd4ae0b59094fe649ddf2aba2a14"
+    }
+  ],
+  "committees": [
+    {
+      "epoch": 0,
+      "operation": "dkg",
+      "threshold": 3,
+      "fault_bound": 1,
+      "members": [1, 2, 3, 4, 5],
+      "eligible_members": [1, 2, 3, 4, 5]
+    },
+    {
+      "epoch": 1,
+      "operation": "reshare",
+      "threshold": 4,
+      "fault_bound": 1,
+      "members": [1, 2, 3, 4, 5, 6, 7],
+      "eligible_members": [1, 2, 3, 4, 5, 6, 7, 8],
+      "old_dealers": [1, 2, 3, 4, 5]
+    },
+    {
+      "epoch": 2,
+      "operation": "reshare",
+      "threshold": 4,
+      "fault_bound": 1,
+      "members": [1, 2, 3, 4, 5, 6, 7],
+      "eligible_members": [1, 2, 3, 4, 5, 6, 7, 8],
+      "old_dealers": [1, 2, 3, 4, 5, 6, 7]
+    },
+    {
+      "epoch": 3,
+      "operation": "reshare",
+      "threshold": 4,
+      "fault_bound": 1,
+      "members": [1, 2, 3, 4, 5, 6, 7],
+      "eligible_members": [1, 2, 3, 4, 5, 6, 7, 8],
+      "old_dealers": [1, 2, 3, 4, 5, 6, 7]
+    },
+    {
+      "epoch": 4,
+      "operation": "reshare",
+      "threshold": 2,
+      "fault_bound": 1,
+      "members": [2, 4, 6, 7],
+      "eligible_members": [2, 4, 6, 7, 8],
+      "old_dealers": [1, 2, 3, 4, 5, 6, 7]
+    }
+  ],
+  "funding_blocks": 600,
+  "confirmation_blocks": 10,
+  "deposit_maximum_fee_atomic_units": 5000000000,
+  "poll_interval_ms": 250,
+  "protocol_timeout_seconds": 180,
+  "proactive_refresh_interval_seconds": 15
+}

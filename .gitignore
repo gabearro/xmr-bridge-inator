@@ -1,0 +1,9 @@
+/target/
+/data/
+/artifacts/
+/.env
+*.swp
+*.tmp
+/.idea/
+docker/quic-pki/*.pem
+docker/quic-pki/*.cnf

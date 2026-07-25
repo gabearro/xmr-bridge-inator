@@ -1,0 +1,28 @@
+# The AVSS-crash and QUAL-crash campaigns need exact epoch-zero durable dealer barriers. The normal
+# Compose application and every other campaign start canonical DKG autonomously; this test-only
+# overlay gives the acceptance driver deterministic control over those two crash schedules.
+services:
+  p1:
+    environment:
+      TM_AUTO_START_GENESIS: "false"
+  p2:
+    environment:
+      TM_AUTO_START_GENESIS: "false"
+  p3:
+    environment:
+      TM_AUTO_START_GENESIS: "false"
+  p4:
+    environment:
+      TM_AUTO_START_GENESIS: "false"
+  p5:
+    environment:
+      TM_AUTO_START_GENESIS: "false"
+  p6:
+    environment:
+      TM_AUTO_START_GENESIS: "false"
+  p7:
+    environment:
+      TM_AUTO_START_GENESIS: "false"
+  p8:
+    environment:
+      TM_AUTO_START_GENESIS: "false"

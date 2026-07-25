@@ -1,0 +1,32 @@
+# Acceptance-only overlay which makes exact epoch-by-epoch observation deterministic. Every
+# activated epoch persists a held proactive-refresh deadline until the authenticated E2E client
+# releases that exact source epoch; release then waits the scenario's ordinary fixed interval.
+# Party startup ignores the hook unless the scenario is both demo-only and private Regtest.
+services:
+  p1:
+    environment:
+      TM_ACCEPTANCE_HOLD_PROACTIVE_REFRESH: "1"
+  p2:
+    environment:
+      TM_ACCEPTANCE_HOLD_PROACTIVE_REFRESH: "1"
+  p3:
+    environment:
+      TM_ACCEPTANCE_HOLD_PROACTIVE_REFRESH: "1"
+  p4:
+    environment:
+      TM_ACCEPTANCE_HOLD_PROACTIVE_REFRESH: "1"
+  p5:
+    environment:
+      TM_ACCEPTANCE_HOLD_PROACTIVE_REFRESH: "1"
+  p6:
+    environment:
+      TM_ACCEPTANCE_HOLD_PROACTIVE_REFRESH: "1"
+  p7:
+    environment:
+      TM_ACCEPTANCE_HOLD_PROACTIVE_REFRESH: "1"
+  p8:
+    environment:
+      TM_ACCEPTANCE_HOLD_PROACTIVE_REFRESH: "1"
+  e2e:
+    environment:
+      TM_ACCEPTANCE_HOLD_PROACTIVE_REFRESH: "1"

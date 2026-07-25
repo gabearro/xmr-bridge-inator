@@ -1,0 +1,653 @@
+name: threshold-monero-regtest
+
+x-bounded-logging: &bounded-logging
+  driver: json-file
+  options:
+    max-size: 10m
+    max-file: "5"
+
+x-monero-image: &monero-image
+  image: threshold-monero/monerod:0.18.5.1
+  # Never fall back to an image with this local-looking name from a registry. `build` and
+  # `up --build` still use the build section below explicitly.
+  pull_policy: never
+  logging: *bounded-logging
+  build:
+    context: .
+    dockerfile: Dockerfile.monero
+
+x-monero-node: &monero-node
+  <<: *monero-image
+  cpus: 0.75
+  mem_limit: 512m
+  pids_limit: 128
+  environment:
+    HOME: /data
+  expose:
+    - "18081"
+  read_only: true
+  tmpfs:
+    - /tmp:rw,noexec,nosuid,size=64m
+  cap_drop:
+    - ALL
+  security_opt:
+    - no-new-privileges:true
+  stop_grace_period: 30s
+  restart: unless-stopped
+  healthcheck:
+    test: [CMD, /usr/local/bin/monero-healthcheck, daemon]
+    interval: 5s
+    timeout: 3s
+    retries: 60
+    start_period: 5s
+
+x-monero-observer: &monero-observer
+  <<: *monero-node
+  command:
+    [monerod, --config-file=/etc/monero/monerod-observer.conf, --non-interactive]
+  healthcheck:
+    test:
+      [CMD, /usr/local/bin/monero-healthcheck, observer,
+       http://127.0.0.1:18081/json_rpc, http://monerod-miner:18081/json_rpc]
+    interval: 5s
+    timeout: 7s
+    retries: 60
+    start_period: 5s
+
+x-signer-image: &signer-image
+  image: threshold-monero/signer:local
+  # Never fall back to an image with this local-looking name from a registry. `build` and
+  # `up --build` still use the build section below explicitly.
+  pull_policy: never
+  logging: *bounded-logging
+  cpus: 1.0
+  mem_limit: 768m
+  pids_limit: 256
+  build:
+    context: .
+    dockerfile: Dockerfile
+
+x-party-environment: &party-environment
+  RUST_LOG: threshold_monero=info,tower_http=info
+  TM_ADMIN_LISTEN_ADDR: 0.0.0.0:8080
+  TM_QUIC_LISTEN_ADDR: 0.0.0.0:8443
+  TM_QUIC_PRIVATE_KEY_FILE: /run/secrets/quic_private_key
+  TM_ADMIN_BEARER_TOKEN_FILE: /run/secrets/admin_bearer_token
+  TM_DEPOSIT_BEARER_TOKEN_FILE: /run/secrets/deposit_bearer_token
+  TM_DEPOSIT_VIEW_KEY_FILE: /run/secrets/deposit_view_key
+  TM_STATE_DIR: /var/lib/threshold-monero
+  TM_SIGNING_SEED_FILE: /run/secrets/signing_seed
+  TM_BOOTSTRAP_X25519_SECRET_FILE: /run/secrets/bootstrap_x25519_secret
+  TM_SCENARIO_FILE: /etc/threshold-monero/regtest-scenario.json
+  # Each eligible epoch-zero member durably starts only its own canonical dealer role. QUIC
+  # outbox retry makes simultaneous container startup and ordinary process restart idempotent.
+  TM_AUTO_START_GENESIS: "true"
+
+x-party-common: &party-common
+  <<: *signer-image
+  command: [party]
+  environment: *party-environment
+  expose:
+    - "8080/tcp"
+    - "8443/udp"
+  # Do not gate identity restore, QUIC, DKG, QUAL, or proactive refresh on chain RPC
+  # availability. Deposit workers connect lazily and retry after monerod recovers.
+  read_only: true
+  tmpfs:
+    - /tmp:rw,noexec,nosuid,size=64m
+  cap_drop:
+    - ALL
+  security_opt:
+    - no-new-privileges:true
+  stop_grace_period: 15s
+  restart: unless-stopped
+  healthcheck:
+    test: [CMD, /usr/local/bin/party-healthcheck]
+    interval: 5s
+    timeout: 3s
+    retries: 90
+    start_period: 5s
+
+services:
+  monerod-miner:
+    <<: *monero-node
+    command: [monerod, --config-file=/etc/monero/monerod-miner.conf, --non-interactive]
+    volumes:
+      - monerod-miner-regtest:/data
+      - ./docker/configs/monerod-regtest-miner.conf:/etc/monero/monerod-miner.conf:ro
+    networks:
+      - monero-p2p
+      - monero-mining
+
+  monerod-p1:
+    <<: *monero-observer
+    volumes:
+      - monerod-p1-regtest:/data
+      - ./docker/configs/monerod-regtest-observer.conf:/etc/monero/monerod-observer.conf:ro
+    networks:
+      - monero-p2p
+      - monero-rpc-p1
+
+  monerod-p2:
+    <<: *monero-observer
+    volumes:
+      - monerod-p2-regtest:/data
+      - ./docker/configs/monerod-regtest-observer.conf:/etc/monero/monerod-observer.conf:ro
+    networks:
+      - monero-p2p
+      - monero-rpc-p2
+
+  monerod-p3:
+    <<: *monero-observer
+    volumes:
+      - monerod-p3-regtest:/data
+      - ./docker/configs/monerod-regtest-observer.conf:/etc/monero/monerod-observer.conf:ro
+    networks:
+      - monero-p2p
+      - monero-rpc-p3
+
+  monerod-p4:
+    <<: *monero-observer
+    volumes:
+      - monerod-p4-regtest:/data
+      - ./docker/configs/monerod-regtest-observer.conf:/etc/monero/monerod-observer.conf:ro
+    networks:
+      - monero-p2p
+      - monero-rpc-p4
+
+  monerod-p5:
+    <<: *monero-observer
+    volumes:
+      - monerod-p5-regtest:/data
+      - ./docker/configs/monerod-regtest-observer.conf:/etc/monero/monerod-observer.conf:ro
+    networks:
+      - monero-p2p
+      - monero-rpc-p5
+
+  monerod-p6:
+    <<: *monero-observer
+    volumes:
+      - monerod-p6-regtest:/data
+      - ./docker/configs/monerod-regtest-observer.conf:/etc/monero/monerod-observer.conf:ro
+    networks:
+      - monero-p2p
+      - monero-rpc-p6
+
+  monerod-p7:
+    <<: *monero-observer
+    volumes:
+      - monerod-p7-regtest:/data
+      - ./docker/configs/monerod-regtest-observer.conf:/etc/monero/monerod-observer.conf:ro
+    networks:
+      - monero-p2p
+      - monero-rpc-p7
+
+  monerod-p8:
+    <<: *monero-observer
+    volumes:
+      - monerod-p8-regtest:/data
+      - ./docker/configs/monerod-regtest-observer.conf:/etc/monero/monerod-observer.conf:ro
+    networks:
+      - monero-p2p
+      - monero-rpc-p8
+
+  p1:
+    <<: *party-common
+    environment:
+      <<: *party-environment
+      TM_PARTY_ID: "1"
+    volumes:
+      - p1-state:/var/lib/threshold-monero
+      - ./docker/configs/regtest-scenario.json:/etc/threshold-monero/regtest-scenario.json:ro
+      - ./docker/quic-pki:/etc/threshold-monero/quic:ro
+    networks:
+      control:
+        aliases: [p1-admin]
+      peer-quic:
+        aliases: [p1-quic]
+      monero-rpc-p1:
+    secrets:
+      - source: demo-p1-signing-seed
+        target: signing_seed
+      - source: demo-p1-bootstrap-x25519-secret
+        target: bootstrap_x25519_secret
+      - source: demo-p1-quic-private-key
+        target: quic_private_key
+      - source: demo-p1-admin-bearer-token
+        target: admin_bearer_token
+      - source: demo-p1-deposit-bearer-token
+        target: deposit_bearer_token
+      - source: demo-deposit-view-key
+        target: deposit_view_key
+
+  p2:
+    <<: *party-common
+    environment:
+      <<: *party-environment
+      TM_PARTY_ID: "2"
+    volumes:
+      - p2-state:/var/lib/threshold-monero
+      - ./docker/configs/regtest-scenario.json:/etc/threshold-monero/regtest-scenario.json:ro
+      - ./docker/quic-pki:/etc/threshold-monero/quic:ro
+    networks:
+      control:
+        aliases: [p2-admin]
+      peer-quic:
+        aliases: [p2-quic]
+      monero-rpc-p2:
+    secrets:
+      - source: demo-p2-signing-seed
+        target: signing_seed
+      - source: demo-p2-bootstrap-x25519-secret
+        target: bootstrap_x25519_secret
+      - source: demo-p2-quic-private-key
+        target: quic_private_key
+      - source: demo-p2-admin-bearer-token
+        target: admin_bearer_token
+      - source: demo-p2-deposit-bearer-token
+        target: deposit_bearer_token
+      - source: demo-deposit-view-key
+        target: deposit_view_key
+
+  p3:
+    <<: *party-common
+    environment:
+      <<: *party-environment
+      TM_PARTY_ID: "3"
+    volumes:
+      - p3-state:/var/lib/threshold-monero
+      - ./docker/configs/regtest-scenario.json:/etc/threshold-monero/regtest-scenario.json:ro
+      - ./docker/quic-pki:/etc/threshold-monero/quic:ro
+    networks:
+      control:
+        aliases: [p3-admin]
+      peer-quic:
+        aliases: [p3-quic]
+      monero-rpc-p3:
+    secrets:
+      - source: demo-p3-signing-seed
+        target: signing_seed
+      - source: demo-p3-bootstrap-x25519-secret
+        target: bootstrap_x25519_secret
+      - source: demo-p3-quic-private-key
+        target: quic_private_key
+      - source: demo-p3-admin-bearer-token
+        target: admin_bearer_token
+      - source: demo-p3-deposit-bearer-token
+        target: deposit_bearer_token
+      - source: demo-deposit-view-key
+        target: deposit_view_key
+
+  p4:
+    <<: *party-common
+    environment:
+      <<: *party-environment
+      TM_PARTY_ID: "4"
+    volumes:
+      - p4-state:/var/lib/threshold-monero
+      - ./docker/configs/regtest-scenario.json:/etc/threshold-monero/regtest-scenario.json:ro
+      - ./docker/quic-pki:/etc/threshold-monero/quic:ro
+    networks:
+      control:
+        aliases: [p4-admin]
+      peer-quic:
+        aliases: [p4-quic]
+      monero-rpc-p4:
+    secrets:
+      - source: demo-p4-signing-seed
+        target: signing_seed
+      - source: demo-p4-bootstrap-x25519-secret
+        target: bootstrap_x25519_secret
+      - source: demo-p4-quic-private-key
+        target: quic_private_key
+      - source: demo-p4-admin-bearer-token
+        target: admin_bearer_token
+      - source: demo-p4-deposit-bearer-token
+        target: deposit_bearer_token
+      - source: demo-deposit-view-key
+        target: deposit_view_key
+
+  p5:
+    <<: *party-common
+    environment:
+      <<: *party-environment
+      TM_PARTY_ID: "5"
+    volumes:
+      - p5-state:/var/lib/threshold-monero
+      - ./docker/configs/regtest-scenario.json:/etc/threshold-monero/regtest-scenario.json:ro
+      - ./docker/quic-pki:/etc/threshold-monero/quic:ro
+    networks:
+      control:
+        aliases: [p5-admin]
+      peer-quic:
+        aliases: [p5-quic]
+      monero-rpc-p5:
+    secrets:
+      - source: demo-p5-signing-seed
+        target: signing_seed
+      - source: demo-p5-bootstrap-x25519-secret
+        target: bootstrap_x25519_secret
+      - source: demo-p5-quic-private-key
+        target: quic_private_key
+      - source: demo-p5-admin-bearer-token
+        target: admin_bearer_token
+      - source: demo-p5-deposit-bearer-token
+        target: deposit_bearer_token
+      - source: demo-deposit-view-key
+        target: deposit_view_key
+
+  p6:
+    <<: *party-common
+    environment:
+      <<: *party-environment
+      TM_PARTY_ID: "6"
+    volumes:
+      - p6-state:/var/lib/threshold-monero
+      - ./docker/configs/regtest-scenario.json:/etc/threshold-monero/regtest-scenario.json:ro
+      - ./docker/quic-pki:/etc/threshold-monero/quic:ro
+    networks:
+      control:
+        aliases: [p6-admin]
+      peer-quic:
+        aliases: [p6-quic]
+      monero-rpc-p6:
+    secrets:
+      - source: demo-p6-signing-seed
+        target: signing_seed
+      - source: demo-p6-bootstrap-x25519-secret
+        target: bootstrap_x25519_secret
+      - source: demo-p6-quic-private-key
+        target: quic_private_key
+      - source: demo-p6-admin-bearer-token
+        target: admin_bearer_token
+      - source: demo-p6-deposit-bearer-token
+        target: deposit_bearer_token
+      - source: demo-deposit-view-key
+        target: deposit_view_key
+
+  p7:
+    <<: *party-common
+    environment:
+      <<: *party-environment
+      TM_PARTY_ID: "7"
+    volumes:
+      - p7-state:/var/lib/threshold-monero
+      - ./docker/configs/regtest-scenario.json:/etc/threshold-monero/regtest-scenario.json:ro
+      - ./docker/quic-pki:/etc/threshold-monero/quic:ro
+    networks:
+      control:
+        aliases: [p7-admin]
+      peer-quic:
+        aliases: [p7-quic]
+      monero-rpc-p7:
+    secrets:
+      - source: demo-p7-signing-seed
+        target: signing_seed
+      - source: demo-p7-bootstrap-x25519-secret
+        target: bootstrap_x25519_secret
+      - source: demo-p7-quic-private-key
+        target: quic_private_key
+      - source: demo-p7-admin-bearer-token
+        target: admin_bearer_token
+      - source: demo-p7-deposit-bearer-token
+        target: deposit_bearer_token
+      - source: demo-deposit-view-key
+        target: deposit_view_key
+
+  p8:
+    <<: *party-common
+    environment:
+      <<: *party-environment
+      TM_PARTY_ID: "8"
+    volumes:
+      - p8-state:/var/lib/threshold-monero
+      - ./docker/configs/regtest-scenario.json:/etc/threshold-monero/regtest-scenario.json:ro
+      - ./docker/quic-pki:/etc/threshold-monero/quic:ro
+    networks:
+      control:
+        aliases: [p8-admin]
+      peer-quic:
+        aliases: [p8-quic]
+      monero-rpc-p8:
+    secrets:
+      - source: demo-p8-signing-seed
+        target: signing_seed
+      - source: demo-p8-bootstrap-x25519-secret
+        target: bootstrap_x25519_secret
+      - source: demo-p8-quic-private-key
+        target: quic_private_key
+      - source: demo-p8-admin-bearer-token
+        target: admin_bearer_token
+      - source: demo-p8-deposit-bearer-token
+        target: deposit_bearer_token
+      - source: demo-deposit-view-key
+        target: deposit_view_key
+
+  e2e:
+    <<: *signer-image
+    # The acceptance driver is deliberately opt-in. The default Compose application is the
+    # long-running daemon and signer network; a completed one-shot test must not
+    # determine their lifecycle.
+    profiles: [acceptance]
+    command: [e2e, --scenario, /etc/threshold-monero/regtest-scenario.json]
+    environment:
+      RUST_LOG: threshold_monero=info
+      TM_SCENARIO_FILE: /etc/threshold-monero/regtest-scenario.json
+      TM_E2E_ADMIN_BEARER_TOKEN_DIRECTORY: /run/secrets
+      TM_E2E_DEPOSIT_BEARER_TOKEN_DIRECTORY: /run/secrets
+      # The official profile exercises real allocation/funding/permanence and fails closed unless
+      # autonomous consolidation reaches exact signed/broadcast/confirmed status.
+      TM_E2E_DEPOSITS: "1"
+      TM_E2E_REQUIRE_DEPOSIT_CONSOLIDATION: "1"
+    volumes:
+      - ./docker/configs/regtest-scenario.json:/etc/threshold-monero/regtest-scenario.json:ro
+      - ./docker/quic-pki:/etc/threshold-monero/quic:ro
+    secrets:
+      - source: demo-p1-admin-bearer-token
+        target: p1-admin-bearer-token
+      - source: demo-p2-admin-bearer-token
+        target: p2-admin-bearer-token
+      - source: demo-p3-admin-bearer-token
+        target: p3-admin-bearer-token
+      - source: demo-p4-admin-bearer-token
+        target: p4-admin-bearer-token
+      - source: demo-p5-admin-bearer-token
+        target: p5-admin-bearer-token
+      - source: demo-p6-admin-bearer-token
+        target: p6-admin-bearer-token
+      - source: demo-p7-admin-bearer-token
+        target: p7-admin-bearer-token
+      - source: demo-p8-admin-bearer-token
+        target: p8-admin-bearer-token
+      - source: demo-p1-deposit-bearer-token
+        target: p1-deposit-bearer-token
+      - source: demo-p2-deposit-bearer-token
+        target: p2-deposit-bearer-token
+      - source: demo-p3-deposit-bearer-token
+        target: p3-deposit-bearer-token
+      - source: demo-p4-deposit-bearer-token
+        target: p4-deposit-bearer-token
+      - source: demo-p5-deposit-bearer-token
+        target: p5-deposit-bearer-token
+      - source: demo-p6-deposit-bearer-token
+        target: p6-deposit-bearer-token
+      - source: demo-p7-deposit-bearer-token
+        target: p7-deposit-bearer-token
+      - source: demo-p8-deposit-bearer-token
+        target: p8-deposit-bearer-token
+    networks:
+      - control
+      - monero-mining
+    depends_on:
+      monerod-miner:
+        condition: service_healthy
+      p1:
+        condition: service_healthy
+      p2:
+        condition: service_healthy
+      p3:
+        condition: service_healthy
+      p4:
+        condition: service_healthy
+      p5:
+        condition: service_healthy
+      p6:
+        condition: service_healthy
+      p7:
+        condition: service_healthy
+      p8:
+        condition: service_healthy
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=128m
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    restart: "no"
+
+networks:
+  # Operator/acceptance HTTP and peer endpoint discovery use distinct internal bridges, and no
+  # port is host-published in this base file. Because party listeners bind wildcard addresses and
+  # every party joins both bridges, this is endpoint organization rather than an L4 firewall;
+  # bearer authentication remains the HTTP boundary. Scenario peer endpoints use only QUIC/UDP.
+  control:
+    internal: true
+  # Only signer containers join this network. Peer protocol traffic targets QUIC over UDP/8443.
+  peer-quic:
+    internal: true
+  # The acceptance driver can mine and submit only through the test block producer.
+  monero-mining:
+    internal: true
+  # Fakechain block propagation is isolated from every signer RPC path.
+  monero-p2p:
+    internal: true
+  # A separate bridge per party prevents accidental DNS/address fallback to another party's
+  # observer. The scenario additionally requires every configured observer URL to be unique.
+  monero-rpc-p1:
+    internal: true
+  monero-rpc-p2:
+    internal: true
+  monero-rpc-p3:
+    internal: true
+  monero-rpc-p4:
+    internal: true
+  monero-rpc-p5:
+    internal: true
+  monero-rpc-p6:
+    internal: true
+  monero-rpc-p7:
+    internal: true
+  monero-rpc-p8:
+    internal: true
+
+volumes:
+  monerod-miner-regtest:
+  monerod-p1-regtest:
+  monerod-p2-regtest:
+  monerod-p3-regtest:
+  monerod-p4-regtest:
+  monerod-p5-regtest:
+  monerod-p6-regtest:
+  monerod-p7-regtest:
+  monerod-p8-regtest:
+  p1-state:
+  p2-state:
+  p3-state:
+  p4-state:
+  p5-state:
+  p6-state:
+  p7-state:
+  p8-state:
+
+secrets:
+  # Public deterministic signing-seed and bootstrap X25519 fixtures. The two key families are
+  # deliberately independent. Replace all sixteen through a secret manager outside this demo.
+  demo-p1-signing-seed:
+    file: ./docker/demo-secrets/p1-signing-seed.hex
+  demo-p2-signing-seed:
+    file: ./docker/demo-secrets/p2-signing-seed.hex
+  demo-p3-signing-seed:
+    file: ./docker/demo-secrets/p3-signing-seed.hex
+  demo-p4-signing-seed:
+    file: ./docker/demo-secrets/p4-signing-seed.hex
+  demo-p5-signing-seed:
+    file: ./docker/demo-secrets/p5-signing-seed.hex
+  demo-p6-signing-seed:
+    file: ./docker/demo-secrets/p6-signing-seed.hex
+  demo-p7-signing-seed:
+    file: ./docker/demo-secrets/p7-signing-seed.hex
+  demo-p8-signing-seed:
+    file: ./docker/demo-secrets/p8-signing-seed.hex
+  demo-p1-bootstrap-x25519-secret:
+    file: ./docker/demo-secrets/p1-bootstrap-x25519-secret.hex
+  demo-p2-bootstrap-x25519-secret:
+    file: ./docker/demo-secrets/p2-bootstrap-x25519-secret.hex
+  demo-p3-bootstrap-x25519-secret:
+    file: ./docker/demo-secrets/p3-bootstrap-x25519-secret.hex
+  demo-p4-bootstrap-x25519-secret:
+    file: ./docker/demo-secrets/p4-bootstrap-x25519-secret.hex
+  demo-p5-bootstrap-x25519-secret:
+    file: ./docker/demo-secrets/p5-bootstrap-x25519-secret.hex
+  demo-p6-bootstrap-x25519-secret:
+    file: ./docker/demo-secrets/p6-bootstrap-x25519-secret.hex
+  demo-p7-bootstrap-x25519-secret:
+    file: ./docker/demo-secrets/p7-bootstrap-x25519-secret.hex
+  demo-p8-bootstrap-x25519-secret:
+    file: ./docker/demo-secrets/p8-bootstrap-x25519-secret.hex
+  # Public deterministic transport-key fixtures. Compose exposes only the matching key to each
+  # party and mounts it read-only. Replace these with a real secret manager outside this demo.
+  demo-p1-quic-private-key:
+    file: ./docker/demo-secrets/p1-quic-key.der
+  demo-p2-quic-private-key:
+    file: ./docker/demo-secrets/p2-quic-key.der
+  demo-p3-quic-private-key:
+    file: ./docker/demo-secrets/p3-quic-key.der
+  demo-p4-quic-private-key:
+    file: ./docker/demo-secrets/p4-quic-key.der
+  demo-p5-quic-private-key:
+    file: ./docker/demo-secrets/p5-quic-key.der
+  demo-p6-quic-private-key:
+    file: ./docker/demo-secrets/p6-quic-key.der
+  demo-p7-quic-private-key:
+    file: ./docker/demo-secrets/p7-quic-key.der
+  demo-p8-quic-private-key:
+    file: ./docker/demo-secrets/p8-quic-key.der
+  # Every signer receives only its own HTTP capabilities. Sharing one token across parties would
+  # let a compromised signer administer or impersonate a deposit client to every honest peer.
+  demo-p1-admin-bearer-token:
+    file: ./docker/demo-secrets/p1-admin-bearer-token.txt
+  demo-p2-admin-bearer-token:
+    file: ./docker/demo-secrets/p2-admin-bearer-token.txt
+  demo-p3-admin-bearer-token:
+    file: ./docker/demo-secrets/p3-admin-bearer-token.txt
+  demo-p4-admin-bearer-token:
+    file: ./docker/demo-secrets/p4-admin-bearer-token.txt
+  demo-p5-admin-bearer-token:
+    file: ./docker/demo-secrets/p5-admin-bearer-token.txt
+  demo-p6-admin-bearer-token:
+    file: ./docker/demo-secrets/p6-admin-bearer-token.txt
+  demo-p7-admin-bearer-token:
+    file: ./docker/demo-secrets/p7-admin-bearer-token.txt
+  demo-p8-admin-bearer-token:
+    file: ./docker/demo-secrets/p8-admin-bearer-token.txt
+  demo-p1-deposit-bearer-token:
+    file: ./docker/demo-secrets/p1-deposit-bearer-token.txt
+  demo-p2-deposit-bearer-token:
+    file: ./docker/demo-secrets/p2-deposit-bearer-token.txt
+  demo-p3-deposit-bearer-token:
+    file: ./docker/demo-secrets/p3-deposit-bearer-token.txt
+  demo-p4-deposit-bearer-token:
+    file: ./docker/demo-secrets/p4-deposit-bearer-token.txt
+  demo-p5-deposit-bearer-token:
+    file: ./docker/demo-secrets/p5-deposit-bearer-token.txt
+  demo-p6-deposit-bearer-token:
+    file: ./docker/demo-secrets/p6-deposit-bearer-token.txt
+  demo-p7-deposit-bearer-token:
+    file: ./docker/demo-secrets/p7-deposit-bearer-token.txt
+  demo-p8-deposit-bearer-token:
+    file: ./docker/demo-secrets/p8-deposit-bearer-token.txt
+  # Public deterministic scalar used only by the local regtest demo. Every signer can scan all
+  # deposits; replace this custody model and key material outside the demo.
+  demo-deposit-view-key:
+    file: ./docker/demo-secrets/deposit-view-key.hex

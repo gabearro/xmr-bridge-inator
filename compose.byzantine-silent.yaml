@@ -1,0 +1,23 @@
+# Deterministic omission-fault overlay.
+#
+# Party 1 still runs the real signer process and its local HTTP health check succeeds, but its QUIC
+# UDP listener is bound to container loopback. Other parties therefore cannot establish an mTLS
+# peer channel to p1. Party 1 is also the round-zero QUAL leader in the first two epochs, so this
+# overlay exercises both one omission fault and explicit round advancement without granting a
+# fault-injector access to the Docker socket or NET_ADMIN.
+services:
+  p1:
+    environment:
+      TM_QUIC_LISTEN_ADDR: 127.0.0.1:8443
+    # Remove the peer network entirely. Binding only the listener to loopback would still allow
+    # p1 to open outbound authenticated QUIC connections and contribute protocol traffic.
+    networks: !override
+      control:
+        aliases: [p1-admin]
+      monero-rpc-p1:
+    labels:
+      org.threshold-monero.fault: silent-omission
+      org.threshold-monero.fault-party: "1"
+  e2e:
+    environment:
+      TM_FAULTY_PARTIES: "1"

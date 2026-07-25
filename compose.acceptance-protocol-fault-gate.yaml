@@ -1,0 +1,6 @@
+# Private-Regtest-only durable AVSS/QUAL crash boundary. Only p3 is exposed because both crash
+# campaigns target that exact process; the ordinary stack never mounts this admin route.
+services:
+  p3:
+    environment:
+      TM_ACCEPTANCE_ENABLE_PROTOCOL_FAULT_GATE: "1"

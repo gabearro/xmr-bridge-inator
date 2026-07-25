@@ -1,0 +1,12 @@
+.git
+.gitignore
+target
+data
+artifacts
+.env
+*.swp
+*.tmp
+
+# Runtime-only material is mounted by Compose and must never enter an image build context.
+docker/demo-secrets
+docker/quic-pki

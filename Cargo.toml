@@ -1,0 +1,73 @@
+[package]
+name = "threshold-monero"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+license = "MIT OR Apache-2.0"
+description = "Proactive threshold Monero signing with asynchronous verifiable secret sharing"
+
+[lib]
+name = "threshold_monero"
+path = "src/lib.rs"
+
+[[bin]]
+name = "threshold-monero"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0"
+axum = { version = "0.8", features = ["http1", "json", "tokio"] }
+base64 = "0.22"
+blake3 = "1.8"
+chacha20poly1305 = "0.10"
+clap = { version = "4.5", features = ["derive", "env"] }
+curve25519-dalek = { version = "4.1", features = ["digest", "group", "rand_core", "zeroize"] }
+dalek-ff-group = "0.4.1"
+dkg = "=0.6.1"
+ed25519-dalek = { version = "2.2", features = ["rand_core", "zeroize"] }
+frost = { package = "modular-frost", version = "=0.11.0", features = ["ed25519"] }
+hex = "0.4"
+hkdf = "0.12"
+monero-oxide = { path = "vendor/monero-oxide/monero-oxide", features = ["std", "compile-time-generators"] }
+monero-simple-request-rpc = { path = "vendor/monero-oxide/monero-oxide/interface/daemon/simple-request", features = ["webpki-roots"] }
+monero-wallet = { path = "vendor/monero-oxide/monero-oxide/wallet", features = ["multisig", "compile-time-generators"] }
+postcard = { version = "1.1", features = ["alloc"] }
+quinn = { version = "=0.11.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
+rand = "0.8"
+rand_chacha = "0.3"
+rand_core = "0.6"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+rustls = { version = "=0.23.42", default-features = false, features = ["ring", "std"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10"
+subtle = "2.6"
+thiserror = "2.0"
+tokio = { version = "1.48", features = ["fs", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+tower-http = { version = "0.6", features = ["trace"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+url = { version = "2.5", features = ["serde"] }
+x25519-dalek = { version = "2.0", features = ["static_secrets", "zeroize"] }
+zeroize = { version = "1.8", features = ["derive"] }
+
+[dev-dependencies]
+rcgen = { version = "=0.14.8", default-features = false, features = ["crypto", "ring"] }
+tempfile = "3.23"
+
+[profile.dev.package]
+curve25519-dalek = { opt-level = 3 }
+dalek-ff-group = { opt-level = 3 }
+monero-oxide = { opt-level = 3 }
+
+[profile.release]
+overflow-checks = true
+panic = "unwind"
+strip = "debuginfo"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = "warn"
+pedantic = "warn"

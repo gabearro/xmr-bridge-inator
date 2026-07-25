@@ -1,0 +1,28 @@
+# Acceptance-only overlay for the deterministic consolidation omission campaign. Party startup
+# still rejects this hook unless the scenario is both demo-only and regtest, and every gate
+# mutation additionally requires the ordinary admin bearer token.
+services:
+  p1:
+    environment:
+      TM_ACCEPTANCE_ENABLE_CONSOLIDATION_GATE: "1"
+  p2:
+    environment:
+      TM_ACCEPTANCE_ENABLE_CONSOLIDATION_GATE: "1"
+  p3:
+    environment:
+      TM_ACCEPTANCE_ENABLE_CONSOLIDATION_GATE: "1"
+  p4:
+    environment:
+      TM_ACCEPTANCE_ENABLE_CONSOLIDATION_GATE: "1"
+  p5:
+    environment:
+      TM_ACCEPTANCE_ENABLE_CONSOLIDATION_GATE: "1"
+  p6:
+    environment:
+      TM_ACCEPTANCE_ENABLE_CONSOLIDATION_GATE: "1"
+  p7:
+    environment:
+      TM_ACCEPTANCE_ENABLE_CONSOLIDATION_GATE: "1"
+  p8:
+    environment:
+      TM_ACCEPTANCE_ENABLE_CONSOLIDATION_GATE: "1"

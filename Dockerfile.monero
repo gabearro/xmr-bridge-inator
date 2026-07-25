@@ -1,0 +1,69 @@
+# syntax=docker/dockerfile:1.7
+
+# Monero does not publish a first-party OCI image. Build a small local runtime from the official
+# release archive instead of trusting a third-party image. The digest below is review-pinned: this
+# build verifies the downloaded bytes against that exact SHA-256 value, but does not independently
+# verify Monero's GPG-signed hashes.txt.
+FROM debian:bookworm-slim@sha256:7b140f374b289a7c2befc338f42ebe6441b7ea838a042bbd5acbfca6ec875818 AS fetcher
+
+ARG TARGETARCH
+ARG MONERO_VERSION=0.18.5.1
+
+RUN set -eux; \
+    test "${MONERO_VERSION}" = "0.18.5.1"; \
+    apt-get update; \
+    apt-get install --no-install-recommends --yes ca-certificates curl bzip2; \
+    rm -rf /var/lib/apt/lists/*; \
+    case "${TARGETARCH}" in \
+      amd64) \
+        archive="monero-linux-x64-v${MONERO_VERSION}.tar.bz2"; \
+        expected_sha256="22a7dda7b0cb699fdd6b7674c3b4a4465b337cc98a54983523b759e1e7cc9958" \
+        ;; \
+      arm64) \
+        archive="monero-linux-armv8-v${MONERO_VERSION}.tar.bz2"; \
+        expected_sha256="c0caf042cb7c7b760f5ad6be188084b59352440b32990a78b8051497b9398dbc" \
+        ;; \
+      *) \
+        echo "unsupported Docker target architecture: ${TARGETARCH}" >&2; \
+        exit 1 \
+        ;; \
+    esac; \
+    curl --fail --location --proto '=https' --show-error --silent \
+      --connect-timeout 15 --max-time 300 --retry 5 --retry-all-errors \
+      --output "/tmp/${archive}" \
+      "https://downloads.getmonero.org/cli/${archive}"; \
+    printf '%s  %s\n' "${expected_sha256}" "/tmp/${archive}" | sha256sum --check --strict -; \
+    mkdir -p /opt/monero; \
+    tar --extract --bzip2 --file "/tmp/${archive}" --strip-components=1 --directory /opt/monero; \
+    test -x /opt/monero/monerod; \
+    rm -f "/tmp/${archive}"
+
+FROM debian:bookworm-slim@sha256:7b140f374b289a7c2befc338f42ebe6441b7ea838a042bbd5acbfca6ec875818
+
+ARG MONERO_VERSION=0.18.5.1
+
+LABEL org.opencontainers.image.title="Monero daemon runtime for Threshold Monero" \
+      org.opencontainers.image.description="Official Monero daemon with a review-pinned release-archive SHA-256 digest" \
+      org.opencontainers.image.source="https://github.com/monero-project/monero" \
+      org.opencontainers.image.version="${MONERO_VERSION}" \
+      org.opencontainers.image.licenses="BSD-3-Clause"
+
+RUN set -eux; \
+    apt-get update; \
+    apt-get install --no-install-recommends --yes ca-certificates curl tini; \
+    rm -rf /var/lib/apt/lists/*; \
+    groupadd --gid 10001 monero; \
+    useradd --uid 10001 --gid 10001 --home-dir /home/monero --create-home --shell /usr/sbin/nologin monero; \
+    install --directory --owner=monero --group=monero /data
+
+COPY --from=fetcher /opt/monero/monerod /usr/local/bin/monerod
+COPY --chmod=0755 docker/monero-healthcheck.sh /usr/local/bin/monero-healthcheck
+
+USER 10001:10001
+WORKDIR /home/monero
+
+EXPOSE 18080 18081
+STOPSIGNAL SIGTERM
+
+ENTRYPOINT ["/usr/bin/tini", "--"]
+CMD ["monerod", "--non-interactive"]
