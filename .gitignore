@@ -7,3 +7,4 @@
 /.idea/
 docker/quic-pki/*.pem
 docker/quic-pki/*.cnf
+.DS_Store

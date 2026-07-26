@@ -3268,16 +3268,11 @@ impl DepositWorkerState {
                 }
                 let binding_chunk = output_bindings(&block)?;
                 if !binding_chunk.is_empty() {
-                    request(
-                        request_timeout,
-                        "atomic allocation-backfill output binding",
-                        Some(height),
-                        output_index.bind_outputs(
-                            self.wallet_id(),
-                            portable_snapshot,
-                            &binding_chunk,
-                        ),
-                    )
+                    bind_local_outputs(output_index.bind_outputs(
+                        self.wallet_id(),
+                        portable_snapshot,
+                        &binding_chunk,
+                    ))
                     .await?;
                 }
                 let mut progress = backfill.pending.clone().unwrap_or(PendingDepositBlockScan {
@@ -3339,12 +3334,11 @@ impl DepositWorkerState {
             return Err(DepositWorkerError::AllocationBackfillBranchChanged);
         }
         if !binding_chunk.is_empty() {
-            request(
-                request_timeout,
-                "atomic allocation-backfill output binding",
-                Some(height),
-                output_index.bind_outputs(self.wallet_id(), portable_snapshot, &binding_chunk),
-            )
+            bind_local_outputs(output_index.bind_outputs(
+                self.wallet_id(),
+                portable_snapshot,
+                &binding_chunk,
+            ))
             .await?;
         }
 
@@ -3654,16 +3648,11 @@ impl DepositWorkerState {
                     }
                     progress.cursor = next_cursor;
                     if !binding_chunk.is_empty() {
-                        request(
-                            request_timeout,
-                            "atomic local deposit-output binding",
-                            Some(height),
-                            output_index.bind_outputs(
-                                self.wallet_id(),
-                                portable_snapshot,
-                                &binding_chunk,
-                            ),
-                        )
+                        bind_local_outputs(output_index.bind_outputs(
+                            self.wallet_id(),
+                            portable_snapshot,
+                            &binding_chunk,
+                        ))
                         .await?;
                     }
                     let mut candidate = self.clone();
@@ -3830,12 +3819,11 @@ impl DepositWorkerState {
                 }
             }
             if !binding_chunk.is_empty() {
-                request(
-                    request_timeout,
-                    "atomic local deposit-output binding",
-                    Some(height),
-                    output_index.bind_outputs(self.wallet_id(), portable_snapshot, &binding_chunk),
-                )
+                bind_local_outputs(output_index.bind_outputs(
+                    self.wallet_id(),
+                    portable_snapshot,
+                    &binding_chunk,
+                ))
                 .await?;
             }
             fetched.push(evidence);
@@ -6405,6 +6393,26 @@ async fn request<T>(
             }
             other => DepositWorkerError::ChainSource(other),
         })
+}
+
+/// Await a party-local durable output binding to completion, without the per-operation daemon
+/// deadline that [`request`] applies.
+///
+/// `bind_outputs` writes the party-local burning-bug safety index through encrypted storage; it is
+/// not a monero-daemon RPC. The daemon deadline exists to bound an unresponsive remote node, and
+/// applying it to this binding is a category error with a concrete liveness failure: elapsing the
+/// deadline cancels the in-flight future mid-fsync, and that interrupted attempt leaves a pending
+/// index journal every retry must first roll back. When the binding cannot fit inside the deadline
+/// at all, the scanner can never durably record a confirmed output and the deposit-observation
+/// pipeline stalls permanently. The storage layer already fails closed on conflicting bindings and
+/// recovers its own journals idempotently, so this local transition must run to completion.
+async fn bind_local_outputs(future: ChainFuture<'_, ()>) -> Result<(), DepositWorkerError> {
+    future.await.map_err(|error| match error {
+        ChainSourceError::UnsupportedHardfork(version) => {
+            DepositWorkerError::UnsupportedHardfork(version)
+        }
+        other => DepositWorkerError::ChainSource(other),
+    })
 }
 
 fn output_scan_failure<E: std::fmt::Display>(

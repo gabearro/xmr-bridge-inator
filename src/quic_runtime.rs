@@ -41,8 +41,7 @@ use crate::{
     },
     deposit_index::{
         DepositIndexError, DepositIndexObjectId, DepositIndexReader, PortableStateQuery,
-        PortableStateRecord, lookup_portable_state, next_portable_state_query_object,
-        verify_portable_index_object,
+        PortableStateRecord, lookup_portable_state, verify_portable_index_object,
     },
     deposit_service::DepositPeerMessageId,
     deposit_sync_wire::{
@@ -879,37 +878,44 @@ impl DepositSyncDownload {
         Ok(None)
     }
 
-    fn path_to_missing_index_object(
+    /// Return the root-connected path to one portable-index object that a already-downloaded
+    /// ancestor references but that has not yet been downloaded, walking the *entire* index tree.
+    /// Returns `None` once every object reachable from the advertised root is present.
+    ///
+    /// Adopting a mixed observation tip re-validates the whole portable index (its scanner-snapshot
+    /// proof traverses every node and value), so the download must materialize the complete tree —
+    /// not merely the terminal ledger-statement path. The path is re-sent from the root on each
+    /// page so the server can re-verify reachability.
+    fn path_to_next_missing_index_object(
         &self,
         wallet: crate::deposit_wallet::DepositWalletId,
         root: DepositIndexObjectId,
-        missing: DepositIndexObjectId,
-    ) -> anyhow::Result<Vec<DepositSyncObjectRef>> {
+    ) -> anyhow::Result<Option<Vec<DepositSyncObjectRef>>> {
+        if !self.contains(DepositSyncObjectRef::Index(root)) {
+            return Ok(Some(vec![DepositSyncObjectRef::Index(root)]));
+        }
         let mut stack = vec![(root, vec![root])];
         let mut visited = BTreeSet::new();
         while let Some((candidate, path)) = stack.pop() {
             if !visited.insert(candidate) {
                 continue;
             }
-            if candidate == missing {
-                return Ok(path.into_iter().map(DepositSyncObjectRef::Index).collect());
-            }
             let Some(bytes) = self.bytes(DepositSyncObjectRef::Index(candidate)) else {
                 continue;
             };
             let verified = verify_portable_index_object(wallet, candidate, bytes)?;
-            for child in verified.children().iter().copied().rev() {
+            for child in verified.children().iter().copied() {
                 let mut child_path = path.clone();
                 child_path.push(child);
-                if child == missing {
-                    return Ok(child_path.into_iter().map(DepositSyncObjectRef::Index).collect());
+                if !self.contains(DepositSyncObjectRef::Index(child)) {
+                    return Ok(Some(
+                        child_path.into_iter().map(DepositSyncObjectRef::Index).collect(),
+                    ));
                 }
-                if self.contains(DepositSyncObjectRef::Index(child)) {
-                    stack.push((child, child_path));
-                }
+                stack.push((child, child_path));
             }
         }
-        anyhow::bail!("next portable-index object is detached from its advertised root")
+        Ok(None)
     }
 
     fn index_manifest(
@@ -922,14 +928,10 @@ impl DepositSyncDownload {
         }
         let head = portable.to_index_head()?;
         let root = head.root().context("non-genesis portable index omitted its root")?;
-        let query = PortableStateQuery::Sequence(portable.through_sequence());
-        if let Some(missing) = next_portable_state_query_object(self, &head, query)? {
-            return Ok(Some(self.path_to_missing_index_object(
-                portable.wallet_id(),
-                root,
-                missing,
-            )?));
+        if let Some(path) = self.path_to_next_missing_index_object(portable.wallet_id(), root)? {
+            return Ok(Some(path));
         }
+        let query = PortableStateQuery::Sequence(portable.through_sequence());
         let Some(PortableStateRecord::Statement(statement)) =
             lookup_portable_state(self, &head, query)?
         else {
@@ -2097,9 +2099,18 @@ impl QuicRuntime {
             }
         }
 
-        // Deposit ledger effects are globally ordered. Keep at most the earliest sequence and
-        // causal phase in flight for each recipient; otherwise a fast Attest stream can overtake
-        // its proposal and turn an ordinary network race into an UnknownSlot rejection.
+        // Deposit effects are causally ordered only within one globally ordered sequence: an
+        // Attest or vote for sequence N must never overtake the proposal it references at N, or an
+        // ordinary network race becomes an UnknownSlot rejection. Distinct sequences are
+        // independent — a checkpoint round at N+1 does not depend on the wire delivery of any
+        // sequence-N effect, and a premature arrival is re-validated against the recipient's own
+        // head and retried, never mis-accepted. Keying this fence per recipient alone therefore
+        // over-serializes: a sequence-N effect a silent or offline recipient never acknowledges
+        // (e.g. a ledger Certificate bound for the stopped party) permanently occupies that
+        // recipient's single slot and starves every later sequence, wedging the
+        // observation-checkpoint round behind it. Fence per (recipient, sequence) so each
+        // independent sequence keeps its own causal-earliest phase in flight while later sequences
+        // fall through.
         let mut earliest_deposit = BTreeMap::new();
         for pending in
             self.server.pending_deposit_peer_messages(self.config.outbox_batch_size).await
@@ -2130,11 +2141,12 @@ impl QuicRuntime {
                     continue;
                 }
             };
-            let replace = earliest_deposit.get(&recipient).is_none_or(
+            let lane = (recipient, pending.id.sequence());
+            let replace = earliest_deposit.get(&lane).is_none_or(
                 |current: &crate::deposit_service::PendingDepositPeerMessage| {
                     // Every entry admitted into this map already passed the same decoder. If the
                     // retained value somehow stops decoding, replacing it is safer than letting
-                    // a poison predecessor starve this recipient forever.
+                    // a poison predecessor starve this lane forever.
                     match deposit_pending_causal_key(current) {
                         Ok(current) => candidate < current,
                         Err(_) => true,
@@ -2142,7 +2154,7 @@ impl QuicRuntime {
                 },
             );
             if replace {
-                earliest_deposit.insert(recipient, pending);
+                earliest_deposit.insert(lane, pending);
             }
         }
         for pending in earliest_deposit.into_values() {

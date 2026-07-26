@@ -147,6 +147,11 @@ const DEPOSIT_LOCAL_STATE_VERSION: u16 = 12;
 const ALLOCATION_ISSUANCE_LEAD_SECONDS: u64 = 2 * MIN_ALLOCATION_CERTIFICATION_LEAD_SECONDS;
 const MAX_DEPOSIT_OUTBOX_ENTRIES: usize = 16_384;
 const MAX_DEPOSIT_OUTBOX_ENTRIES_PER_RECIPIENT: usize = 4_096;
+/// Upper bound on distinct content-addressed artifacts retained by [`DepositService`] to answer
+/// repeated compact-state `SyncObjects` pages without re-decrypting a shared path prefix. It
+/// comfortably exceeds the object count of one archive path frontier; on overflow the cache is
+/// dropped wholesale, trading a cold re-read for a hard memory ceiling.
+const SERVED_ARTIFACT_CACHE_MAX: usize = 8_192;
 const MAX_PUBLIC_CONSOLIDATIONS_PER_REQUEST: usize = 1_024;
 // A portable completion retains canonical Monero transaction bytes and its n-f certificate. Keep
 // this below the authenticated QUIC 8 MiB frame while large enough that every ledger-valid
@@ -2369,13 +2374,6 @@ impl DepositProtocolState {
             .ok_or(DepositServiceError::InvalidDepositIndexCheckpoint)?;
         let required = usize::from(
             self.registry.active().committee().n() - self.registry.active().fault_bound(),
-        );
-        eprintln!(
-            "TRACE_CKPT completed_index_checkpoint witnesses={} required={} seq={} parties={:?}",
-            checkpoint.witnesses.len(),
-            required,
-            checkpoint.statement.sequence(),
-            checkpoint.witnesses.keys().collect::<Vec<_>>(),
         );
         if checkpoint.witnesses.len() < required {
             return Ok(None);
@@ -6826,6 +6824,23 @@ pub struct DepositService {
     consolidation_backend: Option<Arc<dyn DepositConsolidationBackend>>,
     runtime: Mutex<Option<DepositRuntime>>,
     runtime_ready: AtomicBool,
+    /// Snapshot revision whose latest index checkpoint has already passed
+    /// [`Self::authenticated_latest_index_checkpoint`]. A snapshot revision is monotonic and
+    /// content-unique, so re-authenticating the same revision would recompute the identical
+    /// threshold-signature `verify_anchored` result. Caching that outcome lets a frozen source
+    /// answer a burst of `SyncHead`/`SyncObjects` advertisements without repeating the expensive
+    /// verification on every request; any snapshot mutation advances the revision and forces a
+    /// fresh authentication.
+    authenticated_checkpoint_revision: std::sync::atomic::AtomicU64,
+    /// Decrypted plaintext of content-addressed artifacts already served over the compact-state
+    /// sync path, keyed by their immutable object reference. A joining replica walks the archive
+    /// one root-connected path at a time and must re-send every downloaded ancestor in each
+    /// successive page so the server can re-verify reachability; without this cache the source
+    /// re-reads and re-decrypts the shared path prefix on every page, which is quadratic in the
+    /// archive depth. The reference is a content hash, so a cached entry can never disagree with a
+    /// fresh load; the map is bounded and cleared wholesale once it exceeds
+    /// [`SERVED_ARTIFACT_CACHE_MAX`].
+    served_artifact_cache: Mutex<BTreeMap<DepositSyncObjectRef, Vec<u8>>>,
 }
 
 impl std::fmt::Debug for DepositService {
@@ -8892,6 +8907,8 @@ impl DepositService {
             consolidation_backend,
             runtime: Mutex::new(None),
             runtime_ready: AtomicBool::new(false),
+            authenticated_checkpoint_revision: std::sync::atomic::AtomicU64::new(u64::MAX),
+            served_artifact_cache: Mutex::new(BTreeMap::new()),
         }))
     }
 
@@ -10440,6 +10457,21 @@ impl DepositService {
         Ok(DepositSyncContext::new(self.scenario.quic_network_id()?, runtime.deriver.wallet_id())?)
     }
 
+    /// Report whether this replica's compact deposit archive is still at the empty genesis base
+    /// (through-sequence zero). This is exactly the local precondition under which
+    /// `adopt_deposit_sync_candidate` may install an imported archive; a replica with any real
+    /// compact state can never be advanced by import. It is read-only and takes only the brief
+    /// snapshot lock, so a scanner-ready empty replica can keep probing peers for a longer
+    /// committee-certified archive to import.
+    pub async fn deposit_archive_at_empty_base(&self) -> Result<bool, DepositServiceError> {
+        let guard = self.runtime.lock().await;
+        let runtime = guard.as_ref().ok_or(DepositServiceError::NotInitialized)?;
+        let head = PortableDepositIndexHead::from_head(
+            runtime.snapshot.deposit_index_checkpoint().portable_head(),
+        )?;
+        Ok(head.through_sequence() == 0)
+    }
+
     /// Advertise only the exact settled authorities retained by one authenticated snapshot.
     pub async fn deposit_sync_advertisement(
         &self,
@@ -10457,7 +10489,15 @@ impl DepositService {
             }
             runtime.snapshot.clone()
         };
-        self.authenticated_latest_index_checkpoint(&snapshot).await?;
+        // Authenticate the snapshot-authoritative checkpoint at most once per snapshot revision.
+        // The verification is a self-consistency proof over immutable, content-addressed local
+        // state, so a cache hit for the current revision is exactly equivalent to re-running it,
+        // but avoids repeating the expensive `verify_anchored` for every advertisement a source
+        // serves during one replica's compact-state pull.
+        if self.authenticated_checkpoint_revision.load(Ordering::Acquire) != snapshot.revision {
+            self.authenticated_latest_index_checkpoint(&snapshot).await?;
+            self.authenticated_checkpoint_revision.store(snapshot.revision, Ordering::Release);
+        }
         Ok(DepositSyncAdvertisement::from_checkpoints(
             context,
             snapshot.compact_registry_checkpoint(),
@@ -10491,8 +10531,24 @@ impl DepositService {
         )?;
         let mut plaintext = BTreeMap::new();
         for reference in request.references().iter().copied() {
-            let artifact = artifacts.load_artifact(reference.storage_reference()?).await?;
-            if plaintext.insert(reference, artifact.contents.into_bytes()).is_some() {
+            // A joining replica re-lists every already-downloaded ancestor of the object it still
+            // needs so this server can re-verify root reachability. Serve those repeats from the
+            // decrypted-artifact cache instead of re-reading and re-decrypting them each page.
+            let cached = self.served_artifact_cache.lock().await.get(&reference).cloned();
+            let bytes = match cached {
+                Some(bytes) => bytes,
+                None => {
+                    let artifact = artifacts.load_artifact(reference.storage_reference()?).await?;
+                    let bytes = artifact.contents.into_bytes();
+                    let mut cache = self.served_artifact_cache.lock().await;
+                    if cache.len() >= SERVED_ARTIFACT_CACHE_MAX {
+                        cache.clear();
+                    }
+                    cache.insert(reference, bytes.clone());
+                    bytes
+                }
+            };
+            if plaintext.insert(reference, bytes).is_some() {
                 return Err(DepositSyncWireError::InvalidObjectManifest.into());
             }
         }
@@ -14631,13 +14687,8 @@ impl DepositService {
         )?;
         match completed {
             Some(certificate) => {
-                let r = self
-                    .finalize_index_checkpoint_certificate(runtime, candidate, certificate, now)
-                    .await;
-                if let Err(e) = &r {
-                    eprintln!("TRACE_FINALIZE (decided-round) error={e:?}");
-                }
-                r
+                self.finalize_index_checkpoint_certificate(runtime, candidate, certificate, now)
+                    .await
             }
             None => self.commit_protocol_with_messages(runtime, candidate, messages).await,
         }
@@ -15274,13 +15325,8 @@ impl DepositService {
             previous.as_ref(),
         )? {
             Some(certificate) => {
-                let r = self
-                    .finalize_index_checkpoint_certificate(runtime, candidate, certificate, now)
-                    .await;
-                if let Err(e) = &r {
-                    eprintln!("TRACE_FINALIZE (attest-handler) error={e:?}");
-                }
-                r
+                self.finalize_index_checkpoint_certificate(runtime, candidate, certificate, now)
+                    .await
             }
             None => self.commit_protocol(runtime, candidate).await,
         }
@@ -16182,13 +16228,10 @@ impl DepositService {
         {
             return Err(DepositServiceError::InvalidDepositIndexCheckpoint);
         }
-
-        eprintln!("TRACE_FIN step=verify_checkpoint ok");
         let staged_ledger = self
             .archive
             .authenticate_certified_entry_artifact(lane.ledger_artifact, &verified_entry)
             .await?;
-        eprintln!("TRACE_FIN step=authenticate_entry ok");
         let archive_append = self
             .archive
             .append_ledger_checkpoint(
@@ -16204,8 +16247,6 @@ impl DepositService {
         {
             return Err(DepositServiceError::InvalidArchiveHead);
         }
-
-        eprintln!("TRACE_FIN step=append_ledger_checkpoint ok");
         let mut index_guard = self.deposit_index.lock().await;
         let store =
             index_guard.as_mut().ok_or(DepositServiceError::InvalidDepositIndexCheckpoint)?;
@@ -16214,19 +16255,26 @@ impl DepositService {
             return Err(DepositServiceError::InvalidDepositIndexCheckpoint);
         }
 
+        // `record_certified_entry_locator` reads and cross-checks four local-safety aliases: the
+        // ledger-keyed CertifiedEntryLocator and SignedLedgerSlot plus the checkpoint-keyed
+        // CertifiedCheckpointLocator and SignedIndexCheckpointSlot. All four Merkle paths must be
+        // resident in the bounded cache after `reset_bounded_cache` retains only roots; preloading
+        // just the two ledger-keyed paths left the checkpoint-keyed absence/equality proofs
+        // uncached, so the builder read failed closed with MissingObject and the finalize aborted.
+        let checkpoint_sequence = checkpoint_certificate.statement().sequence();
         store.reset_bounded_cache()?;
         for query in [
             LocalSafetyQuery::SignedLedgerSlot(lane.ledger.statement.sequence),
             LocalSafetyQuery::CertifiedEntryLocator(lane.ledger.statement.sequence),
+            LocalSafetyQuery::SignedIndexCheckpointSlot(checkpoint_sequence),
+            LocalSafetyQuery::CertifiedCheckpointLocator(checkpoint_sequence),
         ] {
             store.preload_local_safety_query(query).await?;
         }
-        eprintln!("TRACE_FIN step=preload_local_safety ok");
         let local_head = store.local_safety_head().clone();
         let mut local_builder = DepositIndexBuilder::new(&*store, local_head)?;
         local_builder.record_certified_entry_locator(archive_append.verified_ledger_locator())?;
         let local_update = local_builder.finish()?;
-        eprintln!("TRACE_FIN step=local_builder ok");
 
         let prior_terminal = match &lane.ledger.statement.payload {
             LedgerPayload::LateConsolidationSettlement(settlement) => {
@@ -16244,13 +16292,10 @@ impl DepositService {
             | LedgerPayload::ConsolidationCompletion(_)
             | LedgerPayload::ConsolidationAbandonment(_) => None,
         };
-        eprintln!("TRACE_FIN step=prior_terminal ok");
         Self::preload_portable_statement_paths(store, &lane.ledger.statement).await?;
-        eprintln!("TRACE_FIN step=preload_portable_paths ok");
         let portable_head = store.portable_head().clone();
         let mut portable_builder = DepositIndexBuilder::new(&*store, portable_head)?;
         let preflight = portable_builder.preflight_ledger_statement(&lane.ledger.statement)?;
-        eprintln!("TRACE_FIN step=preflight ok");
         let candidate_terminal = match &lane.ledger.statement.payload {
             LedgerPayload::ConsolidationCompletion(completion) => {
                 portable_builder.candidate_portable_terminal(completion.id())?
@@ -16474,6 +16519,32 @@ impl DepositService {
                 compact_store.abort_prepared(prepared_registry).await?;
             }
             return Err(error);
+        }
+        // Re-warm the local-safety alias paths that the local index update's staged verification
+        // reads. `prepare_snapshot` re-verifies each update against the store using only the
+        // objects reachable in the bounded cache: `preload_staged` loads the update's own recorded
+        // verification set, but `validate_touched_paths` additionally cross-checks each certified
+        // locator against its counterpart and its signed-slot alias (SignedLedgerSlot,
+        // SignedIndexCheckpointSlot, and the paired locator). Those cross-referenced records are not
+        // in the update's touched set, so they are absent from `next_verification`. The earlier
+        // `preload_portable_statement_paths` call reset the bounded cache to portable roots, evicting
+        // the local-safety paths staged for the local builder, so without this re-warm the cross
+        // checks read closed with MissingObject. Preloading here only populates the read cache; every
+        // verification the checkpoint performs is unchanged.
+        if updates.len() > 1 {
+            for query in [
+                LocalSafetyQuery::SignedLedgerSlot(lane.ledger.statement.sequence),
+                LocalSafetyQuery::CertifiedEntryLocator(lane.ledger.statement.sequence),
+                LocalSafetyQuery::SignedIndexCheckpointSlot(checkpoint_sequence),
+                LocalSafetyQuery::CertifiedCheckpointLocator(checkpoint_sequence),
+            ] {
+                if let Err(error) = store.preload_local_safety_query(query).await {
+                    if let Some(prepared_registry) = &prepared_compact {
+                        compact_store.abort_prepared(prepared_registry).await?;
+                    }
+                    return Err(error.into());
+                }
+            }
         }
         let prepared = match store.prepare_snapshot(updates).await {
             Ok(prepared) => prepared,

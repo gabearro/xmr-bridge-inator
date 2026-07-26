@@ -710,6 +710,17 @@ impl DepositIndexStore {
             return Err(DepositIndexStoreError::TransitionInProgress);
         }
         let base_checkpoint_digest = self.checkpoint.digest();
+        // A previous attempt at this exact transition can be cancelled mid-write (the worker bounds
+        // every binding by its per-operation daemon deadline) after it fsynced a pending journal
+        // but before it materialized or committed. That journal embeds a fresh random batch owner,
+        // so a naive retry would mint a different owner and collide with the fork-detection check
+        // in `save_deposit_index_journal`, wedging the scanner forever. Roll back any such stale
+        // pending journal first so the retry rebinds from the exact settled base, honouring the
+        // `bind_outputs` idempotency contract without relaxing fork detection.
+        for update in &updates {
+            let scope = scope_for_namespace(update.expected_head().namespace())?;
+            self.abort_stale_pending_journal(scope).await?;
+        }
         let mut prepared_journals = BTreeMap::new();
         let mut scopes = BTreeSet::new();
         for update in updates {
@@ -818,6 +829,53 @@ impl DepositIndexStore {
         Ok(())
     }
 
+    /// Discard a pending journal that a cancelled `prepare_snapshot` may have fsynced for `scope`
+    /// before it could materialize or commit its successor.
+    ///
+    /// A journal keyed to the *current* settled head is necessarily pending: committing one
+    /// advances the head and rekeys its journal by the new revision, so nothing found under the
+    /// current-head key can name an authenticated successor. Every object it references therefore
+    /// belongs to an interrupted attempt whose transition was never installed, and rolling it back
+    /// restores the exact settled base. This preserves the fork-detection guarantee — a genuinely
+    /// divergent successor is keyed to a different old head and is never matched here — while giving
+    /// `bind_outputs` the exact idempotency its trait contract requires across a mid-write
+    /// cancellation (e.g. the worker's per-operation daemon deadline elapsing during the fsync).
+    async fn abort_stale_pending_journal(
+        &mut self,
+        scope: DepositIndexJournalScope,
+    ) -> Result<(), DepositIndexStoreError> {
+        let key = journal_key(self.checkpoint.head(scope), scope)?;
+        let Some(blob) = self.protocol.load_deposit_index_journal(key).await? else {
+            return Ok(());
+        };
+        let bytes = blob.into_bytes();
+        let journal = DepositIndexMutationJournal::from_bytes(&bytes)?;
+        let staged = journal.staged();
+        validate_journal_binding(
+            key,
+            staged,
+            self.checkpoint.head(scope),
+            JournalPosition::Pending,
+        )?;
+        self.materialize_update(staged.update(), journal.owner()).await?;
+        self.preload_staged(staged, false).await?;
+        staged.verify_staged(self)?;
+        for (id, _) in staged.update().staged_objects() {
+            if !self.index_object_is_pinned(id)? {
+                self.artifacts
+                    .remove_artifact_if_owned(id.storage_reference(), journal.owner())
+                    .await?;
+            } else {
+                self.artifacts
+                    .release_artifact_ownership(id.storage_reference(), journal.owner())
+                    .await?;
+            }
+            self.remove_cached(id);
+        }
+        self.protocol.destroy_deposit_index_journal(key, &bytes).await?;
+        Ok(())
+    }
+
     async fn recover_startup(&mut self) -> Result<(), DepositIndexStoreError> {
         // Crash window B: the wallet snapshot installed the target head and retained the exact
         // old-head journal key. Missing means cleanup completed before the crash.
@@ -850,34 +908,7 @@ impl DepositIndexStore {
         // Crash window A: journals/artifacts exist but the snapshot still authenticates the old
         // head. Probe exactly one derivable key per scope, verify it, and abort its exact objects.
         for scope in [DepositIndexJournalScope::Portable, DepositIndexJournalScope::LocalSafety] {
-            let key = journal_key(self.checkpoint.head(scope), scope)?;
-            if let Some(blob) = self.protocol.load_deposit_index_journal(key).await? {
-                let bytes = blob.into_bytes();
-                let journal = DepositIndexMutationJournal::from_bytes(&bytes)?;
-                let staged = journal.staged();
-                validate_journal_binding(
-                    key,
-                    staged,
-                    self.checkpoint.head(scope),
-                    JournalPosition::Pending,
-                )?;
-                self.materialize_update(staged.update(), journal.owner()).await?;
-                self.preload_staged(staged, false).await?;
-                staged.verify_staged(self)?;
-                for (id, _) in staged.update().staged_objects() {
-                    if !self.index_object_is_pinned(id)? {
-                        self.artifacts
-                            .remove_artifact_if_owned(id.storage_reference(), journal.owner())
-                            .await?;
-                    } else {
-                        self.artifacts
-                            .release_artifact_ownership(id.storage_reference(), journal.owner())
-                            .await?;
-                    }
-                    self.remove_cached(id);
-                }
-                self.protocol.destroy_deposit_index_journal(key, &bytes).await?;
-            }
+            self.abort_stale_pending_journal(scope).await?;
         }
         self.validate_current_roots().await?;
         self.reset_bounded_cache()?;

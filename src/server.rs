@@ -3325,7 +3325,16 @@ impl PartyServer {
             return Ok(None);
         };
         Box::pin(self.ensure_deposit_initialized()).await?;
-        if Box::pin(deposit.deposit_sync_ready()).await? {
+        // Scanner readiness alone must not close import-sync for a replica whose compact archive is
+        // still at the empty genesis base. Such a replica can trail the committee-certified archive
+        // tip even when its blockchain scanner is fully caught up, because committee-certified
+        // observations (allocations, confirmed-output observations) are not locally scannable — the
+        // only way it can reach the certified tip is by importing it over QUIC. A replica that has
+        // any real compact state cannot be advanced by `adopt_deposit_sync_candidate` anyway, so for
+        // it scanner readiness remains the correct condition to stop probing.
+        if Box::pin(deposit.deposit_sync_ready()).await?
+            && !Box::pin(deposit.deposit_archive_at_empty_base()).await?
+        {
             return Ok(None);
         }
         let active = Box::pin(self.active_epoch_public()).await?;

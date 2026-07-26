@@ -1209,7 +1209,16 @@ async fn empty_deposit_replica_body() {
         nodes.insert(party, node);
     }
 
-    let client = Client::builder().timeout(Duration::from_secs(3)).build().unwrap();
+    // Disable HTTP keep-alive pooling for this client. When a party is stopped, `stop_node`/
+    // `crash_node` aborts only the axum accept loop; any connection the shared client left pooled
+    // would keep its server-side hyper task (and thus an `Arc<PartyServer>` clone of the router
+    // state) alive, pinning that party's `PartyStateLease` past the intended stop and blocking the
+    // later reconstruction of the same party from acquiring the exclusive writer lease.
+    let client = Client::builder()
+        .timeout(Duration::from_secs(3))
+        .pool_max_idle_per_host(0)
+        .build()
+        .unwrap();
     wait_for_http_parties(&client, &scenario, &(1_u16..=5).map(PartyId).collect::<Vec<_>>()).await;
     let initial = scenario.genesis_committee().unwrap();
     let (key_id, session) = canonical_dkg_identity(&scenario).unwrap();
