@@ -20,6 +20,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/usr/local/cargo/git,sharing=locked \
     --mount=type=cache,id=threshold-monero-target-${TARGETARCH},target=/build/target,sharing=locked \
     set -eux; \
+    ./vendor/monero-oxide/verify-threshold-monero-sources.sh; \
     cargo build --locked --release --bin threshold-monero; \
     install --directory /out; \
     install --mode=0755 /build/target/release/threshold-monero /out/threshold-monero; \

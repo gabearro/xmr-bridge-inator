@@ -522,6 +522,28 @@ impl CompactRegistryStore {
         Ok(lookup_compact_registry_epoch(&head, epoch, &self.cache)?)
     }
 
+    /// Authenticate two epochs against one head, sharing at most six bounded index paths.
+    /// The cache is cleared on entry; no earlier lookup substitutes for storage authentication.
+    pub async fn lookup_epoch_pair(
+        &mut self,
+        epochs: [u64; 2],
+    ) -> Result<
+        [crate::compact_registry_archive::VerifiedRegistryEpoch; 2],
+        CompactRegistryStoreError,
+    > {
+        self.reset_cache()?;
+        let head =
+            self.checkpoint.head.clone().ok_or(CompactRegistryStoreError::CheckpointConflict)?;
+        self.preload_head_verification(&head).await?;
+        for epoch in epochs {
+            self.preload_epoch_and_parent(&head, epoch).await?;
+        }
+        Ok([
+            lookup_compact_registry_epoch(&head, epochs[0], &self.cache)?,
+            lookup_compact_registry_epoch(&head, epochs[1], &self.cache)?,
+        ])
+    }
+
     /// Direct authenticated issuer window lookup with no prefix replay.
     pub async fn lookup_issuer_window(
         &mut self,
@@ -1329,11 +1351,16 @@ mod tests {
         let previous_ledger_head = anchor.ledger_head();
         let next_index = anchor.next_index();
         let portable = PortableDepositIndexHead::from_head(&local_portable).unwrap();
+        let source_state = crate::deposit_state_export::DepositHandoffStateBinding::new(
+            Some([0xb1; 32]),
+            portable.clone(),
+        )
+        .unwrap();
         let statement = RegistryHandoffStatement::new(
             head.registry(),
             terminal_sequence,
             previous_ledger_head,
-            portable.digest(),
+            source_state.clone(),
             target,
             next_index,
         )
@@ -1359,7 +1386,7 @@ mod tests {
             head.registry(),
             terminal_sequence,
             previous_ledger_head,
-            portable.digest(),
+            source_state,
             target,
             next_index,
         )
@@ -1514,6 +1541,10 @@ mod tests {
         let (certificate, portable) = handoff(store.head().unwrap(), &source, &target);
         let append = store.prepare_append(&target, certificate, &portable).await.unwrap();
         let append_target = append.checkpoint().clone();
+        assert!(matches!(
+            store.lookup_epoch_pair([0, 1]).await,
+            Err(CompactRegistryStoreError::TransitionInProgress)
+        ));
         assert!(append_target.has_recovery_journal());
         store.commit_prepared(&append, &append_target).await.unwrap();
         assert!(!store.checkpoint().has_recovery_journal());
@@ -1525,6 +1556,22 @@ mod tests {
         let active = store.lookup_issuer_window(1).await.unwrap();
         assert_eq!(active.issuer().epoch(), 1);
         assert!(active.terminal().is_none());
+
+        let before = store.artifact_load_count();
+        let source = store.lookup_epoch(0).await.unwrap();
+        let target = store.lookup_epoch(1).await.unwrap();
+        let separate_reads = store.artifact_load_count() - before;
+        let before = store.artifact_load_count();
+        assert_eq!(store.lookup_epoch_pair([0, 1]).await.unwrap(), [source, target]);
+        let paired_reads = store.artifact_load_count() - before;
+        assert!(paired_reads < separate_reads, "paired lookup must reuse authenticated objects");
+        assert!(store.lookup_epoch_pair([0, 2]).await.is_err());
+        assert!(store.lookup_epoch_pair([1, 0]).await.is_ok());
+
+        // A new lookup must reauthenticate storage, not reuse a previous call's authority.
+        let reference = store.head().unwrap().index_root_reference().storage_reference().unwrap();
+        tokio::fs::write(store.artifacts.artifact_path(reference), b"corrupt").await.unwrap();
+        assert!(store.lookup_epoch_pair([0, 1]).await.is_err());
     }
 
     #[tokio::test]

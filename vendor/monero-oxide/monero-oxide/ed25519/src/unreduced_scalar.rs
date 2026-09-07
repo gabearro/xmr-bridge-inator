@@ -68,11 +68,11 @@ impl UnreducedScalar {
       naf[b] = i8::try_from(bit).expect("bit didn't fit within an i8");
     }
 
-    for i in 0 .. 256 {
+    for i in 0..256 {
       if naf[i] != 0 {
         // if the bit is a one, work our way up through the window
         // combining the bits with this bit.
-        for b in 1 .. 6 {
+        for b in 1..6 {
           if (i + b) >= 256 {
             // if we are at the length of the array then break out
             // the loop.
@@ -95,7 +95,7 @@ impl UnreducedScalar {
               // in the minus.
               naf[i] -= potential_carry;
               #[allow(clippy::needless_range_loop)]
-              for k in (i + b) .. 256 {
+              for k in (i + b)..256 {
                 if naf[k] == 0 {
                   naf[k] = 1;
                   break;

@@ -5,7 +5,7 @@ use threshold_monero::{
     PartyId, SessionId,
     storage::{
         ActivationCertificateKey, ActivationTransitionKey, MAX_SESSION_STATE_BYTES, ProtocolStore,
-        SessionStateKey, StoreError,
+        StoreError,
     },
 };
 
@@ -43,10 +43,12 @@ async fn session_state_overwrite_reload_enumeration_and_retirement_are_crash_saf
     let stale_temporary =
         state_path.parent().unwrap().join(format!(".{filename}.{}.tmp", "00".repeat(24)));
     tokio::fs::write(&stale_temporary, b"incomplete replacement").await.unwrap();
-    assert_eq!(
-        store.session_states().await.unwrap(),
-        vec![SessionStateKey { session, context_digest: context }]
-    );
+    let mut restored = store.session_states().await.unwrap();
+    assert_eq!(restored.len(), 1);
+    let restored = restored.pop().unwrap();
+    assert_eq!(restored.session, session);
+    assert_eq!(restored.context_digest, context);
+    assert_eq!(restored.state.as_bytes(), b"first snapshot");
 
     store.save_session_state(session, context, b"second snapshot", &mut OsRng).await.unwrap();
     let reloaded = ProtocolStore::new(directory.path(), PartyId(1), &[9; 32]).unwrap();
@@ -206,8 +208,6 @@ async fn tombstones_are_permanent_idempotent_and_block_session_reuse() {
     assert_eq!(tombstone.session(), session);
     assert_eq!(tombstone.purpose(), purpose);
     assert!(!format!("{tombstone:?}").contains("frost-sign"));
-    assert_eq!(store.session_tombstones().await.unwrap(), vec![session]);
-
     assert!(matches!(
         store.save_session_tombstone(session, b"different-purpose", &mut OsRng).await,
         Err(StoreError::TombstoneConflict(found)) if found == session

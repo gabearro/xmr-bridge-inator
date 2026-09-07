@@ -356,7 +356,7 @@ impl<T: HttpTransport> MoneroDaemon<T> {
       local, and the increased latency likely negligible compared to the latency of generating
       these blocks anyways).
     */
-    for _ in 0 .. block_count {
+    for _ in 0..block_count {
       let res = self
         .json_rpc_call_internal::<BlocksResponse>(
           "generateblocks",

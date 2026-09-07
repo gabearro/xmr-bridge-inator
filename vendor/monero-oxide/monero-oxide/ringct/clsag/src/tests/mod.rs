@@ -13,15 +13,15 @@ mod multisig;
 
 #[test]
 fn clsag() {
-  for ring_len in 1 ..= 16 {
-    for real in 0 .. ring_len {
+  for ring_len in 1..=16 {
+    for real in 0..ring_len {
       let mut msg_hash = [1; 32];
       OsRng.fill_bytes(&mut msg_hash);
       let amount = OsRng.next_u64();
 
       let mut secrets = (Zeroizing::new(Scalar::ZERO.into()), Scalar::ZERO.into());
       let mut ring = vec![];
-      for i in 0 .. ring_len {
+      for i in 0..ring_len {
         let dest = Zeroizing::new(Scalar::random(&mut OsRng).into());
         let mask = Scalar::random(&mut OsRng).into();
         let amount = if i == real {
@@ -43,7 +43,7 @@ fn clsag() {
         vec![(
           Zeroizing::new(Scalar::from(*secrets.0.clone())),
           ClsagContext::new(
-            Decoys::new((1 ..= u64::from(ring_len)).collect(), real, ring.clone()).unwrap(),
+            Decoys::new((1..=u64::from(ring_len)).collect(), real, ring.clone()).unwrap(),
             Commitment::new(Scalar::from(secrets.1), amount),
           )
           .unwrap(),
@@ -57,8 +57,8 @@ fn clsag() {
       let pseudo_out = CompressedPoint::from(pseudo_out.compress().to_bytes());
 
       let image = CompressedPoint::from(
-        (Point::biased_hash((ED25519_BASEPOINT_TABLE * secrets.0.deref()).compress().0).into() *
-          secrets.0.deref())
+        (Point::biased_hash((ED25519_BASEPOINT_TABLE * secrets.0.deref()).compress().0).into()
+          * secrets.0.deref())
         .compress()
         .to_bytes(),
       );

@@ -34,7 +34,7 @@ test!(
   (
     async |_, mut builder: Builder, addr| {
       let mut data = vec![];
-      for b in 1 ..= 3 {
+      for b in 1..=3 {
         data.push(vec![b; MAX_ARBITRARY_DATA_SIZE - 1]);
       }
 

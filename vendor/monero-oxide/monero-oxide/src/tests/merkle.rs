@@ -20,7 +20,7 @@ fn old_merkle_root(mut leafs: Vec<[u8; 32]>) -> Option<[u8; 32]> {
       // Merge right-most hashes until we're at the low_pow_2
       {
         let overage = leafs.len() - low_pow_2;
-        let mut rightmost = leafs.drain((low_pow_2 - overage) ..);
+        let mut rightmost = leafs.drain((low_pow_2 - overage)..);
         // This is true since we took overage from beneath and above low_pow_2, taking twice as
         // many elements as overage
         debug_assert_eq!(rightmost.len() % 2, 0);
@@ -58,9 +58,9 @@ fn merkle() {
   assert!(old_merkle_root(vec![]).is_none());
   assert!(merkle_root(&mut []).is_none());
 
-  for i in 1 .. 513 {
+  for i in 1..513 {
     let mut leaves = Vec::with_capacity(i);
-    for _ in 0 .. i {
+    for _ in 0..i {
       let mut leaf = [0; 32];
       OsRng.fill_bytes(&mut leaf);
       leaves.push(leaf);
@@ -132,7 +132,7 @@ fn block_202612() {
   assert_eq!(keccak256(complete), CORRECT_BLOCK_HASH_202612);
 
   let mut blob = header.serialize();
-  blob.extend_from_slice(&merkle_root(&mut transactions[.. 512]).unwrap());
+  blob.extend_from_slice(&merkle_root(&mut transactions[..512]).unwrap());
   VarInt::write(&transactions.len(), &mut blob).unwrap();
   let mut complete = vec![];
   VarInt::write(&blob.len(), &mut complete).unwrap();

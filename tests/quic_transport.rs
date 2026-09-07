@@ -8,7 +8,8 @@ use threshold_monero::{
     key_rotation::KeyRotationWire,
     quic_transport::{
         AvssOperation, KeyRotationOperation, LocalTlsIdentity, PeerRequest, PeerResponse,
-        PinnedPeerCertificate, QuicPeerEndpoint, QuicTransportConfig, RequestId,
+        PinnedPeerCertificate, QuicPeerEndpoint, QuicTransportConfig, QuicTransportError,
+        RequestId,
     },
 };
 
@@ -74,6 +75,77 @@ fn key_rotation_wire() -> KeyRotationWire {
 }
 
 #[tokio::test]
+async fn initial_close_packet_does_not_retain_endpoint_socket() {
+    let one = TestIdentity::generate(PartyId(1));
+    let two = TestIdentity::generate(PartyId(2));
+    let client = QuicPeerEndpoint::bind(
+        "127.0.0.1:0".parse().unwrap(),
+        PartyId(1),
+        TEST_NETWORK,
+        one.local(),
+        [two.pin(PartyId(2))],
+        QuicTransportConfig::default(),
+    )
+    .unwrap();
+    let server = QuicPeerEndpoint::bind(
+        "127.0.0.1:0".parse().unwrap(),
+        PartyId(2),
+        TEST_NETWORK,
+        two.local(),
+        [one.pin(PartyId(1))],
+        QuicTransportConfig::default(),
+    )
+    .unwrap();
+    let address = server.local_addr().unwrap();
+    let relay = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let mut packet = [0_u8; 65_535];
+    // Discard the ClientHello, then cancel its sender. Forward only the resulting
+    // Initial CONNECTION_CLOSE, as can happen when a stopped endpoint restarts.
+    {
+        let connecting = client.connect(PartyId(2), relay.local_addr().unwrap());
+        tokio::pin!(connecting);
+        tokio::select! {
+            result = &mut connecting => panic!("unforwarded handshake completed: {result:?}"),
+            result = tokio::time::timeout(Duration::from_secs(3), relay.recv_from(&mut packet)) => {
+                result.unwrap().unwrap();
+            }
+        }
+    }
+    let (length, _) = tokio::time::timeout(Duration::from_secs(3), relay.recv_from(&mut packet))
+        .await
+        .unwrap()
+        .unwrap();
+    relay.send_to(&packet[..length], address).await.unwrap();
+    let rejection = tokio::time::timeout(Duration::from_secs(3), server.accept()).await.unwrap();
+    assert!(
+        matches!(
+            rejection,
+            Err(QuicTransportError::Connection(quinn::ConnectionError::ConnectionClosed(_)))
+        ),
+        "unexpected initial-close response: {rejection:?}"
+    );
+    server.close(b"initial close test complete");
+    tokio::time::timeout(Duration::from_secs(5), server.wait_idle())
+        .await
+        .expect("first-packet close retained a connection until the idle timeout");
+    drop(server);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match std::net::UdpSocket::bind(address) {
+                Ok(_) => break,
+                Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => {
+                    tokio::task::yield_now().await
+                }
+                Err(error) => panic!("cannot probe released endpoint: {error}"),
+            }
+        }
+    })
+    .await
+    .unwrap();
+    client.close(b"test complete");
+}
+
+#[tokio::test]
 async fn mutually_authenticated_connection_round_trips_correlated_requests() {
     let one = TestIdentity::generate(PartyId(1));
     let two = TestIdentity::generate(PartyId(2));
@@ -112,7 +184,7 @@ async fn mutually_authenticated_connection_round_trips_correlated_requests() {
     let server = tokio::spawn(async move {
         let connection = endpoint_two.accept().await.unwrap();
         assert_eq!(connection.peer_party(), PartyId(1));
-        let request = connection.accept_request().await.unwrap();
+        let request = connection.accept_request().await.unwrap().read_request().await.unwrap();
         assert_eq!(request.peer_party(), PartyId(1));
         assert_eq!(request.request_id(), request_id);
         assert_eq!(
@@ -124,7 +196,7 @@ async fn mutually_authenticated_connection_round_trips_correlated_requests() {
         );
         request.respond(PeerResponse::Success { body: b"accepted".to_vec() }).await.unwrap();
 
-        let request = connection.accept_request().await.unwrap();
+        let request = connection.accept_request().await.unwrap().read_request().await.unwrap();
         assert_eq!(request.request_id(), rotation_request_id);
         let PeerRequest::KeyRotation { operation, body } = request.request() else {
             panic!("key rotation used another QUIC request family");

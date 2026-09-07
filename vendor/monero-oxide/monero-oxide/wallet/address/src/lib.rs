@@ -59,8 +59,8 @@ pub enum AddressType {
 impl AddressType {
   /// If this address is a subaddress.
   pub fn is_subaddress(&self) -> bool {
-    matches!(self, AddressType::Subaddress) ||
-      matches!(self, AddressType::Featured { subaddress: true, .. })
+    matches!(self, AddressType::Subaddress)
+      || matches!(self, AddressType::Featured { subaddress: true, .. })
   }
 
   /// The payment ID within this address.
@@ -146,10 +146,10 @@ impl AddressBytes {
 
   #[expect(clippy::as_conversions)]
   const fn to_const_generic(self) -> u32 {
-    ((self.legacy as u32) << 24) +
-      ((self.legacy_integrated as u32) << 16) +
-      ((self.subaddress as u32) << 8) +
-      (self.featured as u32)
+    ((self.legacy as u32) << 24)
+      + ((self.legacy_integrated as u32) << 16)
+      + ((self.subaddress as u32) << 8)
+      + (self.featured as u32)
   }
 
   #[expect(clippy::as_conversions, clippy::cast_possible_truncation)]
@@ -279,9 +279,9 @@ impl NetworkedAddressBytes {
   /// We cannot use this struct directly as a const generic unfortunately.
   #[expect(clippy::as_conversions)]
   pub const fn to_const_generic(self) -> u128 {
-    ((self.mainnet.to_const_generic() as u128) << 96) +
-      ((self.stagenet.to_const_generic() as u128) << 64) +
-      ((self.testnet.to_const_generic() as u128) << 32)
+    ((self.mainnet.to_const_generic() as u128) << 96)
+      + ((self.stagenet.to_const_generic() as u128) << 64)
+      + ((self.testnet.to_const_generic() as u128) << 32)
   }
 
   #[expect(clippy::as_conversions, clippy::cast_possible_truncation)]
@@ -453,13 +453,13 @@ impl<const ADDRESS_BYTES: u128> Address<ADDRESS_BYTES> {
 
     // Read the payment ID, if there should be one
     match kind {
-      AddressType::LegacyIntegrated(ref mut id) |
-      AddressType::Featured { payment_id: Some(ref mut id), .. } => {
+      AddressType::LegacyIntegrated(ref mut id)
+      | AddressType::Featured { payment_id: Some(ref mut id), .. } => {
         *id = read_bytes(&mut raw).map_err(|_| AddressError::InvalidLength)?;
       }
-      AddressType::Legacy |
-      AddressType::Subaddress |
-      AddressType::Featured { payment_id: None, .. } => {}
+      AddressType::Legacy
+      | AddressType::Subaddress
+      | AddressType::Featured { payment_id: None, .. } => {}
     }
 
     if !raw.is_empty() {

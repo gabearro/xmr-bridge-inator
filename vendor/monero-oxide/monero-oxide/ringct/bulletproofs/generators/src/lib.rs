@@ -42,7 +42,7 @@ pub fn bulletproofs_generators(dst: &'static [u8]) -> Generators {
   preimage.extend(dst);
 
   let mut res = Generators { G: Vec::with_capacity(MAX_MN), H: Vec::with_capacity(MAX_MN) };
-  for i in 0 .. MAX_MN {
+  for i in 0..MAX_MN {
     // We generate a pair of generators per iteration
     let i = 2 * i;
 

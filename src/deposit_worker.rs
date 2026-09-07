@@ -1,6 +1,7 @@
 //! Autonomous, durable Monero deposit scanning and consolidation preparation.
 //!
-//! The worker scans only blocks which reached the configured confirmation depth. Every cursor
+//! The worker authenticates the contiguous chain through the daemon tip, but releases a deposit
+//! detection only after its exact deterministic confirmation horizon is present. Every cursor
 //! advance, detection, and deep-reorg rollback is first staged in [`DepositWorkerState`]. A caller
 //! must persist the returned [`WorkerPersistEffect`] before reading the staged
 //! [`WorkerEventBatch`]. Event delivery is at-least-once: after applying a batch idempotently, the
@@ -80,17 +81,18 @@ use crate::{
     signing::{CanonicalSignerSet, signing_context_in_session},
 };
 
-const WORKER_STATE_VERSION: u16 = 14;
+const WORKER_STATE_VERSION: u16 = 17;
 const ALLOCATION_BACKFILL_VERSION: u16 = 2;
 const CERTIFIED_SWEEP_PUBLICATION_VERSION: u16 = 1;
-const EVENT_BATCH_VERSION: u16 = 2;
+const EVENT_BATCH_VERSION: u16 = 3;
 const MAX_WORKER_STATE_BYTES: usize = 64 * 1024 * 1024;
 const MAX_SUPPORTED_HARDFORK: u8 = 16;
 const MAX_CONFIRMATION_DEPTH: u32 = 100_000;
 const MAX_BLOCKS_PER_TICK: u16 = 1024;
 const MAX_REORG_DEPTH: u32 = 100_000;
 const MAX_OUTPUTS_PER_BLOCK: u16 = 4096;
-const MAX_ATOMIC_OUTPUT_BINDINGS: usize = 256;
+pub(crate) const MAX_PORTABLE_OUTPUT_CLASSIFICATION_BINDINGS: usize = 256;
+const MAX_ATOMIC_OUTPUT_BINDINGS: usize = MAX_PORTABLE_OUTPUT_CLASSIFICATION_BINDINGS;
 const MAX_SWEEP_INPUTS: u16 = 1024;
 const MAX_RETAINED_OUTPUTS: u32 = 1_000_000;
 const MAX_REQUEST_TIMEOUT_MILLIS: u64 = 10 * 60 * 1000;
@@ -118,8 +120,38 @@ pub struct DepositOutputBinding {
     pub subaddress: Option<DepositSubaddressIndex>,
     /// Decrypted amount authenticated by the RingCT commitment.
     pub amount_atomic_units: u64,
+    /// Global RingCT output index used when constructing decoy rings.
+    pub index_on_blockchain: u64,
+    /// Exact canonical block containing the output.
+    pub observed_block: ChainPoint,
     /// Canonical block timestamp used to burn a deposit allocation permanently on first use.
     pub observed_at: u64,
+}
+
+/// Portable-index disposition for one exact locally scanned output binding.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PortableOutputBindingStatus {
+    /// No portable observation and no terminal input claim exist.
+    UnseenUnclaimed,
+    /// No portable observation exists, but the named sweep permanently owns the input.
+    UnseenClaimed(SweepId),
+    /// The exact output fact is already portable and remains unclaimed.
+    ExactPortableUnclaimed,
+    /// The exact output fact is already portable and the named sweep permanently owns the input.
+    ExactPortableClaimed(SweepId),
+}
+
+impl PortableOutputBindingStatus {
+    const fn is_portable(self) -> bool {
+        matches!(self, Self::ExactPortableUnclaimed | Self::ExactPortableClaimed(_))
+    }
+
+    const fn claim_owner(self) -> Option<SweepId> {
+        match self {
+            Self::UnseenClaimed(sweep) | Self::ExactPortableClaimed(sweep) => Some(sweep),
+            Self::UnseenUnclaimed | Self::ExactPortableUnclaimed => None,
+        }
+    }
 }
 
 /// Narrow authenticated-index seam used by the bounded output scanner.
@@ -150,6 +182,17 @@ pub trait DepositOutputIndexBackend: Send + Sync {
         portable_snapshot: [u8; 32],
         bindings: &'a [DepositOutputBinding],
     ) -> ChainFuture<'a, ()>;
+
+    /// Classify a bounded exact binding set against one immutable portable snapshot.
+    ///
+    /// Results must have exactly the same length and order as `bindings`. Implementations must
+    /// fail closed on incomplete aliases or any same-ID/key fact mismatch.
+    fn classify_portable_output_bindings<'a>(
+        &'a self,
+        wallet: DepositWalletId,
+        portable_snapshot: [u8; 32],
+        bindings: &'a [DepositOutputBinding],
+    ) -> ChainFuture<'a, Vec<PortableOutputBindingStatus>>;
 }
 
 impl<T> DepositOutputIndexBackend for std::sync::Arc<T>
@@ -176,6 +219,15 @@ where
         bindings: &'a [DepositOutputBinding],
     ) -> ChainFuture<'a, ()> {
         self.as_ref().bind_outputs(wallet, portable_snapshot, bindings)
+    }
+
+    fn classify_portable_output_bindings<'a>(
+        &'a self,
+        wallet: DepositWalletId,
+        portable_snapshot: [u8; 32],
+        bindings: &'a [DepositOutputBinding],
+    ) -> ChainFuture<'a, Vec<PortableOutputBindingStatus>> {
+        self.as_ref().classify_portable_output_bindings(wallet, portable_snapshot, bindings)
     }
 }
 
@@ -1358,6 +1410,18 @@ pub struct DepositDetection {
     pub observed_block: ChainPoint,
     /// Informational consensus timestamp of the containing block.
     pub block_timestamp: u64,
+    /// Exact canonical descendant which supplies the configured confirmation depth.
+    pub confirmation_horizon: ChainPoint,
+}
+
+/// One previously proposed observation whose exact confirmation horizon was orphaned while its
+/// output inclusion survived.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct InvalidatedDepositObservationHorizon {
+    /// Output whose uncertified proposal must be conditionally removed.
+    pub output: WalletOutputId,
+    /// Exact former horizon, preventing a rollback from pruning a replacement proposal.
+    pub horizon: ChainPoint,
 }
 
 /// Exact canonical observation removed by a chain reorganization.
@@ -1390,6 +1454,8 @@ pub struct DepositRollback {
     pub removed_outputs: Vec<WalletOutputId>,
     /// Exact prior canonical metadata for conditional observation retraction.
     pub orphaned_deposits: Vec<OrphanedDeposit>,
+    /// Surviving outputs whose former observation horizon left the canonical chain.
+    pub invalidated_observation_horizons: Vec<InvalidatedDepositObservationHorizon>,
     /// Root/primary outputs removed with orphaned blocks; never client deposits.
     pub removed_root_outputs: Vec<WalletOutputId>,
     /// Sweep attempts whose inputs disappeared.
@@ -1405,6 +1471,7 @@ impl DepositRollback {
         ancestor: ChainPoint,
         report: RollbackReport,
         prior: &ScanState,
+        invalidated_observation_horizons: Vec<InvalidatedDepositObservationHorizon>,
     ) -> Result<Self, DepositWorkerError> {
         let mut orphaned_deposits = Vec::with_capacity(report.removed_outputs.len());
         for id in &report.removed_outputs {
@@ -1427,6 +1494,7 @@ impl DepositRollback {
             ancestor,
             removed_outputs: report.removed_outputs,
             orphaned_deposits,
+            invalidated_observation_horizons,
             removed_root_outputs: report.removed_root_outputs,
             invalidated_sweeps: report.invalidated_sweeps,
             quarantined_sweeps: report.quarantined_sweeps,
@@ -2013,6 +2081,14 @@ pub struct DepositWorkerState {
     portable_through_sequence: Option<u64>,
     allocation_backfill: Option<DepositAllocationBackfill>,
     pending_block_scan: Option<PendingDepositBlockScan>,
+    /// Wallet outputs authenticated in the full chain suffix but not yet deep enough to report.
+    unreported_detection_outputs: BTreeSet<WalletOutputId>,
+    /// Exact confirmation horizon for each locally detected output until its certified
+    /// observation is installed in the portable index.
+    pending_observation_horizons: BTreeMap<WalletOutputId, ChainPoint>,
+    /// Inputs permanently claimed by imported portable terminal authority while their local
+    /// scanner bodies remain retained for observation/reorg evidence.
+    portable_claimed_outputs: BTreeMap<WalletOutputId, SweepId>,
     certified_sweep_publications: BTreeMap<SweepId, CertifiedSweepPublication>,
     observed_family_settlements: BTreeMap<SweepId, SweepFamilySettlementEvidence>,
     pending_events: Option<WorkerEventBatch>,
@@ -2043,6 +2119,9 @@ impl DepositWorkerState {
             portable_through_sequence: None,
             allocation_backfill: None,
             pending_block_scan: None,
+            unreported_detection_outputs: BTreeSet::new(),
+            pending_observation_horizons: BTreeMap::new(),
+            portable_claimed_outputs: BTreeMap::new(),
             certified_sweep_publications: BTreeMap::new(),
             observed_family_settlements: BTreeMap::new(),
             pending_events: None,
@@ -2113,6 +2192,12 @@ impl DepositWorkerState {
     #[must_use]
     pub const fn portable_through_sequence(&self) -> Option<u64> {
         self.portable_through_sequence
+    }
+
+    /// Exact durable confirmation horizon for an observation awaiting portable installation.
+    #[must_use]
+    pub fn pending_observation_horizon(&self, output: WalletOutputId) -> Option<ChainPoint> {
+        self.pending_observation_horizons.get(&output).copied()
     }
 
     /// Durable historical scan which currently gates allocation status and forward scanning.
@@ -2189,17 +2274,21 @@ impl DepositWorkerState {
             transition.resulting_head_digest(),
             transition.through_sequence(),
             transition.allocation_anchors(),
+            transition.observed_outputs(),
+            &[],
+            None,
             true,
         )
     }
 
-    /// Adopt a complete imported portable graph whose exact head was authenticated by a verified
-    /// n-f checkpoint.
+    /// Adopt a complete portable graph whose exact head and archive extension were authenticated
+    /// by verified n-f checkpoints.
     ///
     /// Unlike ordinary transition adoption, this path does not trust a peer-supplied journal. The
     /// snapshot token proves a semantic traversal of the entire graph and carries every allocation
-    /// recognition anchor, so journal loss or fresh join always schedules the required historical
-    /// rescan before the imported view becomes visible.
+    /// recognition anchor. The caller additionally proves archive monotonicity, so a checkpoint
+    /// which only certifies new observations may advance the portable head without increasing the
+    /// ledger sequence.
     pub(crate) fn adopt_verified_portable_scanner_snapshot(
         &mut self,
         snapshot: &VerifiedPortableScannerSnapshot,
@@ -2207,6 +2296,33 @@ impl DepositWorkerState {
         self.require_no_pending_events()?;
         if snapshot.wallet_id() != self.wallet_id() || snapshot.head_digest() == [0; 32] {
             return Err(DepositWorkerError::InvalidPortableIndexTransition);
+        }
+        if snapshot.output_claims().windows(2).any(|pair| pair[0].0 >= pair[1].0)
+            || snapshot.output_claims().iter().any(|(output, sweep)| {
+                output.transaction == [0; 32]
+                    || sweep.0 == [0; 32]
+                    || self.portable_claimed_outputs.get(output).is_some_and(|local| local != sweep)
+            })
+            || self.portable_claimed_outputs.iter().any(|(output, sweep)| {
+                snapshot
+                    .output_claims()
+                    .binary_search_by_key(output, |(candidate, _)| *candidate)
+                    .ok()
+                    .and_then(|position| snapshot.output_claims().get(position))
+                    .is_none_or(|(_, imported)| imported != sweep)
+            })
+        {
+            return Err(DepositWorkerError::InvalidPortableIndexTransition);
+        }
+        for local in self.scan.sweeps() {
+            for input in &local.inputs {
+                if let Ok(position) =
+                    snapshot.output_claims().binary_search_by_key(input, |(output, _)| *output)
+                    && snapshot.output_claims()[position].1 != local.id
+                {
+                    return Err(DepositWorkerError::InvalidPortableIndexTransition);
+                }
+            }
         }
         let current_target = self
             .allocation_backfill
@@ -2219,21 +2335,42 @@ impl DepositWorkerState {
         let Some(current_sequence) = current_sequence else {
             return Err(DepositWorkerError::PortableIndexHeadUninitialized);
         };
-        if snapshot.through_sequence() < current_sequence
-            || (snapshot.through_sequence() == current_sequence
-                && current_target != Some(snapshot.head_digest()))
-        {
+        if snapshot.through_sequence() < current_sequence {
             return Err(DepositWorkerError::InvalidPortableIndexTransition);
         }
         if current_target == Some(snapshot.head_digest())
             && current_sequence == snapshot.through_sequence()
         {
-            return Ok(None);
+            let has_observation_holds = snapshot.observed_outputs().iter().any(|output| {
+                self.pending_observation_horizons.contains_key(output)
+                    || self.unreported_detection_outputs.contains(output)
+            });
+            let has_new_claims = snapshot.output_claims().iter().any(|(output, sweep)| {
+                self.scan.output(*output).is_some()
+                    && self.portable_claimed_outputs.get(output) != Some(sweep)
+            });
+            if !has_observation_holds
+                && !has_new_claims
+                && self.next_sweep_sequence >= snapshot.next_sweep_sequence()
+            {
+                return Ok(None);
+            }
+            let mut candidate = self.clone();
+            candidate.release_portable_observation_holds(snapshot.observed_outputs())?;
+            candidate.retain_portable_claims(snapshot.output_claims())?;
+            candidate.next_sweep_sequence =
+                candidate.next_sweep_sequence.max(snapshot.next_sweep_sequence());
+            let effect = candidate.finish_mutation()?;
+            *self = candidate;
+            return Ok(Some(effect));
         }
         self.adopt_portable_scanner_target(
             snapshot.head_digest(),
             snapshot.through_sequence(),
             snapshot.allocation_anchors(),
+            snapshot.observed_outputs(),
+            snapshot.output_claims(),
+            Some(snapshot.next_sweep_sequence()),
             false,
         )
     }
@@ -2243,10 +2380,18 @@ impl DepositWorkerState {
         resulting_head: [u8; 32],
         through_sequence: u64,
         allocation_anchors: &[ChainPoint],
+        observed_outputs: &[WalletOutputId],
+        output_claims: &[(WalletOutputId, SweepId)],
+        next_sweep_sequence: Option<u64>,
         anchors_locally_authenticated: bool,
     ) -> Result<Option<WorkerPersistEffect>, DepositWorkerError> {
         let mut candidate = self.clone();
         candidate.pending_block_scan = None;
+        candidate.release_portable_observation_holds(observed_outputs)?;
+        candidate.retain_portable_claims(output_claims)?;
+        if let Some(next_sweep_sequence) = next_sweep_sequence {
+            candidate.next_sweep_sequence = candidate.next_sweep_sequence.max(next_sweep_sequence);
+        }
         if allocation_anchors.is_empty() {
             if let Some(backfill) = candidate.allocation_backfill.as_mut() {
                 backfill.portable_head = resulting_head;
@@ -2277,29 +2422,30 @@ impl DepositWorkerState {
             let minimum_anchor_verified =
                 candidate.scan.verify_recognition_anchor(minimum_anchor).is_ok();
 
-            let anchor_authenticated = match candidate.scan.authenticated_historical_block_evidence(
-                minimum_anchor,
-                resulting_head,
-                through_sequence,
-            ) {
-                Ok(evidence) => {
-                    candidate.scan.pin_authenticated_historical_block(&evidence)?;
-                    held_points.push(minimum_anchor);
-                    true
-                }
-                Err(DepositWalletError::UnknownChainPoint(point))
-                    if point == minimum_anchor && minimum_anchor_verified =>
-                {
-                    true
-                }
-                Err(DepositWalletError::UnknownChainPoint(point))
-                    if point == minimum_anchor && !anchors_locally_authenticated =>
-                {
-                    false
-                }
-                Err(error) => return Err(error.into()),
-            };
-            match candidate.scan.authenticated_historical_block_evidence(
+            let anchor_authenticated =
+                match candidate.scan.authenticated_historical_block_header_evidence(
+                    minimum_anchor,
+                    resulting_head,
+                    through_sequence,
+                ) {
+                    Ok(evidence) => {
+                        candidate.scan.pin_authenticated_historical_block(&evidence)?;
+                        held_points.push(minimum_anchor);
+                        true
+                    }
+                    Err(DepositWalletError::UnknownChainPoint(point))
+                        if point == minimum_anchor && minimum_anchor_verified =>
+                    {
+                        true
+                    }
+                    Err(DepositWalletError::UnknownChainPoint(point))
+                        if point == minimum_anchor && !anchors_locally_authenticated =>
+                    {
+                        false
+                    }
+                    Err(error) => return Err(error.into()),
+                };
+            match candidate.scan.authenticated_historical_block_header_evidence(
                 confirmed_horizon,
                 resulting_head,
                 through_sequence,
@@ -2329,12 +2475,12 @@ impl DepositWorkerState {
                 .copied()
                 .filter(|point| held_points.binary_search(point).is_err())
             {
-                candidate.scan.release_authenticated_historical_block(point)?;
+                candidate.release_historical_block_if_unreferenced(point)?;
             }
 
             if next_height > confirmed_horizon.height {
                 for point in held_points {
-                    candidate.scan.release_authenticated_historical_block(point)?;
+                    candidate.release_historical_block_if_unreferenced(point)?;
                 }
                 candidate.portable_index_head = Some(resulting_head);
                 candidate.portable_through_sequence = Some(through_sequence);
@@ -2394,6 +2540,19 @@ impl DepositWorkerState {
         self.certified_sweep_publications.get(&sweep)
     }
 
+    /// Confirmed publications whose root inclusion is at or behind the moving reorganization
+    /// fence, in deterministic sweep-ID order.
+    ///
+    /// These entries may be passed directly to [`Self::compact_certified_sweep_publication`].
+    pub fn compactable_certified_sweep_publications(
+        &self,
+    ) -> impl Iterator<Item = &CertifiedSweepPublication> {
+        let fence = self.reorg_checkpoint();
+        self.certified_sweep_publications.values().filter(move |publication| {
+            publication.confirmation.is_some_and(|confirmation| confirmation.height <= fence.height)
+        })
+    }
+
     /// Pin canonical root-output inclusion for a retained certified publication.
     pub fn mark_certified_sweep_publication_confirmed(
         &mut self,
@@ -2447,6 +2606,9 @@ impl DepositWorkerState {
         let verified = self.scan.verify_terminal_compaction(&terminal, confirmation)?;
         let mut candidate = self.clone();
         let mut changed = candidate.scan.consume_verified_terminal_compaction(&verified)?;
+        candidate
+            .portable_claimed_outputs
+            .retain(|output, _| candidate.scan.output(*output).is_some());
         changed |= candidate.certified_sweep_publications.remove(&sweep).is_some();
         changed |= candidate.observed_family_settlements.remove(&sweep).is_some();
         if !changed {
@@ -2702,6 +2864,11 @@ impl DepositWorkerState {
                 true
             }
         };
+        for input in &completion.plan.inputs {
+            if candidate.scan.output(*input).is_some() {
+                changed |= candidate.record_portable_claim(*input, sweep)?;
+            }
+        }
         if let Some(confirmation) = candidate
             .certified_sweep_publications
             .get(&sweep)
@@ -2977,7 +3144,12 @@ impl DepositWorkerState {
         // An abandonment has no canonical transaction inclusion fence. Retain the local family,
         // inputs, key images, and nonce tombstones permanently; only advance the public sequence
         // floor authenticated by the portable terminal.
-        let changed = candidate.next_sweep_sequence < certified_next;
+        let mut changed = candidate.next_sweep_sequence < certified_next;
+        for input in &abandonment.inputs {
+            if candidate.scan.output(*input).is_some() {
+                changed |= candidate.record_portable_claim(*input, sweep)?;
+            }
+        }
         candidate.next_sweep_sequence = candidate.next_sweep_sequence.max(certified_next);
         if !changed {
             return Ok(None);
@@ -3131,17 +3303,12 @@ impl DepositWorkerState {
             };
             let mut candidate = self.clone();
             let report = candidate.scan.rollback_to(ancestor)?;
+            let invalidated_observation_horizons =
+                candidate.reconcile_observation_tracking_after_rollback(ancestor);
             candidate
                 .observed_family_settlements
                 .retain(|_, evidence| evidence.block.height <= ancestor.height);
-            for publication in candidate.certified_sweep_publications.values_mut() {
-                if publication
-                    .confirmation
-                    .is_some_and(|confirmation| confirmation.height > ancestor.height)
-                {
-                    publication.confirmation = None;
-                }
-            }
+            candidate.clear_certified_publication_confirmations_after(ancestor);
             candidate.pending_block_scan = None;
             let (portable_head, through_sequence, minimum_anchor, anchor_authenticated) = {
                 let progress = candidate
@@ -3158,7 +3325,7 @@ impl DepositWorkerState {
             if ancestor.height < minimum_anchor.height {
                 return Err(DepositWorkerError::AllocationBackfillBranchChanged);
             }
-            let ancestor_evidence = candidate.scan.authenticated_historical_block_evidence(
+            let ancestor_evidence = candidate.scan.authenticated_historical_block_header_evidence(
                 ancestor,
                 portable_head,
                 through_sequence,
@@ -3181,12 +3348,17 @@ impl DepositWorkerState {
                 let completed =
                     candidate.allocation_backfill.take().ok_or(DepositWorkerError::CorruptState)?;
                 for point in completed.held_points {
-                    candidate.scan.release_authenticated_historical_block(point)?;
+                    candidate.release_historical_block_if_unreferenced(point)?;
                 }
                 candidate.portable_index_head = Some(completed.portable_head);
                 candidate.portable_through_sequence = Some(completed.through_sequence);
             }
-            let rollback = DepositRollback::from_report(ancestor, report, &self.scan)?;
+            let rollback = DepositRollback::from_report(
+                ancestor,
+                report,
+                &self.scan,
+                invalidated_observation_horizons,
+            )?;
             candidate.stage_events(Vec::new(), Some(rollback))?;
             let effect = candidate.finish_mutation()?;
             let scanner_tip = candidate.scan.tip();
@@ -3342,7 +3514,19 @@ impl DepositWorkerState {
             .await?;
         }
 
-        let block = evidence.block;
+        let classification = classify_portable_block_outputs(
+            output_index,
+            self.wallet_id(),
+            portable_snapshot,
+            &evidence.block,
+        )
+        .await?;
+        self.validate_portable_claim_batch(&classification.claimed)?;
+        let mut block = evidence.block;
+        block.outputs.retain(|output| {
+            !(classification.portable.contains(&output.id())
+                && classification.claimed.contains_key(&output.id()))
+        });
         let historical = AuthenticatedHistoricalBlockEvidence::from_authenticated_chain_source(
             self.wallet_id(),
             block.block,
@@ -3356,27 +3540,15 @@ impl DepositWorkerState {
         let mut candidate = self.clone();
         candidate.scan.pin_authenticated_historical_block(&historical)?;
         candidate.scan.insert_authenticated_historical_outputs(&historical)?;
-        if backfill.anchor_authenticated {
-            if backfill.held_points.binary_search(&block.block.point).is_err() {
-                candidate.scan.release_authenticated_historical_block(block.block.point)?;
+        for output in &block.outputs {
+            let output = output.id();
+            if let Some(sweep) = classification.claimed.get(&output) {
+                candidate.record_portable_claim(output, *sweep)?;
+            }
+            if !classification.portable.contains(&output) {
+                candidate.queue_unreported_detection(output)?;
             }
         }
-
-        let detections = block
-            .outputs
-            .iter()
-            .map(|output| {
-                let wallet_output = output.wallet_output()?;
-                Ok(DepositDetection {
-                    output: output.id(),
-                    index_on_blockchain: output.index_on_blockchain(),
-                    subaddress: output.subaddress(),
-                    amount_atomic_units: wallet_output.commitment().amount,
-                    observed_block: block.block.point,
-                    block_timestamp: block.timestamp,
-                })
-            })
-            .collect::<Result<Vec<_>, DepositWorkerError>>()?;
         let next_height = height.checked_add(1).ok_or(DepositWorkerError::HeightOverflow)?;
         {
             let progress =
@@ -3394,6 +3566,15 @@ impl DepositWorkerState {
             progress.next_height = next_height;
             progress.pending = None;
         }
+        let detections = candidate.take_mature_detections()?;
+        if !detections.is_empty() {
+            candidate.stage_events(detections, None)?;
+        }
+        if backfill.anchor_authenticated
+            && backfill.held_points.binary_search(&block.block.point).is_err()
+        {
+            candidate.release_historical_block_if_unreferenced(block.block.point)?;
+        }
         let completed = next_height > backfill.confirmed_horizon.height;
         if completed {
             let completed_job =
@@ -3402,13 +3583,10 @@ impl DepositWorkerState {
                 return Err(DepositWorkerError::AllocationBackfillBranchChanged);
             }
             for point in completed_job.held_points {
-                candidate.scan.release_authenticated_historical_block(point)?;
+                candidate.release_historical_block_if_unreferenced(point)?;
             }
             candidate.portable_index_head = Some(completed_job.portable_head);
             candidate.portable_through_sequence = Some(completed_job.through_sequence);
-        }
-        if !detections.is_empty() {
-            candidate.stage_events(detections, None)?;
         }
         let effect = candidate.finish_mutation()?;
         let scanner_tip = candidate.scan.tip();
@@ -3460,19 +3638,19 @@ impl DepositWorkerState {
         if let Some(ancestor) = self.find_reorg_ancestor(source, request_timeout).await? {
             let mut candidate = self.clone();
             let report = candidate.scan.rollback_to(ancestor)?;
+            let invalidated_observation_horizons =
+                candidate.reconcile_observation_tracking_after_rollback(ancestor);
             candidate
                 .observed_family_settlements
                 .retain(|_, evidence| evidence.block.height <= ancestor.height);
-            for publication in candidate.certified_sweep_publications.values_mut() {
-                if publication
-                    .confirmation
-                    .is_some_and(|confirmation| confirmation.height > ancestor.height)
-                {
-                    publication.confirmation = None;
-                }
-            }
+            candidate.clear_certified_publication_confirmations_after(ancestor);
             candidate.pending_block_scan = None;
-            let rollback = DepositRollback::from_report(ancestor, report, &self.scan)?;
+            let rollback = DepositRollback::from_report(
+                ancestor,
+                report,
+                &self.scan,
+                invalidated_observation_horizons,
+            )?;
             candidate.stage_events(Vec::new(), Some(rollback))?;
             let effect = candidate.finish_mutation()?;
             let scanner_tip = candidate.scan.tip();
@@ -3485,31 +3663,34 @@ impl DepositWorkerState {
             });
         }
 
-        let chain_length =
-            daemon_height.checked_add(1).ok_or(DepositWorkerError::HeightOverflow)?;
-        let Some(confirmed_height) =
-            chain_length.checked_sub(u64::from(self.config.confirmation_depth))
-        else {
-            return Ok(WorkerTick {
-                persistence: None,
-                daemon_height,
-                scanner_tip: self.scan.tip(),
-                staged_events: false,
-            });
-        };
         let next_height = self.scan.next_height()?;
-        if confirmed_height < next_height {
+        if daemon_height < next_height {
+            let mut candidate = self.clone();
+            let detections = candidate.take_mature_detections()?;
+            if detections.is_empty() {
+                return Ok(WorkerTick {
+                    persistence: None,
+                    daemon_height,
+                    scanner_tip: self.scan.tip(),
+                    staged_events: false,
+                });
+            }
+            candidate.stage_events(detections, None)?;
+            candidate.scan.compact_reorg_window(candidate.config.max_reorg_depth)?;
+            let effect = candidate.finish_mutation()?;
+            let scanner_tip = candidate.scan.tip();
+            *self = candidate;
             return Ok(WorkerTick {
-                persistence: None,
+                persistence: Some(effect),
                 daemon_height,
-                scanner_tip: self.scan.tip(),
-                staged_events: false,
+                scanner_tip,
+                staged_events: true,
             });
         }
         let last_height = if self.pending_block_scan.is_some() {
             next_height
         } else {
-            confirmed_height.min(
+            daemon_height.min(
                 next_height
                     .checked_add(u64::from(self.config.max_blocks_per_tick) - 1)
                     .ok_or(DepositWorkerError::HeightOverflow)?,
@@ -3564,7 +3745,7 @@ impl DepositWorkerState {
             usize::try_from(last_height - next_height + 1)
                 .map_err(|_| DepositWorkerError::HeightOverflow)?,
         );
-        for height in next_height..=last_height {
+        'scan_blocks: for height in next_height..=last_height {
             let resume = self
                 .pending_block_scan
                 .as_ref()
@@ -3613,6 +3794,13 @@ impl DepositWorkerState {
                         || next_cursor.portable_snapshot != portable_snapshot
                     {
                         return Err(DepositWorkerError::CorruptState);
+                    }
+                    // A deferred cursor is valid only against the worker's immediate next
+                    // height. Commit any already-fetched contiguous prefix first; the deferred
+                    // block is fetched again on the next tick and can then be persisted without
+                    // skipping the prefix across a crash.
+                    if height != next_height {
+                        break 'scan_blocks;
                     }
                     let binding_chunk = output_bindings(&block)?;
                     let mut progress = match &self.pending_block_scan {
@@ -3826,40 +4014,56 @@ impl DepositWorkerState {
                 ))
                 .await?;
             }
-            fetched.push(evidence);
+            let classification = classify_portable_block_outputs(
+                output_index,
+                self.wallet_id(),
+                portable_snapshot,
+                &evidence.block,
+            )
+            .await?;
+            self.validate_portable_claim_batch(&classification.claimed)?;
+            fetched.push((evidence, classification));
         }
 
         let mut candidate = self.clone();
         candidate.pending_block_scan = None;
-        let mut detections = Vec::new();
-        for fetched_evidence in fetched {
+        for (fetched_evidence, classification) in fetched {
             let fetched_block = fetched_evidence.block;
             let mut outputs = fetched_block.outputs;
             let mut root_outputs = fetched_block.root_outputs;
             outputs.sort_unstable_by_key(PersistedWalletOutput::id);
             root_outputs.sort_unstable_by_key(PersistedRootOutput::id);
-            for output in &outputs {
-                let wallet_output = output.wallet_output()?;
-                detections.push(DepositDetection {
-                    output: output.id(),
-                    index_on_blockchain: output.index_on_blockchain(),
-                    subaddress: output.subaddress(),
-                    amount_atomic_units: wallet_output.commitment().amount,
-                    observed_block: fetched_block.block.point,
-                    block_timestamp: fetched_block.timestamp,
-                });
-            }
+            outputs.retain(|output| {
+                !(classification.portable.contains(&output.id())
+                    && classification.claimed.contains_key(&output.id()))
+            });
+            let detected_outputs =
+                outputs.iter().map(PersistedWalletOutput::id).collect::<Vec<_>>();
             candidate.scan.append_block_with_root(
                 fetched_block.block,
                 fetched_block.timestamp,
                 outputs,
                 root_outputs,
             )?;
+            for output in detected_outputs {
+                if let Some(sweep) = classification.claimed.get(&output) {
+                    candidate.record_portable_claim(output, *sweep)?;
+                }
+                if !classification.portable.contains(&output) {
+                    candidate.queue_unreported_detection(output)?;
+                }
+            }
             candidate.observe_sweep_family_transactions(
                 fetched_block.block.point,
                 &fetched_evidence.transactions,
             )?;
         }
+        let detections = candidate.take_mature_detections()?;
+        if !detections.is_empty() {
+            candidate.stage_events(detections, None)?;
+        }
+        // Pin every promoted deterministic horizon before compaction can move it out of the
+        // ordinary reorganization suffix.
         candidate.scan.compact_reorg_window(candidate.config.max_reorg_depth)?;
         let retained_outputs = candidate.scan.retained_output_count();
         if retained_outputs
@@ -3870,9 +4074,6 @@ impl DepositWorkerState {
                 retained: retained_outputs,
                 maximum: candidate.config.max_retained_outputs,
             });
-        }
-        if !detections.is_empty() {
-            candidate.stage_events(detections, None)?;
         }
         let staged_events = candidate.pending_events.is_some();
         let effect = candidate.finish_mutation()?;
@@ -3959,16 +4160,21 @@ impl DepositWorkerState {
             return Err(DepositWorkerError::SweepSequenceExhausted);
         }
         let tip = self.scan.tip();
+        let minimum_confirmations = u64::from(self.config.confirmation_depth).max(
+            u64::try_from(DEFAULT_LOCK_WINDOW).map_err(|_| DepositWorkerError::HeightOverflow)?,
+        );
         let mut candidates = Vec::<(u64, WalletOutputId)>::new();
         for output in self.scan.available_outputs() {
+            if self.unreported_detection_outputs.contains(&output.id())
+                || self.portable_claimed_outputs.contains_key(&output.id())
+            {
+                continue;
+            }
             let Some(inclusion) = self.scan.output_chain_point(output.id()) else {
                 return Err(DepositWorkerError::CorruptState);
             };
             let confirmations = tip.height.saturating_sub(inclusion.height).saturating_add(1);
-            if confirmations
-                < u64::try_from(DEFAULT_LOCK_WINDOW)
-                    .map_err(|_| DepositWorkerError::HeightOverflow)?
-            {
+            if confirmations < minimum_confirmations {
                 continue;
             }
             let wallet_output = output.wallet_output()?;
@@ -4417,14 +4623,9 @@ impl DepositWorkerState {
     ) -> Result<FamilyKeyImageBinding, DepositWorkerError> {
         self.validate(None)?;
         let record = self.scan.sweep(id).ok_or(DepositWalletError::UnknownSweep(id))?;
-        let unsigned = record
-            .signing_intent
-            .signable_transaction()?
-            .unsigned_transaction(
-                key_images.iter().copied().map(MoneroCompressedPoint::from).collect(),
-            )
-            .ok_or(DepositWorkerError::InvalidSweepFamilyCandidate)?;
-        let unsigned_transaction_digest = unsigned_sweep_transaction_digest(&unsigned)?;
+        let unsigned_transaction_digest =
+            expected_unsigned_sweep_digest(&record.signing_intent, &key_images)?
+                .ok_or(DepositWorkerError::InvalidSweepFamilyCandidate)?;
         self.scan
             .preview_sweep_family_key_images(id, key_images, unsigned_transaction_digest)
             .map_err(Into::into)
@@ -5012,6 +5213,7 @@ impl DepositWorkerState {
         } else {
             candidate.scan.mark_sweep_confirmed(id, transaction, block)?;
         }
+        candidate.pin_matching_certified_sweep_publication(id, transaction, block)?;
         let effect = candidate.finish_mutation()?;
         *self = candidate;
         Ok(effect)
@@ -5046,6 +5248,7 @@ impl DepositWorkerState {
             block,
         )?;
         candidate.observed_family_settlements.remove(&id);
+        candidate.pin_matching_certified_sweep_publication(id, signed.transaction_id(), block)?;
         let effect = candidate.finish_mutation()?;
         *self = candidate;
         Ok(effect)
@@ -5175,9 +5378,15 @@ impl DepositWorkerState {
             return Err(DepositWorkerError::StaleSweepPlan);
         }
         let mut total = 0_u64;
+        let minimum_confirmations = u64::from(self.config.confirmation_depth).max(
+            u64::try_from(DEFAULT_LOCK_WINDOW).map_err(|_| DepositWorkerError::HeightOverflow)?,
+        );
         for id in &plan.inputs {
             let output = self.scan.output(*id).ok_or(DepositWorkerError::StaleSweepPlan)?;
-            if !self.scan.available_outputs().any(|available| available.id() == *id) {
+            if self.unreported_detection_outputs.contains(id)
+                || self.portable_claimed_outputs.contains_key(id)
+                || !self.scan.available_outputs().any(|available| available.id() == *id)
+            {
                 return Err(DepositWorkerError::StaleSweepPlan);
             }
             let inclusion =
@@ -5188,10 +5397,7 @@ impl DepositWorkerState {
                 .checked_sub(inclusion.height)
                 .and_then(|distance| distance.checked_add(1))
                 .ok_or(DepositWorkerError::StaleSweepPlan)?;
-            if confirmations
-                < u64::try_from(DEFAULT_LOCK_WINDOW)
-                    .map_err(|_| DepositWorkerError::HeightOverflow)?
-            {
+            if confirmations < minimum_confirmations {
                 return Err(DepositWorkerError::StaleSweepPlan);
             }
             let wallet_output = output.wallet_output()?;
@@ -5222,6 +5428,7 @@ impl DepositWorkerState {
         }
         detections
             .sort_unstable_by_key(|detection| (detection.observed_block.height, detection.output));
+        self.pin_detection_confirmation_horizon(&detections)?;
         let revision = self.revision.checked_add(1).ok_or(DepositWorkerError::RevisionExhausted)?;
         let mut batch = WorkerEventBatch { id: [0_u8; 32], revision, detections, rollback };
         batch.id = event_batch_id(&batch);
@@ -5267,6 +5474,22 @@ impl DepositWorkerState {
     }
 
     fn validate(&self, deriver: Option<&DepositAddressDeriver>) -> Result<(), DepositWorkerError> {
+        if let Some(deriver) = deriver
+            && self.wallet_id() != deriver.wallet_id()
+        {
+            return Err(DepositWorkerError::WrongWalletDomain);
+        }
+        std::thread_local! {
+            // ponytail: one commitment per thread; enlarge only if alternating states defeat reuse.
+            static VALIDATED: std::cell::Cell<Option<[u8; 32]>> = const { std::cell::Cell::new(None) };
+        }
+        // This commits to every serialized field, including proof bytes, not merely a revision.
+        // Reuse only a successful pure validation of identical state. Storage/epoch/chain
+        // authority is checked by callers, and the caller's wallet binding is checked above.
+        let commitment = self.state_commitment()?;
+        if VALIDATED.with(|validated| validated.get() == Some(commitment)) {
+            return Ok(());
+        }
         if self.version != WORKER_STATE_VERSION {
             return Err(DepositWorkerError::UnsupportedStateVersion(self.version));
         }
@@ -5336,7 +5559,7 @@ impl DepositWorkerState {
                 || backfill.held_points.windows(2).any(|points| points[0] >= points[1])
                 || backfill.held_points.iter().any(|point| {
                     self.scan
-                        .authenticated_historical_block_evidence(
+                        .authenticated_historical_block_header_evidence(
                             *point,
                             backfill.portable_head,
                             backfill.through_sequence,
@@ -5364,6 +5587,73 @@ impl DepositWorkerState {
                     return Err(DepositWorkerError::CorruptState);
                 }
             }
+        }
+        let maximum_tracked_outputs = usize::try_from(self.config.max_retained_outputs)
+            .map_err(|_| DepositWorkerError::CorruptState)?;
+        if self.unreported_detection_outputs.len() > maximum_tracked_outputs
+            || self.pending_observation_horizons.len() > maximum_tracked_outputs
+            || self.portable_claimed_outputs.len() > maximum_tracked_outputs
+        {
+            return Err(DepositWorkerError::CorruptState);
+        }
+        let required_distance = u64::from(
+            self.config
+                .confirmation_depth
+                .checked_sub(1)
+                .ok_or(DepositWorkerError::CorruptState)?,
+        );
+        for output in &self.unreported_detection_outputs {
+            if self.pending_observation_horizons.contains_key(output) {
+                return Err(DepositWorkerError::CorruptState);
+            }
+            let inclusion =
+                self.scan.output_chain_point(*output).ok_or(DepositWorkerError::CorruptState)?;
+            let required_height = inclusion
+                .height
+                .checked_add(required_distance)
+                .ok_or(DepositWorkerError::CorruptState)?;
+            if self.scan.authenticated_canonical_chain_point(required_height).is_some()
+                || (required_height <= self.scan.tip().height
+                    && self
+                        .allocation_backfill
+                        .as_ref()
+                        .is_none_or(|backfill| backfill.next_height > required_height))
+            {
+                return Err(DepositWorkerError::CorruptState);
+            }
+        }
+        for (output, horizon) in &self.pending_observation_horizons {
+            ChainPoint::new(horizon.height, horizon.hash)
+                .map_err(|_| DepositWorkerError::CorruptState)?;
+            let inclusion =
+                self.scan.output_chain_point(*output).ok_or(DepositWorkerError::CorruptState)?;
+            if !self.scan.authenticates_canonical_chain_point(*horizon)
+                || inclusion.height.checked_add(required_distance) != Some(horizon.height)
+            {
+                return Err(DepositWorkerError::CorruptState);
+            }
+        }
+        for (output, sweep) in &self.portable_claimed_outputs {
+            if sweep.0 == [0; 32] || self.scan.output(*output).is_none() {
+                return Err(DepositWorkerError::CorruptState);
+            }
+        }
+        for local in self.scan.sweeps() {
+            if local.inputs.iter().any(|input| {
+                self.portable_claimed_outputs.get(input).is_some_and(|owner| *owner != local.id)
+            }) {
+                return Err(DepositWorkerError::CorruptState);
+            }
+        }
+        let mut expected_historical_holds =
+            self.pending_observation_horizons.values().copied().collect::<BTreeSet<_>>();
+        if let Some(backfill) = &self.allocation_backfill {
+            expected_historical_holds.extend(backfill.held_points.iter().copied());
+        }
+        if self.scan.held_historical_chain_points().collect::<BTreeSet<_>>()
+            != expected_historical_holds
+        {
+            return Err(DepositWorkerError::CorruptState);
         }
         if self.certified_sweep_publications.len() > MAX_CERTIFIED_SWEEP_PUBLICATIONS {
             return Err(DepositWorkerError::CorruptState);
@@ -5419,21 +5709,10 @@ impl DepositWorkerState {
         }
         for sweep in self.scan.sweeps() {
             if let Some(binding) = &sweep.family_key_images {
-                let unsigned = sweep
-                    .signing_intent
-                    .signable_transaction()?
-                    .unsigned_transaction(
-                        binding
-                            .key_images()
-                            .iter()
-                            .copied()
-                            .map(MoneroCompressedPoint::from)
-                            .collect(),
-                    )
-                    .ok_or(DepositWorkerError::CorruptState)?;
-                if unsigned_sweep_transaction_digest(&unsigned)?
-                    != binding.unsigned_transaction_digest()
-                {
+                let expected =
+                    expected_unsigned_sweep_digest(&sweep.signing_intent, binding.key_images())?
+                        .ok_or(DepositWorkerError::CorruptState)?;
+                if expected != binding.unsigned_transaction_digest() {
                     return Err(DepositWorkerError::CorruptState);
                 }
             }
@@ -5491,19 +5770,21 @@ impl DepositWorkerState {
             })
             .collect::<BTreeSet<_>>();
         expected_pinned_root_transactions.extend(observed_transactions);
+        expected_pinned_root_transactions.extend(
+            self.certified_sweep_publications
+                .values()
+                .filter(|publication| publication.confirmation().is_some())
+                .map(|publication| publication.signed_transaction.transaction_id()),
+        );
         if self.scan.pinned_root_transactions().collect::<BTreeSet<_>>()
             != expected_pinned_root_transactions
         {
             return Err(DepositWorkerError::CorruptState);
         }
-        if let Some(deriver) = deriver
-            && self.wallet_id() != deriver.wallet_id()
-        {
-            return Err(DepositWorkerError::WrongWalletDomain);
-        }
         if let Some(batch) = &self.pending_events {
             self.validate_event_batch(batch)?;
         }
+        VALIDATED.with(|validated| validated.set(Some(commitment)));
         Ok(())
     }
 
@@ -5528,6 +5809,11 @@ impl DepositWorkerState {
                 self.scan.output(detection.output).ok_or(DepositWorkerError::InvalidEventBatch)?;
             let wallet_output = output.wallet_output()?;
             if self.scan.output_chain_point(detection.output) != Some(detection.observed_block)
+                || self.pending_observation_horizons.get(&detection.output)
+                    != Some(&detection.confirmation_horizon)
+                || !self.scan.authenticates_canonical_chain_point(detection.confirmation_horizon)
+                || self.scan.canonical_block_timestamp(detection.observed_block)
+                    != Some(detection.block_timestamp)
                 || output.index_on_blockchain() != detection.index_on_blockchain
                 || output.subaddress() != detection.subaddress
                 || wallet_output.commitment().amount != detection.amount_atomic_units
@@ -5551,6 +5837,10 @@ impl DepositWorkerState {
                     .orphaned_deposits
                     .windows(2)
                     .all(|window| window[0].output < window[1].output)
+                || !rollback
+                    .invalidated_observation_horizons
+                    .windows(2)
+                    .all(|window| window[0].output < window[1].output)
                 || orphaned_ids != rollback.removed_outputs
                 || rollback
                     .removed_outputs
@@ -5568,6 +5858,18 @@ impl DepositWorkerState {
                 ChainPoint::new(orphaned.observed_block.height, orphaned.observed_block.hash)
                     .map_err(|_| DepositWorkerError::InvalidEventBatch)?;
                 if orphaned.observed_block.height <= rollback.ancestor.height {
+                    return Err(DepositWorkerError::InvalidEventBatch);
+                }
+            }
+            for invalidated in &rollback.invalidated_observation_horizons {
+                ChainPoint::new(invalidated.horizon.height, invalidated.horizon.hash)
+                    .map_err(|_| DepositWorkerError::InvalidEventBatch)?;
+                if invalidated.horizon.height <= rollback.ancestor.height
+                    || self.scan.output(invalidated.output).is_none()
+                    || !self.unreported_detection_outputs.contains(&invalidated.output)
+                    || self.pending_observation_horizons.contains_key(&invalidated.output)
+                    || rollback.removed_outputs.binary_search(&invalidated.output).is_ok()
+                {
                     return Err(DepositWorkerError::InvalidEventBatch);
                 }
             }
@@ -5603,6 +5905,255 @@ impl DepositWorkerState {
     fn require_no_pending_events(&self) -> Result<(), DepositWorkerError> {
         if let Some(batch) = &self.pending_events {
             return Err(DepositWorkerError::PendingEvents(batch.id));
+        }
+        Ok(())
+    }
+
+    fn historical_block_is_referenced(&self, point: ChainPoint) -> bool {
+        self.pending_observation_horizons.values().any(|horizon| *horizon == point)
+            || self
+                .allocation_backfill
+                .as_ref()
+                .is_some_and(|backfill| backfill.held_points.binary_search(&point).is_ok())
+    }
+
+    fn pin_matching_certified_sweep_publication(
+        &mut self,
+        sweep: SweepId,
+        transaction: [u8; 32],
+        confirmation: ChainPoint,
+    ) -> Result<bool, DepositWorkerError> {
+        let Some(publication) = self.certified_sweep_publications.get(&sweep).cloned() else {
+            return Ok(false);
+        };
+        if publication.signed_transaction.transaction_id() != transaction
+            || publication.confirmation.is_some_and(|known| known != confirmation)
+        {
+            return Err(DepositWorkerError::CertifiedSweepConflict);
+        }
+        let terminal = verified_portable_publication(&publication, self.wallet_id())?;
+        let mut changed = self.scan.pin_verified_portable_terminal(&terminal, confirmation)?;
+        let stored = self
+            .certified_sweep_publications
+            .get_mut(&sweep)
+            .ok_or(DepositWorkerError::CorruptState)?;
+        if stored.confirmation.is_none() {
+            stored.confirmation = Some(confirmation);
+            changed = true;
+        }
+        Ok(changed)
+    }
+
+    /// `ScanState::rollback_to` removes every orphaned pinned root witness. Clear the matching
+    /// publication coordinates in the same candidate mutation so rebroadcast remains possible.
+    fn clear_certified_publication_confirmations_after(&mut self, ancestor: ChainPoint) {
+        for publication in self.certified_sweep_publications.values_mut() {
+            if publication
+                .confirmation
+                .is_some_and(|confirmation| confirmation.height > ancestor.height)
+            {
+                publication.confirmation = None;
+            }
+        }
+    }
+
+    fn release_historical_block_if_unreferenced(
+        &mut self,
+        point: ChainPoint,
+    ) -> Result<(), DepositWorkerError> {
+        if !self.historical_block_is_referenced(point) {
+            self.scan.release_authenticated_historical_block(point)?;
+        }
+        Ok(())
+    }
+
+    fn release_portable_observation_holds(
+        &mut self,
+        observed_outputs: &[WalletOutputId],
+    ) -> Result<(), DepositWorkerError> {
+        for output in observed_outputs {
+            self.unreported_detection_outputs.remove(output);
+        }
+        let released = observed_outputs
+            .iter()
+            .filter_map(|output| self.pending_observation_horizons.remove(output))
+            .collect::<BTreeSet<_>>();
+        for point in released {
+            self.release_historical_block_if_unreferenced(point)?;
+        }
+        Ok(())
+    }
+
+    fn retain_portable_claims(
+        &mut self,
+        output_claims: &[(WalletOutputId, SweepId)],
+    ) -> Result<(), DepositWorkerError> {
+        self.portable_claimed_outputs.retain(|output, _| self.scan.output(*output).is_some());
+        for (output, sweep) in output_claims {
+            if self.scan.output(*output).is_some() {
+                self.record_portable_claim(*output, *sweep)
+                    .map_err(|_| DepositWorkerError::InvalidPortableIndexTransition)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn record_portable_claim(
+        &mut self,
+        output: WalletOutputId,
+        sweep: SweepId,
+    ) -> Result<bool, DepositWorkerError> {
+        if sweep.0 == [0; 32] || self.scan.output(output).is_none() {
+            return Err(DepositWorkerError::CertifiedSweepConflict);
+        }
+        match self.portable_claimed_outputs.get(&output) {
+            Some(found) if *found == sweep => Ok(false),
+            Some(_) => Err(DepositWorkerError::CertifiedSweepConflict),
+            None => {
+                self.portable_claimed_outputs.insert(output, sweep);
+                Ok(true)
+            }
+        }
+    }
+
+    fn validate_portable_claim_batch(
+        &self,
+        claims: &BTreeMap<WalletOutputId, SweepId>,
+    ) -> Result<(), DepositWorkerError> {
+        if claims.is_empty() {
+            return Ok(());
+        }
+        if claims.iter().any(|(output, sweep)| {
+            output.transaction == [0; 32]
+                || sweep.0 == [0; 32]
+                || self.portable_claimed_outputs.get(output).is_some_and(|known| known != sweep)
+        }) {
+            return Err(DepositWorkerError::CertifiedSweepConflict);
+        }
+        for local in self.scan.sweeps() {
+            if local
+                .inputs
+                .iter()
+                .any(|input| claims.get(input).is_some_and(|portable| *portable != local.id))
+            {
+                return Err(DepositWorkerError::CertifiedSweepConflict);
+            }
+        }
+        Ok(())
+    }
+
+    fn reconcile_observation_tracking_after_rollback(
+        &mut self,
+        ancestor: ChainPoint,
+    ) -> Vec<InvalidatedDepositObservationHorizon> {
+        self.unreported_detection_outputs.retain(|output| self.scan.output(*output).is_some());
+        self.portable_claimed_outputs.retain(|output, _| self.scan.output(*output).is_some());
+        let invalidated = self
+            .pending_observation_horizons
+            .iter()
+            .filter_map(|(output, horizon)| {
+                (horizon.height > ancestor.height
+                    || !self.scan.authenticates_canonical_chain_point(*horizon)
+                    || self.scan.output(*output).is_none())
+                .then_some((*output, *horizon))
+            })
+            .collect::<Vec<_>>();
+        let mut surviving = Vec::new();
+        for (output, horizon) in invalidated {
+            self.pending_observation_horizons.remove(&output);
+            if self.scan.output(output).is_some() {
+                self.unreported_detection_outputs.insert(output);
+                surviving.push(InvalidatedDepositObservationHorizon { output, horizon });
+            }
+        }
+        surviving
+    }
+
+    fn queue_unreported_detection(
+        &mut self,
+        output: WalletOutputId,
+    ) -> Result<(), DepositWorkerError> {
+        if self.scan.output(output).is_none()
+            || self.pending_observation_horizons.contains_key(&output)
+        {
+            return Err(DepositWorkerError::CorruptState);
+        }
+        self.unreported_detection_outputs.insert(output);
+        Ok(())
+    }
+
+    fn take_mature_detections(&mut self) -> Result<Vec<DepositDetection>, DepositWorkerError> {
+        let required_distance = u64::from(
+            self.config
+                .confirmation_depth
+                .checked_sub(1)
+                .ok_or(DepositWorkerError::CorruptState)?,
+        );
+        let ready = self
+            .unreported_detection_outputs
+            .iter()
+            .filter_map(|output| {
+                let inclusion = self.scan.output_chain_point(*output)?;
+                let horizon_height = inclusion.height.checked_add(required_distance)?;
+                self.scan
+                    .authenticated_canonical_chain_point(horizon_height)
+                    .map(|horizon| (*output, horizon))
+            })
+            .collect::<Vec<_>>();
+        let mut detections = Vec::with_capacity(ready.len());
+        for (output_id, confirmation_horizon) in ready {
+            let output = self.scan.output(output_id).ok_or(DepositWorkerError::CorruptState)?;
+            let wallet_output = output.wallet_output()?;
+            let observed_block =
+                self.scan.output_chain_point(output_id).ok_or(DepositWorkerError::CorruptState)?;
+            let block_timestamp = self
+                .scan
+                .canonical_block_timestamp(observed_block)
+                .ok_or(DepositWorkerError::CorruptState)?;
+            detections.push(DepositDetection {
+                output: output_id,
+                index_on_blockchain: output.index_on_blockchain(),
+                subaddress: output.subaddress(),
+                amount_atomic_units: wallet_output.commitment().amount,
+                observed_block,
+                block_timestamp,
+                confirmation_horizon,
+            });
+            self.unreported_detection_outputs.remove(&output_id);
+        }
+        detections
+            .sort_unstable_by_key(|detection| (detection.observed_block.height, detection.output));
+        Ok(detections)
+    }
+
+    fn pin_detection_confirmation_horizon(
+        &mut self,
+        detections: &[DepositDetection],
+    ) -> Result<(), DepositWorkerError> {
+        if detections.is_empty() {
+            return Ok(());
+        }
+        let portable_head =
+            self.portable_index_head.ok_or(DepositWorkerError::PortableIndexHeadUninitialized)?;
+        let through_sequence = self
+            .portable_through_sequence
+            .ok_or(DepositWorkerError::PortableIndexHeadUninitialized)?;
+        for detection in detections {
+            let horizon = detection.confirmation_horizon;
+            if self
+                .pending_observation_horizons
+                .get(&detection.output)
+                .is_some_and(|existing| *existing != horizon)
+            {
+                return Err(DepositWorkerError::CorruptState);
+            }
+            let evidence = self.scan.authenticated_historical_block_header_evidence(
+                horizon,
+                portable_head,
+                through_sequence,
+            )?;
+            self.scan.pin_authenticated_historical_block(&evidence)?;
+            self.pending_observation_horizons.entry(detection.output).or_insert(horizon);
         }
         Ok(())
     }
@@ -5691,13 +6242,6 @@ fn verify_deposit_observation_against_scan(
     allocation: &AllocationStatement,
     observation: &DepositObservationStatement,
 ) -> Result<VerifiedLocalDepositObservation, DepositWorkerError> {
-    let output =
-        scan.output(observation.output()).ok_or(DepositWorkerError::InvalidDepositObservation)?;
-    let wallet_output = output.wallet_output()?;
-    let inclusion = scan
-        .output_chain_point(observation.output())
-        .ok_or(DepositWorkerError::InvalidDepositObservation)?;
-    let current_horizon = scan.tip();
     let statement_horizon = observation.confirmation_horizon();
     let required_distance = u64::from(
         confirmation_depth.checked_sub(1).ok_or(DepositWorkerError::InvalidDepositObservation)?,
@@ -5707,7 +6251,25 @@ fn verify_deposit_observation_against_scan(
         || observation.allocation_sequence() != allocation_sequence
         || observation.allocation_statement() != allocation_statement
         || observation.index() != allocation.address.index()
-        || observation.output_key() != output.output_key()
+        || observation.confirmation_depth() != confirmation_depth
+        || observation.observed_block().height < allocation.recognition_anchor.height
+    {
+        return Err(DepositWorkerError::InvalidDepositObservation);
+    }
+    let local_horizon = scan.tip();
+    if local_horizon.height < statement_horizon.height {
+        return Err(DepositWorkerError::DepositObservationAheadOfScanner {
+            local_height: local_horizon.height,
+            required_height: statement_horizon.height,
+        });
+    }
+    let output =
+        scan.output(observation.output()).ok_or(DepositWorkerError::InvalidDepositObservation)?;
+    let wallet_output = output.wallet_output()?;
+    let inclusion = scan
+        .output_chain_point(observation.output())
+        .ok_or(DepositWorkerError::InvalidDepositObservation)?;
+    if observation.output_key() != output.output_key()
         || observation.index_on_blockchain() != output.index_on_blockchain()
         || observation.amount_atomic_units() != wallet_output.commitment().amount
         || observation.observed_block() != inclusion
@@ -5715,14 +6277,9 @@ fn verify_deposit_observation_against_scan(
             != scan
                 .canonical_block_timestamp(inclusion)
                 .ok_or(DepositWorkerError::InvalidDepositObservation)?
-        || observation.confirmation_depth() != confirmation_depth
         || !scan.authenticates_canonical_chain_point(statement_horizon)
-        || inclusion
-            .height
-            .checked_add(required_distance)
-            .is_none_or(|required_horizon| required_horizon > statement_horizon.height)
+        || inclusion.height.checked_add(required_distance) != Some(statement_horizon.height)
         || output.subaddress() != observation.index()
-        || inclusion.height < allocation.recognition_anchor.height
     {
         return Err(DepositWorkerError::InvalidDepositObservation);
     }
@@ -5731,8 +6288,225 @@ fn verify_deposit_observation_against_scan(
         allocation_statement,
         observation_statement: observation.digest(),
         output: observation.output(),
-        verification_horizon: current_horizon,
+        verification_horizon: local_horizon,
     })
+}
+
+#[cfg(test)]
+mod allocation_backfill_progress_tests {
+    use curve25519_dalek::constants::ED25519_BASEPOINT_POINT;
+
+    use super::*;
+
+    const OLD_PORTABLE_HEAD: [u8; 32] = [0x61; 32];
+    const NEW_PORTABLE_HEAD: [u8; 32] = [0x62; 32];
+    const BACKFILL_HORIZON: u64 = 4;
+
+    fn block_hash(height: u64) -> [u8; 32] {
+        let mut hash = [0x63; 32];
+        hash[..8].copy_from_slice(&height.to_le_bytes());
+        hash
+    }
+
+    fn point(height: u64) -> ChainPoint {
+        ChainPoint::new(height, block_hash(height)).unwrap()
+    }
+
+    struct BackfillChain;
+
+    impl DepositChainSource for BackfillChain {
+        fn latest_height(&self) -> ChainFuture<'_, u64> {
+            Box::pin(async { Ok(BACKFILL_HORIZON) })
+        }
+
+        fn block_hash(&self, height: u64) -> ChainFuture<'_, [u8; 32]> {
+            Box::pin(async move {
+                if height > BACKFILL_HORIZON {
+                    return Err(ChainSourceError::Invalid(
+                        "backfill fixture height exceeds its horizon".to_owned(),
+                    ));
+                }
+                Ok(block_hash(height))
+            })
+        }
+
+        fn scanned_block_evidence<'a>(
+            &'a self,
+            height: u64,
+            _deriver: &'a DepositAddressDeriver,
+            _output_index: &'a dyn DepositOutputIndexBackend,
+            _portable_snapshot: [u8; 32],
+            resume: Option<DepositBlockScanCursor>,
+        ) -> ChainFuture<'a, DepositBlockScanResult> {
+            Box::pin(async move {
+                if height == 0 || height > BACKFILL_HORIZON || resume.is_some() {
+                    return Err(ChainSourceError::Invalid(
+                        "invalid backfill fixture scan request".to_owned(),
+                    ));
+                }
+                Ok(DepositBlockScanResult::Complete(FetchedDepositBlockEvidence {
+                    block: FetchedDepositBlock {
+                        block: ScannedBlock {
+                            point: point(height),
+                            parent_hash: block_hash(height - 1),
+                        },
+                        timestamp: 1_700_000_000 + height,
+                        hardfork_version: MAX_SUPPORTED_HARDFORK,
+                        outputs: Vec::new(),
+                        root_outputs: Vec::new(),
+                    },
+                    transactions: Vec::new(),
+                    transaction_key_images: Vec::new(),
+                    transaction_key_images_complete: true,
+                }))
+            })
+        }
+    }
+
+    struct BackfillOutputIndex([u8; 32]);
+
+    impl DepositOutputIndexBackend for BackfillOutputIndex {
+        fn portable_snapshot(&self, _wallet: DepositWalletId) -> ChainFuture<'_, [u8; 32]> {
+            Box::pin(async move { Ok(self.0) })
+        }
+
+        fn preload_subaddress_spend_keys<'a>(
+            &'a self,
+            _wallet: DepositWalletId,
+            _portable_snapshot: [u8; 32],
+            spend_keys: &'a [[u8; 32]],
+        ) -> ChainFuture<'a, Vec<Option<DepositSubaddressIndex>>> {
+            Box::pin(async move { Ok(vec![None; spend_keys.len()]) })
+        }
+
+        fn bind_outputs<'a>(
+            &'a self,
+            _wallet: DepositWalletId,
+            _portable_snapshot: [u8; 32],
+            _bindings: &'a [DepositOutputBinding],
+        ) -> ChainFuture<'a, ()> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn classify_portable_output_bindings<'a>(
+            &'a self,
+            _wallet: DepositWalletId,
+            _portable_snapshot: [u8; 32],
+            bindings: &'a [DepositOutputBinding],
+        ) -> ChainFuture<'a, Vec<PortableOutputBindingStatus>> {
+            Box::pin(async move {
+                Ok(vec![PortableOutputBindingStatus::UnseenUnclaimed; bindings.len()])
+            })
+        }
+    }
+
+    fn deriver() -> DepositAddressDeriver {
+        DepositAddressDeriver::new(
+            NetworkKind::Regtest,
+            (ED25519_BASEPOINT_POINT * DalekScalar::from(42_u64)).compress().to_bytes(),
+            &Zeroizing::new(DalekScalar::from(17_u64).to_bytes()),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn validation_reuse_is_bound_to_complete_state_and_callers_wallet() {
+        let owner = deriver();
+        let state =
+            DepositWorkerState::new(&owner, point(0), DepositWorkerConfig::default()).unwrap();
+        let encoded = state.encode().unwrap();
+        assert_eq!(DepositWorkerState::decode(&encoded, &owner).unwrap(), state);
+        let other = DepositAddressDeriver::new(
+            NetworkKind::Regtest,
+            (ED25519_BASEPOINT_POINT * DalekScalar::from(43_u64)).compress().to_bytes(),
+            &Zeroizing::new(DalekScalar::from(17_u64).to_bytes()),
+        )
+        .unwrap();
+        assert!(matches!(
+            DepositWorkerState::decode(&encoded, &other),
+            Err(DepositWorkerError::WrongWalletDomain)
+        ));
+        let mut corrupt = state.clone();
+        corrupt.portable_index_head = Some([0; 32]);
+        assert_eq!(corrupt.revision, state.revision);
+        assert_ne!(corrupt.state_commitment().unwrap(), state.state_commitment().unwrap());
+        assert!(corrupt.validate(None).is_err());
+        assert!(corrupt.validate(None).is_err(), "failed validation must never warm the cache");
+        assert_eq!(state.encode().unwrap(), encoded);
+    }
+
+    #[tokio::test]
+    async fn allocation_backfill_persists_exactly_one_block_per_tick_across_restarts() {
+        let deriver = deriver();
+        let chain = BackfillChain;
+        let old_index = BackfillOutputIndex(OLD_PORTABLE_HEAD);
+        let new_index = BackfillOutputIndex(NEW_PORTABLE_HEAD);
+        let mut worker = DepositWorkerState::new(
+            &deriver,
+            point(0),
+            DepositWorkerConfig {
+                confirmation_depth: 1,
+                max_blocks_per_tick: u16::try_from(BACKFILL_HORIZON).unwrap(),
+                ..DepositWorkerConfig::default()
+            },
+        )
+        .unwrap();
+        worker.initialize_portable_index_head(OLD_PORTABLE_HEAD).unwrap();
+
+        let initial_scan = worker.tick(&chain, &deriver, &old_index).await.unwrap();
+        assert_eq!(initial_scan.scanner_tip, point(BACKFILL_HORIZON));
+        assert_eq!(initial_scan.persistence.unwrap().revision(), worker.revision());
+        assert!(!initial_scan.staged_events);
+
+        let before_adoption_revision = worker.revision();
+        let adoption = worker
+            .adopt_portable_scanner_target(NEW_PORTABLE_HEAD, 1, &[point(0)], &[], &[], None, true)
+            .unwrap()
+            .unwrap();
+        assert_eq!(adoption.revision(), before_adoption_revision + 1);
+        assert_eq!(worker.revision(), adoption.revision());
+        assert_eq!(worker.portable_index_head(), Some(OLD_PORTABLE_HEAD));
+        assert_eq!(worker.portable_through_sequence(), Some(0));
+        assert!(!worker.allocation_view_ready());
+        assert_eq!(worker.allocation_backfill().unwrap().next_height(), 1);
+
+        worker = DepositWorkerState::decode(&worker.encode().unwrap(), &deriver).unwrap();
+        worker.verify_effect(adoption, adoption.revision()).unwrap();
+        for height in 1..=BACKFILL_HORIZON {
+            let before_revision = worker.revision();
+            let tick = worker.tick_allocation_backfill(&chain, &deriver, &new_index).await.unwrap();
+            let persistence =
+                tick.persistence.expect("each backfill block must require persistence");
+            assert_eq!(persistence.revision(), before_revision + 1);
+            assert_eq!(worker.revision(), persistence.revision());
+            assert_eq!(persistence.state_commitment(), worker.state_commitment().unwrap());
+            assert_eq!(tick.scanner_tip, point(BACKFILL_HORIZON));
+            assert!(!tick.staged_events);
+
+            if height < BACKFILL_HORIZON {
+                let backfill = worker.allocation_backfill().expect("backfill completed early");
+                assert_eq!(backfill.next_height(), height + 1);
+                assert_eq!(backfill.confirmed_horizon(), point(BACKFILL_HORIZON));
+                assert_eq!(backfill.portable_head(), NEW_PORTABLE_HEAD);
+                assert_eq!(backfill.through_sequence(), 1);
+                assert_eq!(worker.portable_index_head(), Some(OLD_PORTABLE_HEAD));
+                assert_eq!(worker.portable_through_sequence(), Some(0));
+                assert!(!worker.allocation_view_ready());
+            } else {
+                assert!(worker.allocation_backfill().is_none());
+                assert_eq!(worker.portable_index_head(), Some(NEW_PORTABLE_HEAD));
+                assert_eq!(worker.portable_through_sequence(), Some(1));
+                assert!(worker.allocation_view_ready());
+                assert!(worker.scan.held_historical_chain_points().next().is_none());
+            }
+
+            let encoded = worker.encode().unwrap();
+            let restored = DepositWorkerState::decode(&encoded, &deriver).unwrap();
+            assert_eq!(restored, worker);
+            restored.verify_effect(persistence, persistence.revision()).unwrap();
+            worker = restored;
+        }
+    }
 }
 
 #[cfg(test)]
@@ -5758,6 +6532,7 @@ mod deposit_observation_validation_tests {
     };
 
     struct ObservationFixture {
+        deriver: DepositAddressDeriver,
         scan: ScanState,
         registry: CompactEpochRegistry,
         allocation: LedgerStatement,
@@ -5884,6 +6659,7 @@ mod deposit_observation_validation_tests {
         statement.validate_active(&registry).unwrap();
 
         ObservationFixture {
+            deriver,
             scan,
             registry,
             allocation,
@@ -5927,6 +6703,143 @@ mod deposit_observation_validation_tests {
     }
 
     #[test]
+    fn observation_ahead_of_the_local_scanner_is_retryable_without_weakening_fork_checks() {
+        let fixture = persisted_fixture();
+        let mut lagging = fixture.scan.clone();
+        lagging.rollback_to(point(11, 11)).unwrap();
+        assert!(matches!(
+            verify(&fixture, &lagging),
+            Err(DepositWorkerError::DepositObservationAheadOfScanner {
+                local_height: 11,
+                required_height: 12,
+            })
+        ));
+
+        let mut replaced_horizon = fixture.scan.clone();
+        replaced_horizon.rollback_to(point(11, 11)).unwrap();
+        append_empty(&mut replaced_horizon, point(12, 22), point(11, 11));
+        assert!(matches!(
+            verify(&fixture, &replaced_horizon),
+            Err(DepositWorkerError::InvalidDepositObservation)
+        ));
+    }
+
+    #[test]
+    fn observation_horizon_survives_compaction_and_restart_until_portable() {
+        let fixture = persisted_fixture();
+        let mut worker = DepositWorkerState::new(
+            &fixture.deriver,
+            point(10, 10),
+            DepositWorkerConfig {
+                confirmation_depth: 2,
+                max_reorg_depth: 60,
+                ..DepositWorkerConfig::default()
+            },
+        )
+        .unwrap();
+        worker.scan = fixture.scan.clone();
+        worker.portable_index_head = Some([0x91; 32]);
+        worker.portable_through_sequence = Some(1);
+        let output = worker.scan.output(fixture.statement.output()).unwrap();
+        let wallet_output = output.wallet_output().unwrap();
+        let index_on_blockchain = output.index_on_blockchain();
+        let subaddress = output.subaddress();
+        let amount_atomic_units = wallet_output.commitment().amount;
+        worker
+            .stage_events(
+                vec![DepositDetection {
+                    output: fixture.statement.output(),
+                    index_on_blockchain,
+                    subaddress,
+                    amount_atomic_units,
+                    observed_block: fixture.statement.observed_block(),
+                    block_timestamp: fixture.statement.block_timestamp(),
+                    confirmation_horizon: fixture.statement.confirmation_horizon(),
+                }],
+                None,
+            )
+            .unwrap();
+        worker.finish_mutation().unwrap();
+        let batch = worker.pending_events.as_ref().unwrap().clone();
+        worker.acknowledge_events(batch.id).unwrap();
+        assert_eq!(
+            worker.pending_observation_horizons.get(&fixture.statement.output()),
+            Some(&fixture.statement.confirmation_horizon())
+        );
+
+        let mut parent = fixture.statement.confirmation_horizon();
+        for height in 13_u64..=80 {
+            let next = point(height, u8::try_from(height).unwrap());
+            append_empty(&mut worker.scan, next, parent);
+            parent = next;
+        }
+        worker.scan.compact_reorg_window(worker.config.max_reorg_depth).unwrap();
+        worker.finish_mutation().unwrap();
+        assert!(
+            fixture.statement.confirmation_horizon().height < worker.reorg_checkpoint().height,
+            "the observation horizon must age behind the ordinary reorg window"
+        );
+
+        let encoded = worker.encode().unwrap();
+        let mut restored = DepositWorkerState::decode(&encoded, &fixture.deriver).unwrap();
+        let verified = verify(&fixture, restored.scan_state()).unwrap();
+        assert_eq!(verified.observation_statement(), fixture.statement.digest());
+        assert!(
+            restored
+                .scan
+                .held_historical_chain_points()
+                .any(|point| point == fixture.statement.confirmation_horizon())
+        );
+        assert_eq!(
+            restored.scan.chain_point(fixture.statement.confirmation_horizon().height),
+            None,
+            "the compacted horizon must no longer be in the ordinary reorganization suffix",
+        );
+        assert_eq!(
+            restored.scan.authenticated_canonical_chain_point(
+                fixture.statement.confirmation_horizon().height,
+            ),
+            Some(fixture.statement.confirmation_horizon()),
+        );
+
+        // Allocation backfill can discover both an inclusion and its exact confirmation horizon
+        // after they have aged behind the live reorganization window. Re-run that pinned-only
+        // state through maturity, event validation, persistence, and restart.
+        let mut historical_reissue = restored.clone();
+        assert_eq!(
+            historical_reissue.pending_observation_horizons.remove(&fixture.statement.output()),
+            Some(fixture.statement.confirmation_horizon()),
+        );
+        assert!(historical_reissue.unreported_detection_outputs.insert(fixture.statement.output()));
+        let detections = historical_reissue.take_mature_detections().unwrap();
+        assert_eq!(detections.len(), 1);
+        assert_eq!(detections[0].output, fixture.statement.output());
+        assert_eq!(detections[0].confirmation_horizon, fixture.statement.confirmation_horizon(),);
+        historical_reissue.stage_events(detections.clone(), None).unwrap();
+        historical_reissue.finish_mutation().unwrap();
+        let replayed =
+            DepositWorkerState::decode(&historical_reissue.encode().unwrap(), &fixture.deriver)
+                .unwrap();
+        assert_eq!(replayed.replay_pending_events().unwrap().unwrap().detections, detections,);
+
+        // A semantically verified portable scanner transition invokes this exact release helper
+        // for every observed output carried by its non-serializable capability.
+        restored.release_portable_observation_holds(&[fixture.statement.output()]).unwrap();
+        restored.finish_mutation().unwrap();
+        assert!(!restored.pending_observation_horizons.contains_key(&fixture.statement.output()));
+        assert!(
+            !restored
+                .scan
+                .held_historical_chain_points()
+                .any(|point| point == fixture.statement.confirmation_horizon())
+        );
+        assert!(matches!(
+            verify(&fixture, restored.scan_state()),
+            Err(DepositWorkerError::InvalidDepositObservation)
+        ));
+    }
+
+    #[test]
     fn observation_rejects_replaced_bound_tip_or_output_history() {
         let fixture = persisted_fixture();
 
@@ -5948,6 +6861,200 @@ mod deposit_observation_validation_tests {
             verify(&fixture, &replaced_output),
             Err(DepositWorkerError::InvalidDepositObservation)
         ));
+    }
+}
+
+#[cfg(test)]
+mod certified_publication_confirmation_tests {
+    use super::*;
+    use curve25519_dalek::constants::ED25519_BASEPOINT_POINT;
+    use monero_oxide::transaction::TransactionPrefix;
+    use monero_wallet::{
+        WalletOutput,
+        ed25519::{Commitment, Scalar},
+        transaction::Timelock,
+    };
+
+    fn point(height: u64, byte: u8) -> ChainPoint {
+        ChainPoint::new(height, [byte; 32]).unwrap()
+    }
+
+    fn deriver() -> DepositAddressDeriver {
+        DepositAddressDeriver::new(
+            NetworkKind::Mainnet,
+            (ED25519_BASEPOINT_POINT * DalekScalar::from(42_u64)).compress().to_bytes(),
+            &Zeroizing::new(DalekScalar::from(17_u64).to_bytes()),
+        )
+        .unwrap()
+    }
+
+    fn signed_miner_transaction(extra: u8) -> SignedSweepTransaction {
+        let transaction = Transaction::V1 {
+            prefix: TransactionPrefix {
+                additional_timelock: Timelock::None,
+                inputs: vec![Input::Gen(1)],
+                outputs: vec![],
+                extra: vec![extra],
+            },
+            signatures: vec![],
+        };
+        SignedSweepTransaction::from_transaction(&transaction, None).unwrap()
+    }
+
+    fn root_output(transaction: [u8; 32]) -> PersistedRootOutput {
+        let offset = DalekScalar::from(29_u64);
+        let output_key = ED25519_BASEPOINT_POINT * (DalekScalar::from(42_u64) + offset);
+        let commitment = Commitment::new(Scalar::from(DalekScalar::from(78_u64)), 9_000_000);
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&transaction);
+        bytes.extend_from_slice(&0_u64.to_le_bytes());
+        bytes.extend_from_slice(&700_u64.to_le_bytes());
+        bytes.extend_from_slice(&output_key.compress().to_bytes());
+        bytes.extend_from_slice(&offset.to_bytes());
+        commitment.write(&mut bytes).unwrap();
+        Timelock::None.write(&mut bytes).unwrap();
+        bytes.extend_from_slice(&[0, 0, 0]);
+        let mut reader = Cursor::new(bytes.as_slice());
+        let output = WalletOutput::read(&mut reader).unwrap();
+        assert_eq!(usize::try_from(reader.position()).unwrap(), bytes.len());
+        PersistedRootOutput::from_scanner(&output).unwrap()
+    }
+
+    fn publication(
+        sweep: SweepId,
+        signed_transaction: SignedSweepTransaction,
+    ) -> CertifiedSweepPublication {
+        CertifiedSweepPublication {
+            version: CERTIFIED_SWEEP_PUBLICATION_VERSION,
+            certificate_digest: [0x71; 32],
+            portable_terminal_digest: [0x72; 32],
+            sweep,
+            inputs: vec![WalletOutputId { transaction: [0x73; 32], index_in_transaction: 0 }],
+            signed_transaction,
+            confirmation: None,
+        }
+    }
+
+    fn worker_with_publication(
+        signed_transaction: SignedSweepTransaction,
+    ) -> (DepositAddressDeriver, DepositWorkerState, SweepId, ChainPoint) {
+        let deriver = deriver();
+        let mut worker =
+            DepositWorkerState::new(&deriver, point(10, 10), DepositWorkerConfig::default())
+                .unwrap();
+        worker.initialize_portable_index_head([0x74; 32]).unwrap();
+        let sweep = SweepId([0x75; 32]);
+        let confirmation = point(11, 11);
+        worker
+            .scan
+            .append_block_with_root(
+                ScannedBlock { point: confirmation, parent_hash: point(10, 10).hash },
+                1_700_000_011,
+                Vec::new(),
+                vec![root_output(signed_transaction.transaction_id())],
+            )
+            .unwrap();
+        worker.certified_sweep_publications.insert(sweep, publication(sweep, signed_transaction));
+        worker.finish_mutation().unwrap();
+        (deriver, worker, sweep, confirmation)
+    }
+
+    #[test]
+    fn matching_confirmation_pins_publication_once_and_roundtrips() {
+        let signed = signed_miner_transaction(1);
+        let transaction = signed.transaction_id();
+        let (deriver, mut worker, sweep, confirmation) = worker_with_publication(signed);
+
+        assert!(
+            worker
+                .pin_matching_certified_sweep_publication(sweep, transaction, confirmation)
+                .unwrap()
+        );
+        worker.finish_mutation().unwrap();
+        assert_eq!(
+            worker.certified_sweep_publication(sweep).unwrap().confirmation(),
+            Some(confirmation)
+        );
+        assert!(
+            !worker
+                .pin_matching_certified_sweep_publication(sweep, transaction, confirmation)
+                .unwrap()
+        );
+
+        let restored = DepositWorkerState::decode(&worker.encode().unwrap(), &deriver).unwrap();
+        assert_eq!(
+            restored.certified_sweep_publication(sweep).unwrap().confirmation(),
+            Some(confirmation)
+        );
+    }
+
+    #[test]
+    fn mismatched_publication_confirmation_is_atomic() {
+        let canonical = signed_miner_transaction(2);
+        let transaction = canonical.transaction_id();
+        let (deriver, mut worker, sweep, confirmation) = worker_with_publication(canonical);
+        worker
+            .certified_sweep_publications
+            .insert(sweep, publication(sweep, signed_miner_transaction(3)));
+        worker.finish_mutation().unwrap();
+        let before = worker.clone();
+
+        assert!(matches!(
+            worker.pin_matching_certified_sweep_publication(sweep, transaction, confirmation),
+            Err(DepositWorkerError::CertifiedSweepConflict)
+        ));
+        assert_eq!(worker, before);
+        DepositWorkerState::decode(&worker.encode().unwrap(), &deriver).unwrap();
+    }
+
+    #[test]
+    fn rollback_clears_confirmation_and_post_fence_compaction_survives_restart() {
+        let signed = signed_miner_transaction(4);
+        let transaction = signed.transaction_id();
+        let (deriver, mut worker, sweep, confirmation) = worker_with_publication(signed);
+        worker.pin_matching_certified_sweep_publication(sweep, transaction, confirmation).unwrap();
+        worker.finish_mutation().unwrap();
+
+        let mut rolled_back = worker.clone();
+        rolled_back.scan.rollback_to(point(10, 10)).unwrap();
+        rolled_back.clear_certified_publication_confirmations_after(point(10, 10));
+        rolled_back.finish_mutation().unwrap();
+        assert_eq!(rolled_back.certified_sweep_publication(sweep).unwrap().confirmation(), None);
+        let rolled_back =
+            DepositWorkerState::decode(&rolled_back.encode().unwrap(), &deriver).unwrap();
+        assert_eq!(rolled_back.certified_sweep_publication(sweep).unwrap().confirmation(), None);
+
+        worker
+            .scan
+            .append_block(
+                ScannedBlock { point: point(12, 12), parent_hash: confirmation.hash },
+                1_700_000_012,
+                Vec::new(),
+            )
+            .unwrap();
+        worker
+            .scan
+            .append_block(
+                ScannedBlock { point: point(13, 13), parent_hash: point(12, 12).hash },
+                1_700_000_013,
+                Vec::new(),
+            )
+            .unwrap();
+        worker.scan.compact_reorg_window(1).unwrap();
+        worker.finish_mutation().unwrap();
+        assert_eq!(
+            worker
+                .compactable_certified_sweep_publications()
+                .map(CertifiedSweepPublication::sweep)
+                .collect::<Vec<_>>(),
+            vec![sweep]
+        );
+
+        let mut restored = DepositWorkerState::decode(&worker.encode().unwrap(), &deriver).unwrap();
+        restored.compact_certified_sweep_publication(sweep).unwrap().unwrap();
+        assert!(restored.certified_sweep_publication(sweep).is_none());
+        let restored = DepositWorkerState::decode(&restored.encode().unwrap(), &deriver).unwrap();
+        assert!(restored.certified_sweep_publication(sweep).is_none());
     }
 }
 
@@ -6278,18 +7385,22 @@ fn validate_fetched_block_shape(
 fn output_bindings(
     block: &FetchedDepositBlock,
 ) -> Result<Vec<DepositOutputBinding>, DepositWorkerError> {
-    let output_count = block.outputs.len().checked_add(block.root_outputs.len()).ok_or(
-        DepositWorkerError::TooManyAtomicOutputBindings {
-            actual: usize::MAX,
-            maximum: MAX_ATOMIC_OUTPUT_BINDINGS,
-        },
-    )?;
-    if output_count > MAX_ATOMIC_OUTPUT_BINDINGS {
+    let bindings = all_output_bindings(block)?;
+    if bindings.len() > MAX_ATOMIC_OUTPUT_BINDINGS {
         return Err(DepositWorkerError::TooManyAtomicOutputBindings {
-            actual: output_count,
+            actual: bindings.len(),
             maximum: MAX_ATOMIC_OUTPUT_BINDINGS,
         });
     }
+    Ok(bindings)
+}
+
+fn all_output_bindings(
+    block: &FetchedDepositBlock,
+) -> Result<Vec<DepositOutputBinding>, DepositWorkerError> {
+    let output_count = block.outputs.len().checked_add(block.root_outputs.len()).ok_or(
+        DepositWorkerError::TooManyAtomicOutputBindings { actual: usize::MAX, maximum: usize::MAX },
+    )?;
     let mut bindings = block
         .outputs
         .iter()
@@ -6300,6 +7411,8 @@ fn output_bindings(
                 output_key: output.output_key(),
                 subaddress: Some(output.subaddress()),
                 amount_atomic_units: wallet_output.commitment().amount,
+                index_on_blockchain: output.index_on_blockchain(),
+                observed_block: block.block.point,
                 observed_at: block.timestamp,
             })
         })
@@ -6310,15 +7423,69 @@ fn output_bindings(
                 output_key: output.output_key(),
                 subaddress: None,
                 amount_atomic_units: wallet_output.commitment().amount,
+                index_on_blockchain: output.index_on_blockchain(),
+                observed_block: block.block.point,
                 observed_at: block.timestamp,
             })
         }))
         .collect::<Result<Vec<_>, DepositWorkerError>>()?;
+    if bindings.len() != output_count {
+        return Err(DepositWorkerError::CorruptState);
+    }
     bindings.sort_unstable_by_key(|binding| binding.output);
     if bindings.windows(2).any(|window| window[0].output == window[1].output) {
         return Err(DepositWorkerError::CorruptState);
     }
     Ok(bindings)
+}
+
+#[derive(Default)]
+struct PortableBlockOutputClassification {
+    portable: BTreeSet<WalletOutputId>,
+    claimed: BTreeMap<WalletOutputId, SweepId>,
+}
+
+async fn classify_portable_block_outputs(
+    output_index: &dyn DepositOutputIndexBackend,
+    wallet: DepositWalletId,
+    portable_snapshot: [u8; 32],
+    block: &FetchedDepositBlock,
+) -> Result<PortableBlockOutputClassification, DepositWorkerError> {
+    let bindings = all_output_bindings(block)?;
+    let mut classification = PortableBlockOutputClassification::default();
+    for chunk in bindings.chunks(MAX_PORTABLE_OUTPUT_CLASSIFICATION_BINDINGS) {
+        let statuses = output_index
+            .classify_portable_output_bindings(wallet, portable_snapshot, chunk)
+            .await
+            .map_err(|error| match error {
+                ChainSourceError::UnsupportedHardfork(version) => {
+                    DepositWorkerError::UnsupportedHardfork(version)
+                }
+                other => DepositWorkerError::ChainSource(other),
+            })?;
+        if statuses.len() != chunk.len() {
+            return Err(DepositWorkerError::CorruptState);
+        }
+        for (binding, status) in chunk.iter().zip(statuses) {
+            let claim_owner = status.claim_owner();
+            if binding.subaddress.is_none() && (status.is_portable() || claim_owner.is_some()) {
+                return Err(DepositWorkerError::CorruptState);
+            }
+            if status.is_portable() {
+                if !classification.portable.insert(binding.output) {
+                    return Err(DepositWorkerError::CorruptState);
+                }
+            }
+            if let Some(sweep) = claim_owner {
+                if sweep.0 == [0; 32]
+                    || classification.claimed.insert(binding.output, sweep).is_some()
+                {
+                    return Err(DepositWorkerError::CorruptState);
+                }
+            }
+        }
+    }
+    Ok(classification)
 }
 
 fn validate_fetched_output_chunk(
@@ -6691,6 +7858,43 @@ fn transaction_key_images(transaction: &Transaction) -> Option<Vec<[u8; 32]>> {
         .collect()
 }
 
+fn expected_unsigned_sweep_digest(
+    intent: &SweepSigningIntent,
+    key_images: &[[u8; 32]],
+) -> Result<Option<[u8; 32]>, DepositWorkerError> {
+    std::thread_local! {
+        // ponytail: 64 digest pairs per thread; revisit only if retained families exceed this bound.
+        static RECENT: std::cell::RefCell<std::collections::VecDeque<([u8; 32], [u8; 32])>> =
+            const { std::cell::RefCell::new(std::collections::VecDeque::new()) };
+    }
+    // Cache only a pure deterministic computation, never a signature/proof authorization result.
+    // The family digest covers the full canonical private intent; image order is significant.
+    let mut hasher =
+        blake3::Hasher::new_derive_key("threshold-monero/expected-unsigned-sweep-cache/v1");
+    hasher.update(&intent.family_digest());
+    hasher.update(&u64::try_from(key_images.len()).unwrap_or(u64::MAX).to_le_bytes());
+    for image in key_images {
+        hasher.update(image);
+    }
+    let key = *hasher.finalize().as_bytes();
+    RECENT.with_borrow_mut(|cached| {
+        if let Some((_, digest)) = cached.iter().find(|(found, _)| *found == key) {
+            return Ok(Some(*digest));
+        }
+        let Some(unsigned) = intent.signable_transaction()?.unsigned_transaction(
+            key_images.iter().copied().map(MoneroCompressedPoint::from).collect(),
+        ) else {
+            return Ok(None);
+        };
+        let digest = unsigned_sweep_transaction_digest(&unsigned)?;
+        if cached.len() == 64 {
+            cached.pop_front();
+        }
+        cached.push_back((key, digest));
+        Ok(Some(digest))
+    })
+}
+
 fn unsigned_sweep_transaction_digest(
     transaction: &Transaction,
 ) -> Result<[u8; 32], DepositWorkerError> {
@@ -6975,6 +8179,16 @@ pub enum DepositWorkerError {
     /// Proposed portable output observation did not match the exact confirmed local rescan.
     #[error("deposit observation does not match confirmed local scanner state")]
     InvalidDepositObservation,
+    /// The proposed observation names a confirmation horizon this scanner has not reached yet.
+    #[error(
+        "deposit observation requires scanner height {required_height}, but local height is {local_height}"
+    )]
+    DepositObservationAheadOfScanner {
+        /// Current locally authenticated scanner height.
+        local_height: u64,
+        /// Confirmation horizon required by the signed observation.
+        required_height: u64,
+    },
     /// Durable certified publication bound was reached.
     #[error("certified sweep publication capacity reached")]
     CertifiedPublicationCapacity,

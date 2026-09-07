@@ -38,7 +38,10 @@ use serde::{
 };
 use thiserror::Error;
 
-use crate::committee::{Committee, CommitteeError, PartyId, SessionId};
+use crate::{
+    committee::{Committee, CommitteeError, PartyId, SessionId},
+    keys::{EpochPublic, EpochShare, KeyError},
+};
 
 type FrostScalar = <Ed25519 as Ciphersuite>::F;
 type FrostPoint = <Ed25519 as Ciphersuite>::G;
@@ -135,6 +138,22 @@ pub fn validate_frostlass_preprocess_shape(
         });
     }
 
+    std::thread_local! {
+        // ponytail: 64 public digests per thread; enlarge only if measured replay churn warrants it.
+        static VALID_SHAPES: std::cell::RefCell<std::collections::VecDeque<[u8; 32]>> =
+            const { std::cell::RefCell::new(std::collections::VecDeque::new()) };
+    }
+    // Pure shape validation only: no nonce state, sender/session authority, or proof equations.
+    // Every byte and the input count are bound; failures never populate this bounded cache.
+    let mut hasher =
+        blake3::Hasher::new_derive_key("threshold-monero/frostlass-preprocess-shape/v1");
+    hasher.update(&input_count.to_le_bytes());
+    hasher.update(message.as_bytes());
+    let digest = *hasher.finalize().as_bytes();
+    if VALID_SHAPES.with_borrow(|cached| cached.contains(&digest)) {
+        return Ok(expected);
+    }
+
     for input in message.as_bytes().chunks_exact(FROSTLASS_PREPROCESS_BYTES_PER_INPUT) {
         // The first four fields are read through modular-frost's `Curve::read_G`, which adds an
         // identity rejection to the ciphersuite's canonical prime-subgroup point decoder.
@@ -171,6 +190,12 @@ pub fn validate_frostlass_preprocess_shape(
             });
         }
     }
+    VALID_SHAPES.with_borrow_mut(|cached| {
+        if cached.len() == 64 {
+            cached.pop_front();
+        }
+        cached.push_back(digest);
+    });
     Ok(expected)
 }
 
@@ -401,6 +426,10 @@ pub enum SigningError {
     IdentityGroupKey,
     #[error("threshold group key does not match the expected wallet spend key")]
     WrongGroupKey,
+    #[error(
+        "threshold share for epoch {supplied_epoch} does not match authenticated epoch {expected_epoch}"
+    )]
+    EpochKeyMismatch { expected_epoch: u64, supplied_epoch: u64 },
     #[error("local secret share does not match its public verification share")]
     LocalShareMismatch,
     #[error("public verification share {participant} is inconsistent with the sharing polynomial")]
@@ -440,6 +469,8 @@ pub enum SigningError {
     InvalidPreprocess { party: PartyId },
     #[error("party {party} supplied a cryptographically invalid signature share")]
     InvalidSignatureShare { party: PartyId },
+    #[error("epoch key material is invalid: {0}")]
+    EpochKey(#[from] KeyError),
     #[error("Monero transaction construction rejected the threshold keys: {0}")]
     Monero(#[from] SendError),
     #[error("FROSTLASS signing failed: {0}")]
@@ -450,6 +481,45 @@ pub enum SigningError {
 pub struct FrostlassSigner;
 
 impl FrostlassSigner {
+    /// Start with a secret share bound to exact, externally authenticated epoch metadata.
+    ///
+    /// The caller must authenticate `expected_epoch` through the activation certificate before
+    /// invoking this method. The complete activation digest binds the key id, committee, group
+    /// key, and verification-share table. It is checked before converting the share or drawing
+    /// signing nonces, so a stale share from an earlier proactive refresh cannot burn a successor
+    /// signing attempt.
+    #[allow(clippy::too_many_arguments)]
+    pub fn start_in_authenticated_epoch_session<R: RngCore + CryptoRng>(
+        transaction: SignableTransaction,
+        share: &EpochShare,
+        expected_epoch: &EpochPublic,
+        local_party: PartyId,
+        signers: impl IntoIterator<Item = PartyId>,
+        session: SessionId,
+        rng: &mut R,
+    ) -> Result<(AwaitingCommitments, BoundPreprocessMessage), SigningError> {
+        let expected_activation = expected_epoch.activation_digest()?;
+        let supplied_activation = share.activation_digest()?;
+        if supplied_activation != expected_activation {
+            return Err(SigningError::EpochKeyMismatch {
+                expected_epoch: expected_epoch.committee.epoch,
+                supplied_epoch: share.committee.epoch,
+            });
+        }
+
+        let keys = share.to_threshold_keys()?;
+        Self::start_in_session(
+            transaction,
+            keys,
+            &expected_epoch.committee,
+            local_party,
+            signers,
+            expected_epoch.group_key_bytes(),
+            session,
+            rng,
+        )
+    }
+
     /// Start a signing attempt whose wire messages are bound to a unique session.
     ///
     /// A session must be durably tombstoned before this method's preprocess is published; retrying

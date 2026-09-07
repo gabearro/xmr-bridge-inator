@@ -127,7 +127,7 @@ impl ExtraField {
     match self {
       ExtraField::Padding(size) => {
         w.write_all(&[0])?;
-        for _ in 1 .. u8::from(*size) {
+        for _ in 1..u8::from(*size) {
           write_byte(&0u8, w)?;
         }
       }
@@ -219,7 +219,7 @@ impl ExtraField {
 
         match field_len.checked_sub(depth.varint_len() + merkle_root.len()) {
           Some(remaining) => {
-            for _ in 0 .. remaining {
+            for _ in 0..remaining {
               read_byte(r)?;
             }
           }
@@ -271,10 +271,10 @@ impl Extra {
           additional = additional
             .or(Some(keys.into_iter().map(|key| key.decompress().unwrap_or(identity)).collect()));
         }
-        ExtraField::Padding(_) |
-        ExtraField::Nonce(_) |
-        ExtraField::MergeMining(_, _) |
-        ExtraField::MysteriousMinergate(_) => (),
+        ExtraField::Padding(_)
+        | ExtraField::Nonce(_)
+        | ExtraField::MergeMining(_, _)
+        | ExtraField::MysteriousMinergate(_) => (),
       }
     }
     // Don't return any keys if this was non-standard and didn't include the primary key
@@ -335,14 +335,14 @@ impl Extra {
     // Only parse arbitrary data from the amount of extra data accepted under the relay rule
     let serialized = self.serialize();
     let bounded_extra =
-      Self::read(&mut &serialized[.. serialized.len().min(MAX_EXTRA_SIZE_BY_RELAY_RULE)])
+      Self::read(&mut &serialized[..serialized.len().min(MAX_EXTRA_SIZE_BY_RELAY_RULE)])
         .expect("`Extra::read` only fails if the IO fails and `&[u8]` won't");
 
     let mut res = vec![];
     for field in &bounded_extra.0 {
       if let ExtraField::Nonce(data) = field {
         if data.first() == Some(&ARBITRARY_DATA_MARKER) {
-          res.push(data[1 ..].to_vec());
+          res.push(data[1..].to_vec());
         }
       }
     }

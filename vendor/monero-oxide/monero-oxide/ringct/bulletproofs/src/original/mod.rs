@@ -123,8 +123,8 @@ impl AggregateRangeStatement<'_> {
     rng: &mut (impl RngCore + CryptoRng),
     witness: AggregateRangeWitness,
   ) -> Option<AggregateRangeProof> {
-    if self.commitments !=
-      witness.commitments.iter().map(|commitment| commitment.commit().into()).collect::<Vec<_>>()
+    if self.commitments
+      != witness.commitments.iter().map(|commitment| commitment.commit().into()).collect::<Vec<_>>()
     {
       None?;
     }
@@ -142,7 +142,7 @@ impl AggregateRangeStatement<'_> {
     let mut aL = ScalarVector::new(padded_pow_of_2 * COMMITMENT_BITS);
     for (i, commitment) in witness.commitments.iter().enumerate() {
       let mut amount = commitment.amount;
-      for j in 0 .. COMMITMENT_BITS {
+      for j in 0..COMMITMENT_BITS {
         aL[(i * COMMITMENT_BITS) + j] = Scalar::from(amount & 1);
         amount >>= 1;
       }
@@ -171,7 +171,7 @@ impl AggregateRangeStatement<'_> {
 
     let mut sL = ScalarVector::new(padded_pow_of_2 * COMMITMENT_BITS);
     let mut sR = ScalarVector::new(padded_pow_of_2 * COMMITMENT_BITS);
-    for i in 0 .. (padded_pow_of_2 * COMMITMENT_BITS) {
+    for i in 0..(padded_pow_of_2 * COMMITMENT_BITS) {
       sL[i] = monero_ed25519::Scalar::random(&mut *rng).into();
       sR[i] = monero_ed25519::Scalar::random(&mut *rng).into();
     }
@@ -205,8 +205,8 @@ impl AggregateRangeStatement<'_> {
     let y_pow_n = ScalarVector::powers(y, aR.len());
     let mut r = [((aR + z[1]) * &y_pow_n), sR * &y_pow_n];
     {
-      for j in 0 .. padded_pow_of_2 {
-        for i in 0 .. COMMITMENT_BITS {
+      for j in 0..padded_pow_of_2 {
+        for i in 0..COMMITMENT_BITS {
           r[0].0[(j * COMMITMENT_BITS) + i] += z[2 + j] * twos[i];
         }
       }
@@ -345,7 +345,7 @@ impl AggregateRangeStatement<'_> {
         verifier.0.other.push((weight * z[2 + i], *commitment));
       }
 
-      for i in 0 .. padded_pow_of_2 {
+      for i in 0..padded_pow_of_2 {
         verifier.0.h -= weight * z[3 + i] * twos.clone().sum();
       }
       verifier.0.other.push((weight * x, T1));
@@ -361,16 +361,16 @@ impl AggregateRangeStatement<'_> {
     // It'd trade `2 * ip_rows` scalar additions (per proof) for one scalar addition and an
     // additional term in the MSM
     let ip_z = ip_weight * z[1];
-    for i in 0 .. ip_rows {
+    for i in 0..ip_rows {
       verifier.0.h_bold[i] += ip_z;
     }
     let neg_ip_z = -ip_z;
-    for i in 0 .. ip_rows {
+    for i in 0..ip_rows {
       verifier.0.g_bold[i] += neg_ip_z;
     }
     {
-      for j in 0 .. padded_pow_of_2 {
-        for i in 0 .. COMMITMENT_BITS {
+      for j in 0..padded_pow_of_2 {
+        for i in 0..COMMITMENT_BITS {
           let full_i = (j * COMMITMENT_BITS) + i;
           verifier.0.h_bold[full_i] += ip_weight * y_inv_pow_n[full_i] * z[2 + j] * twos[i];
         }

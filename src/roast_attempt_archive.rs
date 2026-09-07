@@ -358,7 +358,6 @@ impl RoastAttemptArchiveRecord {
                 || key_images.inputs().len() != input_count
                 || consolidation_input_set_binding(key_images.inputs())
                     != self.intent.authorization().input_set()
-                || key_images.family_digest() != self.family
                 || key_images.signing_context().into_bytes()
                     != self.intent.attempt().signing_context()
             {
@@ -1743,7 +1742,6 @@ impl RoastTransactionArchiveMapping {
                     .map_err(|_| RoastAttemptArchiveError::InvalidTransactionMapping)?
             || consolidation_input_set_binding(key_images.inputs())
                 != record.intent.authorization().input_set()
-            || key_images.family_digest() != record.family
             || key_images.signing_context().into_bytes()
                 != record.intent.attempt().signing_context()
         {
@@ -5907,15 +5905,24 @@ mod tests {
         fn key_image_certificate(
             &self,
             record: &RoastAttemptArchiveRecord,
-            family_override: Option<[u8; 32]>,
         ) -> PortableKeyImageBindingCertificate {
             let signing_context: SigningContext =
                 postcard::from_bytes(&record.intent().attempt().signing_context()).unwrap();
+            // A worker sweep family and its public ROAST family use different domains. Derive a
+            // stable, nonzero worker-domain fixture so archive tests exercise that distinction.
+            let worker_family_digest = {
+                let mut hasher =
+                    blake3::Hasher::new_derive_key("threshold-monero/deposit-sweep-family/v1");
+                hasher.update(b"roast-attempt-archive-fixture");
+                hasher.update(&record.family());
+                *hasher.finalize().as_bytes()
+            };
+            assert_ne!(worker_family_digest, record.family());
             let encoded = postcard::to_allocvec(&PortableKeyImageValueFixture {
                 sweep: self.authorization.sweep_id(),
                 inputs: self.inputs.clone(),
                 key_images: vec![CompressedPoint::G.to_bytes()],
-                family_digest: family_override.unwrap_or(record.family()),
+                family_digest: worker_family_digest,
                 unsigned_transaction_digest: [0x91; 32],
                 signing_context,
                 preprocess_set_digest: [0x92; 32],
@@ -6106,7 +6113,7 @@ mod tests {
 
         let signed_transaction = signed_transaction(8);
         let transaction = signed_transaction.transaction_id();
-        let key_images = fixture.key_image_certificate(&records[1], None);
+        let key_images = fixture.key_image_certificate(&records[1]);
         let endorsements = fixture.endorsements(&records[1], &signed_transaction);
         let mapped = restarted
             .stage_transaction_mapping(
@@ -6358,8 +6365,12 @@ mod tests {
             .unwrap();
         store.commit_prepared_stage(&protocols, &prepared, attempts.head).await.unwrap();
         let transaction = signed_transaction(16);
-        let certificate = fixture.key_image_certificate(&record, None);
+        let certificate = fixture.key_image_certificate(&record);
         let endorsements = fixture.endorsements(&record, &transaction);
+        let certified_key_images = certificate
+            .verify(&fixture.committee, 1, record.network_id(), record.wire_binding())
+            .unwrap();
+        assert_ne!(certified_key_images.family_digest(), family);
 
         assert!(matches!(
             store
@@ -6387,22 +6398,6 @@ mod tests {
                     fixture.plan.clone(),
                     certificate.clone(),
                     reversed,
-                    &mut OsRng,
-                )
-                .await,
-            Err(RoastAttemptArchiveError::InvalidTransactionMapping)
-        ));
-
-        let wrong_family_certificate = fixture.key_image_certificate(&record, Some([0xD4; 32]));
-        assert!(matches!(
-            store
-                .stage_transaction_mapping(
-                    attempts.head,
-                    family,
-                    0,
-                    fixture.plan.clone(),
-                    wrong_family_certificate,
-                    endorsements.clone(),
                     &mut OsRng,
                 )
                 .await,
@@ -6937,7 +6932,7 @@ mod tests {
                 family,
                 0,
                 fixture.plan.clone(),
-                fixture.key_image_certificate(&record, None),
+                fixture.key_image_certificate(&record),
                 fixture.endorsements(&record, &transaction),
                 &mut OsRng,
             )
@@ -7019,7 +7014,7 @@ mod tests {
                 family,
                 0,
                 fixture.plan.clone(),
-                fixture.key_image_certificate(&record, None),
+                fixture.key_image_certificate(&record),
                 fixture.endorsements(&record, &transaction),
                 &mut OsRng,
             )
@@ -7060,7 +7055,7 @@ mod tests {
     fn record_encoding_is_canonical_current_format_and_requires_full_provenance() {
         let fixture = Fixture::new();
         let mut record = fixture.record(0, 0);
-        let certificate = fixture.key_image_certificate(&record, None);
+        let certificate = fixture.key_image_certificate(&record);
         record.key_image_certificate = Some(certificate);
         record.validate().unwrap();
         assert!(record.require_full_key_image_certificate().is_ok());

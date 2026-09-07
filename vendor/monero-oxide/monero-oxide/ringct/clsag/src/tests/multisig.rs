@@ -42,7 +42,7 @@ fn setup(
 
   let randomness = Scalar::random(&mut OsRng).into();
   let mut ring = vec![];
-  for i in 0 .. ring_len {
+  for i in 0..ring_len {
     let dest;
     let mask;
     let amount = if i != ring_index {
@@ -65,7 +65,7 @@ fn setup(
     let (algorithm, mask_send) = ClsagMultisig::new(
       RecommendedTranscript::new(b"monero-oxide CLSAG Test"),
       ClsagContext::new(
-        Decoys::new((1 ..= u64::from(ring_len)).collect(), ring_index, ring.clone()).unwrap(),
+        Decoys::new((1..=u64::from(ring_len)).collect(), ring_index, ring.clone()).unwrap(),
         Commitment::new(Scalar::from(randomness), amount),
       )
       .unwrap(),

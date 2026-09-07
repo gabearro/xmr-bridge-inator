@@ -203,7 +203,7 @@ test!(
     async |rct_type: RctType, rpc, mut builder: Builder, addr, outputs: Vec<WalletOutput>| {
       add_inputs(rct_type, &rpc, outputs, &mut builder).await;
 
-      for i in 0 .. 15 {
+      for i in 0..15 {
         builder.add_payment(addr, i + 1);
       }
       (builder.build().unwrap(), ())
@@ -212,10 +212,10 @@ test!(
       let mut scanned_tx = scanner.scan(block).unwrap().not_additionally_locked();
 
       let mut output_amounts = HashSet::new();
-      for i in 0 .. 15 {
+      for i in 0..15 {
         output_amounts.insert(i + 1);
       }
-      for _ in 0 .. 15 {
+      for _ in 0..15 {
         let output = scanned_tx.swap_remove(0);
         assert_eq!(output.transaction(), tx.hash());
         let amount = output.commitment().amount;
@@ -249,7 +249,7 @@ test!(
       let mut scanner = Scanner::new(view.clone());
 
       let mut subaddresses = vec![];
-      for i in 0 .. 15 {
+      for i in 0..15 {
         let subaddress = SubaddressIndex::new(0, i + 1).unwrap();
         scanner.register_subaddress(subaddress);
 
@@ -265,10 +265,10 @@ test!(
       let mut scanned_tx = state.0.scan(block).unwrap().not_additionally_locked();
 
       let mut output_amounts_by_subaddress = HashMap::new();
-      for i in 0 .. 15 {
+      for i in 0..15 {
         output_amounts_by_subaddress.insert(u64::try_from(i + 1).unwrap(), state.1[i]);
       }
-      for _ in 0 .. 15 {
+      for _ in 0..15 {
         let output = scanned_tx.swap_remove(0);
         assert_eq!(output.transaction(), tx.hash());
         let amount = output.commitment().amount;

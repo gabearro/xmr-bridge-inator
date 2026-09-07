@@ -70,14 +70,14 @@ impl BpPlusGenerators {
       "instantiated with less generators than application required"
     );
 
-    BpPlusGenerators { g_bold: &self.g_bold[.. generators], h_bold: &self.h_bold[.. generators] }
+    BpPlusGenerators { g_bold: &self.g_bold[..generators], h_bold: &self.h_bold[..generators] }
   }
 }
 
 // Returns the little-endian decomposition.
 fn u64_decompose(value: u64) -> ScalarVector {
   let mut bits = ScalarVector::new(64);
-  for bit in 0 .. 64 {
+  for bit in 0..64 {
     bits[bit] = Scalar::from((value >> bit) & 1);
   }
   bits

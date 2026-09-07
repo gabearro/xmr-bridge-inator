@@ -42,7 +42,7 @@ fn test_inner_product() {
     let g = monero_ed25519::CompressedPoint::H.decompress().unwrap().into();
     let mut g_bold = vec![];
     let mut h_bold = vec![];
-    for i in 0 .. i {
+    for i in 0..i {
       g_bold.push(generators.G[i]);
       h_bold.push(generators.H[i]);
     }
@@ -52,7 +52,7 @@ fn test_inner_product() {
     let mut a = ScalarVector::new(i);
     let mut b = ScalarVector::new(i);
 
-    for i in 0 .. i {
+    for i in 0..i {
       a[i] = Scalar::random(&mut OsRng).into();
       b[i] = Scalar::random(&mut OsRng).into();
     }

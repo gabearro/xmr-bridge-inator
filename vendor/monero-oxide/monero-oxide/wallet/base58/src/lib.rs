@@ -39,7 +39,7 @@ pub fn encode(bytes: &[u8]) -> String {
   for chunk in bytes.chunks(BLOCK_LEN) {
     // Convert to a u64
     let mut fixed_len_chunk = [0; BLOCK_LEN];
-    fixed_len_chunk[(BLOCK_LEN - chunk.len()) ..].copy_from_slice(chunk);
+    fixed_len_chunk[(BLOCK_LEN - chunk.len())..].copy_from_slice(chunk);
     let mut val = u64::from_be_bytes(fixed_len_chunk);
 
     // Convert to the base58 encoding
@@ -79,7 +79,7 @@ pub fn decode(data: &str) -> Option<Vec<u8>> {
 
     // From the size of the encoding, determine the size of the bytes
     let mut used_bytes = None;
-    for i in 1 ..= BLOCK_LEN {
+    for i in 1..=BLOCK_LEN {
       if encoded_len_for_bytes(i) == chunk.len() {
         used_bytes = Some(i);
         break;
@@ -92,12 +92,12 @@ pub fn decode(data: &str) -> Option<Vec<u8>> {
       let bytes = sum.to_be_bytes();
       let unused_bytes = BLOCK_LEN - used_bytes;
       // Check if any unused bytes were non-zero, as possible with a non-canonical encoding
-      for b in &bytes[.. unused_bytes] {
+      for b in &bytes[..unused_bytes] {
         if *b != 0 {
           None?;
         }
       }
-      res.extend(&bytes[unused_bytes ..]);
+      res.extend(&bytes[unused_bytes..]);
     }
   }
 
@@ -107,7 +107,7 @@ pub fn decode(data: &str) -> Option<Vec<u8>> {
 /// Encode an arbitrary-length stream of data, with a checksum.
 pub fn encode_check(mut data: Vec<u8>) -> String {
   let checksum = keccak256(&data);
-  data.extend(&checksum[.. CHECKSUM_LEN]);
+  data.extend(&checksum[..CHECKSUM_LEN]);
   encode(&data)
 }
 
@@ -118,7 +118,7 @@ pub fn decode_check(data: &str) -> Option<Vec<u8>> {
     None?;
   }
   let checksum_pos = res.len() - CHECKSUM_LEN;
-  if keccak256(&res[.. checksum_pos])[.. CHECKSUM_LEN] != res[checksum_pos ..] {
+  if keccak256(&res[..checksum_pos])[..CHECKSUM_LEN] != res[checksum_pos..] {
     None?;
   }
   res.truncate(checksum_pos);

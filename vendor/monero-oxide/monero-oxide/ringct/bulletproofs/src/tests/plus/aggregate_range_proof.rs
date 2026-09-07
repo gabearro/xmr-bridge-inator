@@ -9,9 +9,9 @@ use crate::{
 #[test]
 fn test_aggregate_range_proof() {
   let mut verifier = BulletproofsPlusBatchVerifier::default();
-  for m in 1 ..= 16 {
+  for m in 1..=16 {
     let mut commitments = vec![];
-    for _ in 0 .. m {
+    for _ in 0..m {
       commitments.push(Commitment::new(Scalar::random(&mut OsRng), OsRng.next_u64()));
     }
     let commitment_points =

@@ -10,8 +10,8 @@ const COMMITTEE_DIGEST_VERSION: u16 = 2;
 /// This is not a protocol-theory limit. A durable AVSS run retains one receiver machine per
 /// dealer plus bounded encrypted fan-out/retry material, whose worst-case growth is quartic when
 /// the dealer count and threshold both track `n`. Ten keeps that complete run comfortably below
-/// the 8 MiB protocol-session snapshot ceiling while preserving the deployment's 3/5, 4/7, and
-/// 2/3 quorum profiles.
+/// the 8 MiB protocol-session snapshot ceiling while preserving the deployment's 3/5 and 4/7
+/// quorum profiles.
 pub const MAX_COMMITTEE_MEMBERS: usize = 10;
 
 /// Matching resource cap for a threshold (`degree + 1`).

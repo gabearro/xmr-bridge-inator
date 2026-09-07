@@ -341,8 +341,8 @@ impl<T: HttpTransport> ProvidesUnvalidatedDecoys for MoneroDaemon<T> {
                 //   /cc73fe71162d564ffda8e549b79a350bca53c454/src/cryptonote_core
                 //   /blockchain.cpp#L3836
                 let transaction_timelock_satisfied =
-                  Timelock::Block(block_number.saturating_add(ACCEPTED_TIMELOCK_DELTA)) >=
-                    txs[i].prefix().additional_timelock;
+                  Timelock::Block(block_number.saturating_add(ACCEPTED_TIMELOCK_DELTA))
+                    >= txs[i].prefix().additional_timelock;
 
                 global_timelock_satisfied && transaction_timelock_satisfied
               }

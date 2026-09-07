@@ -6,9 +6,9 @@ private keys are committed under `docker/demo-secrets` solely so the demo can be
 
 They provide realistic mutual-TLS wiring tests, not secrecy, identity assurance, revocation,
 rotation, forward secrecy for stored traffic, or protection from a compromised host. Never use
-these certificates or keys outside the private local demo. A real deployment needs independently
-generated keys, authenticated enrollment, protected private-key storage, expiry/rotation, and a
-revocation or membership-removal procedure.
+these certificates or keys outside the private local demo. Production key generation, authenticated
+enrollment, protected/HSM storage, expiry/rotation, and revocation are external deployment-owner
+responsibilities and are not implemented or tested by this repository.
 
 Regenerate or verify the fixtures from the repository root:
 

@@ -23,8 +23,9 @@ use crate::{
     },
     deposit_index::{
         DepositIndexError, DepositIndexHead, DepositIndexNamespace, DepositIndexObjectId,
-        DepositIndexReader, DepositIndexUpdate, SignedIndexCheckpointSlot,
-        VerifiedDepositIndexPreflight, VerifiedDepositObservationIndexTransition,
+        DepositIndexReader, DepositIndexUpdate, MAX_DEPOSIT_INDEX_PROOF_OBJECTS,
+        SignedIndexCheckpointSlot, VerifiedDepositIndexPreflight,
+        VerifiedDepositObservationIndexTransition,
     },
     deposit_index_store::VerifiedSignedIndexCheckpointSlot,
     deposit_ledger::{
@@ -32,7 +33,7 @@ use crate::{
         LedgerPayload, LedgerStatement, genesis_head as ledger_genesis_head,
     },
     deposit_wallet::{DepositSubaddressIndex, DepositWalletId},
-    identity::{Identity, IdentityError, SignedEnvelope},
+    identity::{EnvelopeSigner, EnvelopeSignerScope, Identity, IdentityError, SignedEnvelope},
 };
 
 const LOGICAL_HEAD_VERSION: u16 = 1;
@@ -259,6 +260,22 @@ impl PortableDepositIndexHead {
     #[must_use]
     pub const fn record_count(&self) -> u64 {
         self.records
+    }
+
+    /// Conservative upper bound for immutable objects reachable from this portable root.
+    ///
+    /// Every logical entry can contribute at most one full maximum-depth HAMT path, and every
+    /// distinct record contributes at most one value object. Shared paths only reduce the actual
+    /// count, so this deliberately overestimates without depending on local layout or revisions.
+    pub fn maximum_reachable_objects(&self) -> Result<u64, DepositIndexCheckpointError> {
+        self.validate()?;
+        self.entries
+            .checked_mul(
+                u64::try_from(MAX_DEPOSIT_INDEX_PROOF_OBJECTS)
+                    .map_err(|_| DepositIndexCheckpointError::InvalidLogicalHead)?,
+            )
+            .and_then(|paths| paths.checked_add(self.records))
+            .ok_or(DepositIndexCheckpointError::InvalidLogicalHead)
     }
 
     #[must_use]
@@ -1083,6 +1100,18 @@ impl DepositIndexCheckpointStatement {
         self.validate_exact_for_issuer(issuer_window.issuer(), previous, ledger)
     }
 
+    fn validate_anchored_active(
+        &self,
+        network: [u8; 32],
+        registry: &CompactEpochRegistry,
+        historical_issuer: Option<&VerifiedIssuerWindow>,
+        ledger: &LedgerCertificate,
+        authenticated_current_head: &PortableDepositIndexHead,
+    ) -> Result<(), DepositIndexCheckpointError> {
+        self.context.validate_exact_active(network, registry, historical_issuer, ledger)?;
+        self.validate_anchored_for_issuer(registry.active(), ledger, authenticated_current_head)
+    }
+
     fn validate_anchored_archived(
         &self,
         network: [u8; 32],
@@ -1274,7 +1303,7 @@ impl DepositIndexCheckpointStatement {
     fn sign_expected<R: DepositIndexReader + ?Sized>(
         &self,
         now: u64,
-        identity: &Identity,
+        identity: &dyn EnvelopeSigner,
         authorization: &VerifiedSignedIndexCheckpointSlot,
         network: [u8; 32],
         registry: &CompactEpochRegistry,
@@ -1285,6 +1314,16 @@ impl DepositIndexCheckpointStatement {
         update: &DepositIndexUpdate,
         reader: &R,
     ) -> Result<SignedEnvelope, DepositIndexCheckpointError> {
+        match identity.scope() {
+            EnvelopeSignerScope::Full => {}
+            EnvelopeSignerScope::RecoveryAndFenceOnly
+                if !matches!(&ledger.statement.payload, LedgerPayload::Handoff(_)) => {}
+            EnvelopeSignerScope::HandoffOnly
+                if matches!(&ledger.statement.payload, LedgerPayload::Handoff(_)) => {}
+            EnvelopeSignerScope::RecoveryAndFenceOnly | EnvelopeSignerScope::HandoffOnly => {
+                return Err(DepositIndexCheckpointError::WrongSignerScope);
+            }
+        }
         Self::validate_signing_time(now)?;
         self.verify_transition(
             network,
@@ -1320,7 +1359,7 @@ impl DepositIndexCheckpointStatement {
     fn sign_expected_deposit_observation(
         &self,
         now: u64,
-        identity: &Identity,
+        identity: &dyn EnvelopeSigner,
         authorization: &VerifiedSignedIndexCheckpointSlot,
         network: [u8; 32],
         registry: &CompactEpochRegistry,
@@ -1503,7 +1542,7 @@ pub fn semantic_update_digest(
 /// against the authenticated slot's original reservation time.
 pub fn sign_checkpoint_transition<R: DepositIndexReader + ?Sized>(
     now: u64,
-    identity: &Identity,
+    identity: &dyn EnvelopeSigner,
     authorization: &VerifiedSignedIndexCheckpointSlot,
     network: [u8; 32],
     registry: &CompactEpochRegistry,
@@ -1544,7 +1583,7 @@ pub fn sign_checkpoint_transition<R: DepositIndexReader + ?Sized>(
 #[allow(clippy::too_many_arguments)]
 pub fn sign_deposit_observation_checkpoint_transition(
     now: u64,
-    identity: &Identity,
+    identity: &dyn EnvelopeSigner,
     authorization: &VerifiedSignedIndexCheckpointSlot,
     network: [u8; 32],
     registry: &CompactEpochRegistry,
@@ -1552,6 +1591,12 @@ pub fn sign_deposit_observation_checkpoint_transition(
     observation: &CertifiedDepositObservation,
     transition: &VerifiedDepositObservationIndexTransition,
 ) -> Result<(DepositIndexCheckpointStatement, SignedEnvelope), DepositIndexCheckpointError> {
+    match identity.scope() {
+        EnvelopeSignerScope::Full | EnvelopeSignerScope::RecoveryAndFenceOnly => {}
+        EnvelopeSignerScope::HandoffOnly => {
+            return Err(DepositIndexCheckpointError::WrongSignerScope);
+        }
+    }
     let statement = DepositIndexCheckpointStatement::reconstruct_deposit_observation_transition(
         network,
         registry,
@@ -1818,6 +1863,37 @@ impl DepositIndexCheckpointCertificate {
         self.verify_for_issuer(issuer_window.issuer())
     }
 
+    /// Verify the latest live decision against the compact active issuer and exact current
+    /// portable head, without replaying the preceding checkpoint-certificate prefix.
+    ///
+    /// `authenticated_current_head` must come from the caller's independently authenticated
+    /// archive/index snapshot. This method verifies its exact equality to the n-f signed result.
+    pub fn verify_active_anchored(
+        &self,
+        network: [u8; 32],
+        registry: &CompactEpochRegistry,
+        historical_issuer: Option<&VerifiedIssuerWindow>,
+        ledger: &LedgerCertificate,
+        authenticated_current_head: &PortableDepositIndexHead,
+    ) -> Result<VerifiedDepositIndexCheckpoint, DepositIndexCheckpointError> {
+        if self.version != CERTIFICATE_VERSION {
+            return Err(DepositIndexCheckpointError::UnsupportedVersion);
+        }
+        if self.verify_active_selection(network, registry, historical_issuer)?
+            != DepositIndexCheckpointCandidate::Ledger(ledger.clone())
+        {
+            return Err(DepositIndexCheckpointError::InvalidSelection);
+        }
+        self.statement.validate_anchored_active(
+            network,
+            registry,
+            historical_issuer,
+            ledger,
+            authenticated_current_head,
+        )?;
+        self.verify_for_issuer(registry.active())
+    }
+
     /// Verify the latest retained decision against an authenticated issuer window and exact
     /// current portable head, without replaying the preceding checkpoint-certificate prefix.
     ///
@@ -1932,6 +2008,17 @@ impl DepositIndexCheckpointCertificate {
     pub fn certificate_digest(&self) -> Result<[u8; 32], DepositIndexCheckpointError> {
         let bytes = self.to_bytes()?;
         Ok(length_prefixed_hash(CERTIFICATE_DIGEST_DOMAIN, &bytes))
+    }
+
+    /// Whether two exact certificate artifacts prove the same witness-independent checkpoint
+    /// decision.
+    ///
+    /// Honest collectors may freeze different canonical `n-f` witness subsets. The checkpoint
+    /// statement and the BA certificate's semantic digest bind the selected operation and result,
+    /// while deliberately excluding those collector-local witness representations.
+    #[must_use]
+    pub fn has_same_witness_independent_decision(&self, other: &Self) -> bool {
+        self.statement == other.statement && self.selection.digest() == other.selection.digest()
     }
 
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, DepositIndexCheckpointError> {
@@ -2075,6 +2162,29 @@ impl VerifiedDepositIndexCheckpoint {
     }
 }
 
+#[cfg(test)]
+pub(crate) fn verified_checkpoint_for_scanner_snapshot_test(
+    network: [u8; 32],
+    registry: &CompactEpochRegistry,
+    ledger: &LedgerCertificate,
+    resulting_head: &DepositIndexHead,
+) -> VerifiedDepositIndexCheckpoint {
+    let context =
+        DepositIndexCheckpointContext::expected_active(network, registry, None, ledger).unwrap();
+    VerifiedDepositIndexCheckpoint {
+        context,
+        sequence: 1,
+        decision: [0xd1; 32],
+        certificate: [0xd2; 32],
+        operation: DepositIndexCheckpointOperation::Ledger { statement: ledger.statement.digest() },
+        ledger_sequence: ledger.statement.sequence,
+        ledger_decision: ledger.statement.digest(),
+        update_digest: [0xd3; 32],
+        resulting_head: PortableDepositIndexHead::from_head(resulting_head).unwrap(),
+        signers: vec![PartyId(1)],
+    }
+}
+
 fn deserialize_witnesses<'de, D>(deserializer: D) -> Result<Vec<SignedEnvelope>, D::Error>
 where
     D: Deserializer<'de>,
@@ -2121,6 +2231,8 @@ pub enum DepositIndexCheckpointError {
     Committee(#[from] CommitteeError),
     #[error("identity error: {0}")]
     Identity(#[from] IdentityError),
+    #[error("historical signing capability may only certify handoff ledger checkpoints")]
+    WrongSignerScope,
     #[error("checkpoint-operation consensus error: {0}")]
     Consensus(#[from] ConsensusError),
     #[error("ledger error: {0}")]
@@ -2151,7 +2263,7 @@ pub enum DepositIndexCheckpointError {
     WrongExpectedStatement,
     #[error("checkpoint signing time is invalid")]
     InvalidSigningTime,
-    #[error("allocation checkpoint signing did not complete before client-visible creation time")]
+    #[error("allocation checkpoint was not durably reserved before client-visible creation time")]
     AllocationCheckpointDeadlineElapsed,
     #[error("checkpoint signing slot has not been committed and authenticated for this party")]
     UncommittedSigningSlot,
@@ -2237,7 +2349,7 @@ mod tests {
         config::NetworkKind,
         deposit_index::{DepositIndexBuilder, DepositIndexReader},
         deposit_index_store::{
-            DepositIndexStore, DepositIndexStoreCheckpoint, VerifiedPortableIndexImport,
+            DepositIndexStore, DepositIndexStoreCheckpoint, VerifiedPortableIndexAdvance,
         },
         deposit_ledger::{
             DepositObservationStatement, LedgerRequestId, LedgerStatement, RequestBinding,
@@ -2246,6 +2358,7 @@ mod tests {
         deposit_wallet::{
             ChainPoint, DepositAddressDeriver, DepositSubaddressIndex, WalletOutputId,
         },
+        identity::StableSigningIdentity,
         key_rotation::VerifiedRegistryHandoffTarget,
     };
 
@@ -2730,6 +2843,92 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn handoff_only_checkpoint_signer_rejects_handoff_fence() {
+        let fixture = make_fixture(0x26);
+        let statement = DepositIndexCheckpointStatement::for_transition(
+            SIGNING_NOW,
+            fixture.network,
+            &fixture.registry,
+            None,
+            None,
+            &fixture.ledger,
+            &fixture.preflight,
+            &fixture.update,
+            &fixture.reader,
+        )
+        .unwrap();
+        let party = PartyId(1);
+        let stable = StableSigningIdentity::for_committee(
+            party,
+            &[1; 32],
+            fixture.registry.active().committee(),
+        )
+        .unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let checkpoint = DepositIndexStoreCheckpoint::empty(
+            statement.context().wallet_id(),
+            party,
+            statement.previous_head().next_index(),
+        )
+        .unwrap();
+        let mut store = DepositIndexStore::open(directory.path(), party, &[0xa7; 32], checkpoint)
+            .await
+            .unwrap();
+        let slot = statement.signing_slot(SIGNING_NOW).unwrap();
+        let mut builder =
+            DepositIndexBuilder::new(&store, store.local_safety_head().clone()).unwrap();
+        assert!(builder.record_signed_index_checkpoint_slot(slot).unwrap());
+        let prepared =
+            store.prepare_snapshot(vec![builder.finish().unwrap().unwrap()]).await.unwrap();
+        let authenticated = prepared.checkpoint().clone();
+        store.commit_prepared(&prepared, &authenticated).await.unwrap();
+        let authorization = store
+            .authenticate_signed_index_checkpoint_slot(slot.checkpoint_sequence())
+            .await
+            .unwrap();
+
+        let active = fixture.registry.active();
+        let mut target_committee = active.committee().clone();
+        target_committee.epoch = active.epoch() + 1;
+        let target = VerifiedRegistryHandoffTarget::for_test(
+            target_committee,
+            active.fault_bound(),
+            [0xa8; 32],
+            [0xa9; 32],
+            fixture.registry.wallet(),
+            active.key_id(),
+            active.group_key(),
+        )
+        .unwrap();
+        let fence = LedgerStatement::handoff_fence(
+            &fixture.registry,
+            fixture.ledger.statement.sequence,
+            fixture.ledger.statement.previous,
+            &target,
+            ChainPoint::new(0, [0xaa; 32]).unwrap(),
+        )
+        .unwrap();
+        let fence_ledger = ledger_certificate(fence, active.committee(), &fixture.identities);
+
+        assert!(matches!(
+            statement.sign_expected(
+                SIGNING_NOW,
+                &stable,
+                &authorization,
+                fixture.network,
+                &fixture.registry,
+                None,
+                None,
+                &fence_ledger,
+                &fixture.preflight,
+                &fixture.update,
+                &fixture.reader,
+            ),
+            Err(DepositIndexCheckpointError::WrongSignerScope)
+        ));
+    }
+
+    #[tokio::test]
     async fn post_deadline_persisted_reservation_cannot_authorize_signing() {
         let fixture = make_fixture(0x25);
         let statement = DepositIndexCheckpointStatement::for_transition(
@@ -2932,14 +3131,24 @@ mod tests {
             Err(DepositIndexCheckpointError::WrongObservationDecision)
         ));
 
-        let import = VerifiedPortableIndexImport::from_certified_checkpoint(&verified).unwrap();
         let fresh = DepositIndexStoreCheckpoint::empty(
             verified.context().wallet_id(),
             PartyId(4),
             fixture.update.expected_head().portable_anchor().unwrap().next_index(),
         )
         .unwrap();
-        let imported = fresh.import_verified_portable(&import).unwrap();
+        let ledger_advance =
+            VerifiedPortableIndexAdvance::from_certified_checkpoint(&previous).unwrap();
+        let ledger_checkpoint = fresh.adopt_verified_portable(&ledger_advance).unwrap();
+        let observation_advance =
+            VerifiedPortableIndexAdvance::from_certified_checkpoint(&verified).unwrap();
+        let imported = ledger_checkpoint.adopt_verified_portable(&observation_advance).unwrap();
+        assert_eq!(
+            PortableDepositIndexHead::from_head(ledger_checkpoint.portable_head())
+                .unwrap()
+                .through_sequence(),
+            verified.resulting_head().through_sequence()
+        );
         assert!(verified.resulting_head().matches(imported.portable_head()).unwrap());
     }
 
@@ -3481,6 +3690,7 @@ mod tests {
             .unwrap();
         assert_eq!(alternate_verified.decision_digest(), verified.decision_digest());
         assert_ne!(alternate_verified.certificate_digest(), verified.certificate_digest());
+        assert!(certificate.has_same_witness_independent_decision(&alternate));
         let cursor =
             verified.compact_cursor(&fixture.registry, Some(&fixture.ledger.statement)).unwrap();
         assert_eq!(cursor.head(), fixture.ledger.statement.digest());
@@ -3523,6 +3733,46 @@ mod tests {
                 &stale,
             ),
             Err(DepositIndexCheckpointError::WrongAuthenticatedHead)
+        ));
+    }
+
+    #[test]
+    fn latest_active_checkpoint_verifies_against_authenticated_head_and_context() {
+        let fixture = make_fixture(0x12);
+        let certificate = checkpoint(&fixture);
+        let resulting = PortableDepositIndexHead::from_head(fixture.update.next_head()).unwrap();
+        let verified = certificate
+            .verify_active_anchored(
+                fixture.network,
+                &fixture.registry,
+                None,
+                &fixture.ledger,
+                &resulting,
+            )
+            .unwrap();
+        assert_eq!(verified.resulting_head(), &resulting);
+
+        let stale = PortableDepositIndexHead::from_head(fixture.update.expected_head()).unwrap();
+        assert!(matches!(
+            certificate.verify_active_anchored(
+                fixture.network,
+                &fixture.registry,
+                None,
+                &fixture.ledger,
+                &stale,
+            ),
+            Err(DepositIndexCheckpointError::WrongAuthenticatedHead)
+        ));
+
+        assert!(matches!(
+            certificate.verify_active_anchored(
+                [0x56; 32],
+                &fixture.registry,
+                None,
+                &fixture.ledger,
+                &resulting,
+            ),
+            Err(DepositIndexCheckpointError::Consensus(ConsensusError::InvalidCertificate(_)))
         ));
     }
 

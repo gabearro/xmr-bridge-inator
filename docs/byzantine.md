@@ -11,17 +11,27 @@ implementation requires:
 
 ```text
 n >= 3f + 1
-f < k <= n - 2f
+2f < k <= n - 2f
 consensus quorum = n - f
 ```
+
+The strict `k > 2f` signing bound is checked when the scenario loads. It leaves enough honest
+evidence to prove a selected attempt share-unexposed and move to another ROAST subset despite up to
+`f` Byzantine witnesses and `f` selected omissions. A `k <= 2f` committee can retain threshold
+cryptographic safety yet lose the liveness needed for certified safe abandonment, so configuration
+rejects it rather than discovering that deadlock after nonce work begins.
 
 The adversary may control up to `f` committee identities, equivocate, omit, delay, replay, reorder,
 or corrupt messages, stop at an adversarial phase, and restart from locally durable state. QUIC
 provides authenticated channels, not honest behavior. Portable Ed25519 signatures make relayed
 votes and contributions attributable.
 
-Partial synchrony is required for liveness. Safety should hold during arbitrary delay; timeout only
-changes which deterministic view is attempted.
+The bounded partial-synchrony assumption requires a complete post-stabilization honest-leader
+view—including proposal admission, every required delivery, durable prevote/precommit processing,
+and reducer/storage work—to finish before the deadline capped at
+`64 * protocol_timeout_seconds`. Safety should hold during arbitrary delay; timeouts only change
+which deterministic view is attempted. The implementation does not claim liveness when that
+pipeline exceeds the configured ceiling.
 
 ## Safety invariants
 
@@ -30,8 +40,8 @@ The state machine is organized around these invariants:
 1. One transition and one certified public epoch bind every active secret share.
 2. Honest parties activate only an `n-f`-acknowledged result of one common-QUAL decision.
 3. A successor preserves the Monero public spend key but uses a different share polynomial.
-4. Epoch-tagged shares and commitments from different polynomials never form a valid signing or
-   interpolation set.
+4. Protocol verification accepts shares and commitments only for one exact epoch polynomial; no
+   protocol path treats mixed-epoch points as a valid signing or interpolation set.
 5. No FROSTLASS nonce is released before an exact consolidation intent is certified.
 6. A signature share cannot leave before its exact payload binding is durably marked exposed.
 7. A possibly exposed attempt cannot be declared unused without a safe, certified abandonment
@@ -49,10 +59,10 @@ The state machine is organized around these invariants:
 | Common QUAL | Rotating-view, partially synchronous Byzantine reducer with signed proposals/votes, locks, view-change proof, durable timers, decisions, and outboxes | This is a purpose-built reducer, not a general asynchronous common subset implementation. |
 | DKG and reshare | Common dealer selection; distributed aggregation; immediate-successor epoch binding; unchanged group key on reshare | Proactive secrecy requires fewer than `k` exposed shares in every epoch and real erasure. |
 | Activation | `n-f` matching acknowledgements and exact transition indexes; staged-before-active cutover | Competing external deployment roots require governance outside the process. |
-| Receiver-key rotation | Target members durably persist and sign fresh X25519 advertisements; target `n-f` advertisements are selected by a source `n-f` BFT certificate | At most target `f` exact omission baselines can be used temporarily; full mobile-adversary hygiene prefers rotation by all members. |
-| Refresh timer | Authenticated fixed-interval schedule restored on startup; configured then dynamic same-committee successors | An offline quorum or exhausted resource bound stops progress. |
+| Receiver-key rotation | An eligible roster of at least `desired_n + f_target` stable identities durably persists and signs fresh X25519 advertisements; maximum source overlap is mandatory until an exact source `n-f_source` deadline authorization permits bounded fallback; an exact `desired_n` successor made solely from those advertisements is selected by source BFT | Governance must bound Byzantine identities across the whole eligible roster, not only the selected subset; omitted identities receive no successor share; secure erasure remains operational. |
+| Refresh timer | Authenticated fixed-interval schedule restored on startup; configured then dynamic fixed-size/fixed-threshold successors with eligible-member substitution | An offline quorum or exhausted resource bound stops progress. |
 | Deposits | BFT allocation, scanner-gated output observations, exact `n-f` observation certificates, independent `n-f` portable-index checkpoints, compact registry handoff, monotonic indices, and per-party daemon routes | Shared viewing material remains broad; a signer and its observer share one application-validation fault domain, and honest observers must converge on one finalized chain. |
-| Consolidation | Pre-nonce BFT intent, coordinator-free all-to-all ROAST, portable origin signatures, deterministic bounded view/subset rotation | Intent eligibility still depends on the correctness of local scanner and Monero policy code. |
+| Consolidation | Pre-nonce BFT intent, coordinator-free all-to-all ROAST, portable origin signatures, deterministic bounded view/subset rotation | Intent eligibility still depends on the correctness of local scanner and Monero policy code. ROAST late settlement across committee handoff currently requires at least one retained old-committee member; authenticated transfer to a fully disjoint successor remains [TODO](../TODO.md). |
 | Nonce/share safety | One-use tombstones; readback-gated nonce and share release; monotonic exposure state; certified safe abandonment | Whole-volume rollback can erase all local evidence unless externally anchored. |
 | Terminal selection | Independent FROSTLASS and `Eventuality` validation; local scanner/daemon reproduction before n-f certificates; byte-identical signed candidate attestations; exact broadcast/confirmation binding | Honest observers must converge on one finalized Monero chain; public-network censorship and eclipse resistance remain deployment concerns. |
 | Persistence | Authenticated encrypted records, atomic replacement, durable outboxes, bounded journals, content-addressed archive heads | Valid complete-volume rollback, cloning, backup leakage, and indefinite retention are operational problems. |
@@ -78,13 +88,35 @@ mismatch. If old shares remain recoverable after retirement, however, the mobile
 is false and cumulative compromise may reach `k` shares of one old polynomial.
 
 Membership can grow or shrink only through the immediate successor bound to the trusted active
-epoch. Before any configured or dynamic successor AVSS, responsive target members generate,
-persist, read back, and advertise fresh receiver keys. Joining members advertise to the source
-committee; the source's `n-f` certificate must contain target `n-f` advertisements, with no more
-than target `f` exact policy baselines for omissions. New members do not activate merely because
-they advertised a key or received AVSS outputs; target `n-f` members must acknowledge the same
-activation digest. Old members retain obligations until certified handoff and attempt closure make
-retirement safe.
+epoch. A fixed-size/fixed-threshold successor is a true zero-constant refresh only when the
+certificate selects the same identities; eligible substitution instead invokes the reshare branch.
+Before any configured or dynamic successor AVSS, responsive eligible identities generate,
+persist, read back, and advertise fresh receiver keys. The eligibility roster contains at least
+`desired_n + f` stable identities; identities outside the source committee advertise to that
+committee, whose `n-f` certificate selects exactly `desired_n` advertisements. The successor is
+formed solely from those fresh keys. The target bound is assumed over the whole eligible roster.
+Before the immutable fallback deadline, verifiers require maximum source retention. After it,
+exactly `n_source-f_source` context-bound source votes may relax retention only to the
+fault-derived floor; the local scheduler, never message ingress, creates each party's vote.
+Omitted identities receive no share and no bootstrap or source receiver key is carried forward. A
+previously omitted or departed party may re-enter a later committee under the same stable identity
+only by advertising another fresh key and being selected. New members do not activate merely
+because they advertised a key or received AVSS outputs; target `n-f` members must acknowledge the
+same activation digest. Old members ordinarily retain obligations until certified handoff and
+attempt closure make retirement safe. An authenticated snapshot-absence decision under the
+deposit-genesis publication fence is the narrow exception: it permits threshold-share and X25519
+retirement without letting a never-initialized deposit service pin obsolete secret material.
+
+If canonical source-epoch deposit genesis is published after that absence decision, the retired
+party derives only a transition-bound `RecoveryAndFenceOnly` Ed25519 capability. The authority
+digest commits the network, wallet, exact source and target committees and keys, activation,
+registry root, and fault bound; the durable reducer independently stores the same digest. This
+capability may vote only for exact quorum-backed pre-pin ledger recovery, independently certified
+ledger or observation checkpoints, and the validated `HandoffFence`. It cannot create raw
+observations, allocations, consolidation work, state exports, or the final `Handoff`. Once the
+portable Fence is installed, the recovery authority disappears and a distinct committee-bound
+`HandoffOnly` capability can attest only the final Handoff. Thus share erasure does not trade away
+handoff liveness, and the stable signing seed does not become general historical protocol authority.
 
 ## Byzantine deposit state
 
@@ -115,7 +147,7 @@ Byzantine behavior is handled as follows:
 
 | Behavior | Response |
 | --- | --- |
-| Proposer omits or equivocates before intent commit | Signed vote rules prevent two honest commits; persisted timeout and view change select another proposer after synchrony. |
+| Proposer omits or equivocates before intent commit | Signed vote rules prevent two honest commits; persisted timeout and view change select another proposer once the configured bounded-synchrony assumption holds. |
 | Selected signer omits preprocessing | A later deterministic ROAST view may use another eligible subset without reusing the abandoned session. |
 | Peer forges or relays another origin's contribution | Inner Ed25519 verification, sender binding, and replay/equivocation indexes reject it. |
 | Peer proposes different key-image or signing context | Exact contribution-set and proof-verified key-image bindings fail validation. |
@@ -136,8 +168,9 @@ safety or liveness after the committee assumption is violated.
 
 Network authentication also does not prevent resource exhaustion by an enrolled Byzantine peer.
 Message sizes, committees, live sessions, attempts, views, histories, and archives have hard bounds;
-exceeding them fails closed. Production deployments still need connection, CPU, disk, and per-peer
-rate controls.
+exceeding them fails closed. The runtime also bounds per-peer connections, request concurrency,
+body bytes, and ingress rates. Production deployments still need capacity policy and monitoring for
+CPU, disk, bandwidth, and those configured limits.
 
 ## Persistence and rollback
 
@@ -169,7 +202,10 @@ Important work outside the completed protocol lane remains:
 - deploy independently administered and independently peered Monero observers within the combined
   signer/observer fault budget;
 - reduce common private-view-key exposure and design auditable reserve reporting;
-- add production certificate lifecycle, rate limiting, monitoring, and operator authorization; and
-- demonstrate real accepted transactions on public testnet before any mainnet work.
+- expand protocol-level rate limiting and monitoring within the implemented network; and
+- document the externally supplied deployment assumptions without implementing operator/HSM key
+  custody in this repository.
 
-Mainnet mode should remain disabled until those gates are deliberately reviewed and satisfied.
+Private Regtest is the sole release-acceptance gate. Public testnet/mainnet deployment and evidence,
+including operator authorization, certificate operations, and HSM/key custody, are deployment-owner
+responsibilities outside this implementation's scope. Mainnet party mode remains disabled.

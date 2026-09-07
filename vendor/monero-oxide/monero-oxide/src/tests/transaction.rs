@@ -106,8 +106,8 @@ fn parse() {
           let tx_sig = hex::decode(sigs_array[i].as_str().unwrap()).unwrap();
           for (i, sig) in sig.sigs.iter().enumerate() {
             let start = i * 64;
-            let mut c = &tx_sig[start .. (start + 32)];
-            let mut s = &tx_sig[(start + 32) .. (start + 64)];
+            let mut c = &tx_sig[start..(start + 32)];
+            let mut s = &tx_sig[(start + 32)..(start + 64)];
             assert_eq!(sig.c, Scalar::read(&mut c).unwrap());
             assert_eq!(sig.s, Scalar::read(&mut s).unwrap());
           }

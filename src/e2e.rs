@@ -1,6 +1,13 @@
 //! Docker/regtest acceptance runner.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    ops::{Deref, DerefMut},
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+};
 
 use anyhow::Context as _;
 use curve25519_dalek::{
@@ -24,33 +31,155 @@ use zeroize::{Zeroize as _, Zeroizing};
 
 use crate::{
     auth::bearer_token_digest,
-    committee::{Committee, PartyId, SessionId},
-    compact_epoch_registry::CompactEpochRegistry,
+    committee::{Committee, Member, PartyId, SessionId},
+    compact_epoch_registry::{ActiveIssuer, CompactEpochRegistry, VerifiedIssuerWindow},
     config::{NetworkKind, Scenario},
+    deposit_clock::RegtestClockWriter,
     deposit_consolidation::{ConsolidationId, consolidation_signed_bytes_binding},
     deposit_ledger::{
-        CertifiedLedgerEntry, LedgerPayload, LedgerRequestId, RequestBinding,
+        CertifiedLedgerEntry, LedgerPayload, LedgerRequestId, LedgerStatement, RequestBinding,
         UNUSED_ALLOCATION_TTL_SECONDS,
     },
     deposit_service::{
         DepositAddressRequest, PublicConsolidationPhase, PublicConsolidationStatus,
-        deposit_request_id_for_binding,
+        PublicLiveConsolidationStatus, deposit_request_id_for_binding,
     },
-    deposit_wallet::{ChainPoint, DepositAddressDeriver, SweepId, WalletOutputId},
+    deposit_wallet::{
+        CanonicalDepositAddress, ChainPoint, DepositAddressDeriver, SweepId, WalletOutputId,
+    },
     deposit_worker::{DepositWorkerConfig, root_consolidation_destination_binding},
-    epoch_history::EpochHistoryParent,
+    epoch_history::{EpochHistoryLink, EpochHistoryParent},
+    key_rotation::eligibility_reference_key,
     keys::EpochPublic,
     server::{
-        AcceptanceProactiveRefreshReleaseRequest, AcceptanceProactiveRefreshReleaseResponse,
-        AvssStartRequest, AvssStepResponse, AvssTransition, DealPurpose,
+        AcceptanceDriverLatchKind, AcceptanceProactiveRefreshReleaseRequest,
+        AcceptanceProactiveRefreshReleaseResponse, AvssStartRequest, AvssStepResponse,
+        AvssTransition, DealPurpose, DepositConsolidationStatusRequest,
         DepositConsolidationStatusResponse, DepositHttpResponse, DepositHttpStatus, PartyStatus,
+        acceptance_driver_binding, canonical_dkg_transition, canonical_refresh_session,
+        canonical_reshare_session,
     },
 };
 
 const CONSOLIDATION_PRIMARY_OUTPUT_ATOMIC_UNITS: u64 = 1;
+const INITIAL_ACCEPTANCE_DEPOSIT_OUTPUTS: usize = 2;
 const REQUIRED_ACCEPTANCE_FUNDING_OUTPUTS: u64 = 6;
+const DEPOSIT_ALLOCATION_ISSUANCE_LEAD_SECONDS: u64 = 60;
+const DEPOSIT_TTL_ACCEPTANCE_FLAG: &str = "TM_E2E_DEPOSIT_TTL_ACCEPTANCE";
+const ACCEPTANCE_HTTP_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+/// A certified committee handoff serializes four independently durable BFT stages: the terminal
+/// Fence ledger slot, its portable checkpoint, the final Handoff ledger slot, and its checkpoint.
+/// Each stage may legitimately consume one configured protocol window before the next exists.
+const DEPOSIT_HANDOFF_ACCEPTANCE_WINDOWS: u32 = 4;
+
+/// E2E campaigns which inspect the active ROAST transcript construct this wrapper only when the
+/// optional hot view is present. Dereferencing keeps those checks readable, while `.0.portable`
+/// remains available for the separate post-compaction/handoff assertion.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+struct ObservedConsolidation(PublicConsolidationStatus);
+
+impl ObservedConsolidation {
+    fn from_public(status: PublicConsolidationStatus) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            status.live.is_some(),
+            "consolidation exposed portable terminal evidence but no live diagnostic state"
+        );
+        Ok(Self(status))
+    }
+
+    /// Compare the witness-independent consolidation decision reported by two replicas.
+    ///
+    /// Honest replicas may persist different canonical `n-f` witness subsets for the same BA,
+    /// ROAST-intent, or ledger decision. Candidate relays can likewise leave different supersets
+    /// of already sufficient `f+1` evidence in hot diagnostic state. Those differences are useful
+    /// attribution data, but they are not forks. Every statement, transaction, attempt, key-image
+    /// binding, phase, and chain point remains part of the comparison.
+    fn same_quorum_decision(&self, other: &Self) -> bool {
+        quorum_decision_projection(&self.0) == quorum_decision_projection(&other.0)
+    }
+}
+
+fn quorum_decision_projection(status: &PublicConsolidationStatus) -> PublicConsolidationStatus {
+    let mut projected = status.clone();
+    if let Some(portable) = projected.portable.as_mut() {
+        portable.current_certificate.attestations.clear();
+        if let Some(abandonment) = portable.abandonment_certificate.as_mut() {
+            abandonment.attestations.clear();
+        }
+    }
+    if let Some(live) = projected.live.as_mut() {
+        live.bootstrap_ba_view = 0;
+        live.bootstrap_ba_proposer = PartyId(1);
+        live.bootstrap_certificate_signers.clear();
+        live.roast_candidate_count = 0;
+        live.roast_endorsed_candidate_count = 0;
+        live.roast_intent_certificate_signers.clear();
+        live.roast_endorsed_witness_count = 0;
+        live.roast_endorsed_evidence_digest = [0; 32];
+        live.completion_certificate_signers.clear();
+    }
+    projected
+}
+
+fn same_portable_consolidation_decision(
+    left: &PublicConsolidationStatus,
+    right: &PublicConsolidationStatus,
+) -> bool {
+    quorum_decision_projection(left).portable == quorum_decision_projection(right).portable
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+struct EqualObservationGroup<T> {
+    value: T,
+    parties: BTreeSet<PartyId>,
+}
+
+fn record_equal_observation<T: Eq>(
+    groups: &mut Vec<EqualObservationGroup<T>>,
+    party: PartyId,
+    value: T,
+) {
+    for group in groups.iter_mut() {
+        group.parties.remove(&party);
+    }
+    groups.retain(|group| !group.parties.is_empty());
+    if let Some(group) = groups.iter_mut().find(|group| group.value == value) {
+        group.parties.insert(party);
+    } else {
+        groups.push(EqualObservationGroup { value, parties: BTreeSet::from([party]) });
+    }
+}
+
+fn equal_observation_quorum<'a, T>(
+    groups: &'a [EqualObservationGroup<T>],
+    required: usize,
+    required_parties: &BTreeSet<PartyId>,
+) -> anyhow::Result<Option<&'a EqualObservationGroup<T>>> {
+    anyhow::ensure!(required > 0, "exact observation quorum must be positive");
+    let mut matching = groups.iter().filter(|group| group.parties.len() >= required);
+    let quorum = matching.next();
+    anyhow::ensure!(
+        matching.next().is_none(),
+        "multiple conflicting exact observation groups reached quorum"
+    );
+    Ok(quorum.filter(|group| required_parties.iter().all(|party| group.parties.contains(party))))
+}
+
+impl Deref for ObservedConsolidation {
+    type Target = PublicLiveConsolidationStatus;
+
+    fn deref(&self) -> &Self::Target {
+        self.0.live.as_ref().expect("validated live consolidation status")
+    }
+}
+
+impl DerefMut for ObservedConsolidation {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.0.live.as_mut().expect("validated live consolidation status")
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 struct ConsolidationFaultProof {
     fault_party: PartyId,
     initial_view: u64,
@@ -175,24 +304,6 @@ struct AcceptanceProtocolFaultGateResponse {
     qual_round: Option<u64>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-enum AcceptanceDriverLatchKind {
-    ObserverFork,
-    DynamicRotationOmission,
-    ProactiveDeadline,
-}
-
-impl AcceptanceDriverLatchKind {
-    const fn marker(self) -> &'static str {
-        match self {
-            Self::ObserverFork => "observer_fork",
-            Self::DynamicRotationOmission => "dynamic_rotation_omission",
-            Self::ProactiveDeadline => "proactive_deadline",
-        }
-    }
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 struct AcceptanceDriverLatchRequest {
     action: AcceptanceConsolidationGateAction,
@@ -206,6 +317,7 @@ struct AcceptanceDriverLatchResponse {
     state: AcceptanceConsolidationGateState,
     kind: Option<AcceptanceDriverLatchKind>,
     binding: Option<[u8; 32]>,
+    event_unix_ms: Option<u64>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
@@ -245,6 +357,7 @@ struct PartyClient {
     poll_interval: std::time::Duration,
     protocol_timeout: std::time::Duration,
     network_id: [u8; 32],
+    avss_start_calls: Arc<AtomicU64>,
 }
 
 impl PartyClient {
@@ -277,13 +390,19 @@ impl PartyClient {
                 None
             };
         Ok(Self {
-            http: reqwest::Client::builder().timeout(timeout).build()?,
+            // Every control-plane operation is immediate and idempotent. Bound each party
+            // independently so one Byzantine HTTP endpoint cannot consume the whole protocol
+            // observation deadline before honest n-f responses are sampled.
+            http: reqwest::Client::builder()
+                .timeout(timeout.min(ACCEPTANCE_HTTP_REQUEST_TIMEOUT))
+                .build()?,
             admin_endpoints,
             admin_authorizations,
             deposit_authorizations,
             poll_interval: std::time::Duration::from_millis(scenario.poll_interval_ms),
             protocol_timeout: timeout,
             network_id: scenario.quic_network_id()?,
+            avss_start_calls: Arc::new(AtomicU64::new(0)),
         })
     }
 
@@ -327,11 +446,18 @@ impl PartyClient {
         path: &str,
         request: &T,
     ) -> anyhow::Result<R> {
+        if path == "/v1/avss/start" {
+            self.avss_start_calls.fetch_add(1, Ordering::Relaxed);
+        }
         let authorization = self
             .admin_authorizations
             .get(&party)
             .with_context(|| format!("missing admin credential for party {party}"))?;
         self.post_authenticated(party, path, request, authorization).await
+    }
+
+    fn avss_start_calls(&self) -> u64 {
+        self.avss_start_calls.load(Ordering::Relaxed)
     }
 
     async fn post_deposit<T: Serialize + ?Sized, R: DeserializeOwned>(
@@ -424,22 +550,145 @@ async fn read_bearer_authorization_file(path: &std::path::Path) -> anyhow::Resul
 struct CertifiedDeposit {
     request: DepositAddressRequest,
     response: DepositHttpResponse,
-    issuer_registry: CompactEpochRegistry,
-    funded_output: Option<DepositOutputEvidence>,
-    funded_amount: Option<u64>,
+    allocation_issuer: ActiveIssuer,
+    funded_outputs: Vec<DepositOutputEvidence>,
+}
+
+/// Witness-independent identity of one fully validated Active allocation response.
+///
+/// The routing leader and certificate attestations are intentionally absent: honest replicas may
+/// use different consensus views and different valid `n-f` witness subsets. Everything that can
+/// select another allocation or compact-registry root remains part of exact quorum equality.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ValidatedDepositAllocationCandidate {
+    allocation_issuer: ActiveIssuer,
+    statement: LedgerStatement,
+    address: CanonicalDepositAddress,
+    created_at: u64,
+    expires_at: u64,
+    serving_registry: CompactEpochRegistry,
+    issuer: VerifiedIssuerWindow,
+}
+
+#[derive(Clone, Debug)]
+struct ValidatedDepositAllocationResponse {
+    candidate: ValidatedDepositAllocationCandidate,
+    response: DepositHttpResponse,
+}
+
+fn certified_deposit_candidate_quorum(
+    request: DepositAddressRequest,
+    groups: &[EqualObservationGroup<ValidatedDepositAllocationCandidate>],
+    responses: &BTreeMap<PartyId, ValidatedDepositAllocationResponse>,
+    required: usize,
+    required_parties: &BTreeSet<PartyId>,
+) -> anyhow::Result<Option<(CertifiedDeposit, Vec<PartyId>)>> {
+    let Some(group) = equal_observation_quorum(groups, required, required_parties)? else {
+        return Ok(None);
+    };
+    let representative =
+        *group.parties.first().context("deposit candidate quorum has no representative")?;
+    let validated = responses
+        .get(&representative)
+        .context("deposit candidate quorum omitted its representative response")?;
+    anyhow::ensure!(
+        validated.candidate == group.value,
+        "deposit candidate representative differs from its exact quorum"
+    );
+    Ok(Some((
+        CertifiedDeposit {
+            request,
+            response: validated.response.clone(),
+            allocation_issuer: group.value.allocation_issuer.clone(),
+            funded_outputs: Vec::new(),
+        },
+        group.parties.iter().copied().collect(),
+    )))
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ScheduledDeposit {
+    request: DepositAddressRequest,
+    created_at: u64,
+    expires_at: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct DepositTtlAllocationFacts {
+    request: [u8; 32],
+    sequence: u64,
+    account: u32,
+    address_index: u32,
+    address: String,
+    created_at: u64,
+    expires_at: u64,
+    statement: [u8; 32],
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct DepositOutputEvidence {
     id: WalletOutputId,
     index_on_blockchain: u64,
+    amount_atomic_units: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct SuccessorEpochSigningAcceptance {
     epoch: u64,
     transaction: [u8; 32],
+    input_count: usize,
     exact_transaction_bytes: Vec<u8>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ExactRefreshEvidence {
+    members: Vec<PartyId>,
+    source_verification_shares: [u8; 32],
+    target_verification_shares: [u8; 32],
+    refresh_transition_digest: [u8; 32],
+    reshare_transition_digest: [u8; 32],
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AcceptanceDepositFaultMode {
+    ObserverFork,
+    DepositCheckpoint,
+}
+
+fn parse_acceptance_deposit_fault_mode(mode: &str) -> anyhow::Result<AcceptanceDepositFaultMode> {
+    match mode {
+        "observer_fork" => Ok(AcceptanceDepositFaultMode::ObserverFork),
+        "deposit_checkpoint" => Ok(AcceptanceDepositFaultMode::DepositCheckpoint),
+        value => anyhow::bail!(
+            "TM_ACCEPTANCE_DEPOSIT_FAULT_MODE must be observer_fork or deposit_checkpoint, got {value:?}"
+        ),
+    }
+}
+
+fn configured_acceptance_deposit_fault_mode() -> anyhow::Result<Option<AcceptanceDepositFaultMode>>
+{
+    if std::env::var("TM_ACCEPTANCE_ENABLE_FAULT_HOOKS").as_deref() != Ok("1")
+        || std::env::var("TM_ACCEPTANCE_PAUSE_AFTER_DEPOSIT_FUNDING").as_deref() != Ok("1")
+    {
+        return Ok(None);
+    }
+    let mode = std::env::var("TM_ACCEPTANCE_DEPOSIT_FAULT_MODE")
+        .context("deposit fault hook requires TM_ACCEPTANCE_DEPOSIT_FAULT_MODE")?;
+    parse_acceptance_deposit_fault_mode(&mode).map(Some)
+}
+
+fn deposit_fault_confirmation_plan(
+    mode: Option<AcceptanceDepositFaultMode>,
+    confirmation_blocks: u64,
+) -> anyhow::Result<(u64, u64)> {
+    let remaining = confirmation_blocks
+        .checked_sub(1)
+        .context("deposit confirmation block count must be positive")?;
+    if mode == Some(AcceptanceDepositFaultMode::DepositCheckpoint) {
+        Ok((remaining, 0))
+    } else {
+        Ok((0, remaining))
+    }
 }
 
 fn environment_flag(name: &str) -> anyhow::Result<bool> {
@@ -454,6 +703,85 @@ fn environment_flag(name: &str) -> anyhow::Result<bool> {
     }
 }
 
+fn exact_deposit_ttl_acceptance_flag() -> anyhow::Result<bool> {
+    let Some(value) = std::env::var_os(DEPOSIT_TTL_ACCEPTANCE_FLAG) else {
+        return Ok(false);
+    };
+    match value
+        .to_str()
+        .with_context(|| format!("{DEPOSIT_TTL_ACCEPTANCE_FLAG} must be valid UTF-8"))?
+    {
+        "0" => Ok(false),
+        "1" => Ok(true),
+        value => {
+            anyhow::bail!("{DEPOSIT_TTL_ACCEPTANCE_FLAG} must be exactly 0 or 1, got {value:?}")
+        }
+    }
+}
+
+fn require_exact_environment_value(name: &str, expected: &str) -> anyhow::Result<()> {
+    let value = std::env::var(name).with_context(|| {
+        format!("focused deposit-TTL acceptance requires explicit {name}={expected}")
+    })?;
+    anyhow::ensure!(
+        value == expected,
+        "focused deposit-TTL acceptance requires exactly {name}={expected}, got {value:?}"
+    );
+    Ok(())
+}
+
+fn configured_deposit_ttl_clock(
+    scenario: &Scenario,
+    enabled: bool,
+    deposits_enabled: bool,
+    consolidation_required: bool,
+    protocol_only: bool,
+    faulty: &BTreeSet<PartyId>,
+) -> anyhow::Result<Option<RegtestClockWriter>> {
+    if !enabled {
+        return Ok(None);
+    }
+    require_exact_environment_value("TM_E2E_PROTOCOL_ONLY", "0")?;
+    require_exact_environment_value("TM_E2E_DEPOSITS", "1")?;
+    require_exact_environment_value("TM_E2E_REQUIRE_DEPOSIT_CONSOLIDATION", "0")?;
+    require_exact_environment_value(DEPOSIT_TTL_ACCEPTANCE_FLAG, "1")?;
+    anyhow::ensure!(
+        scenario.demo_only && scenario.network == NetworkKind::Regtest,
+        "focused deposit-TTL acceptance is restricted to a demo-only private Regtest scenario"
+    );
+    anyhow::ensure!(
+        deposits_enabled && !consolidation_required && !protocol_only,
+        "focused deposit-TTL acceptance requires deposits only, with protocol-only and consolidation disabled"
+    );
+    anyhow::ensure!(
+        acceptance_proactive_refresh_hold_enabled()?,
+        "focused deposit-TTL acceptance requires TM_ACCEPTANCE_HOLD_PROACTIVE_REFRESH=1"
+    );
+    anyhow::ensure!(
+        faulty.is_empty(),
+        "focused deposit-TTL acceptance requires every epoch-0 replica to remain responsive"
+    );
+
+    let path = std::env::var_os("TM_E2E_DEPOSIT_CLOCK_FILE")
+        .map(std::path::PathBuf::from)
+        .context("focused deposit-TTL acceptance requires TM_E2E_DEPOSIT_CLOCK_FILE")?;
+    match std::fs::symlink_metadata(&path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Ok(_) => anyhow::bail!(
+            "focused deposit-TTL acceptance requires an initially absent clock file at {}",
+            path.display()
+        ),
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!("failed to inspect focused deposit-TTL clock {}", path.display())
+            });
+        }
+    }
+    RegtestClockWriter::from_e2e_env(scenario)?
+        .context("focused deposit-TTL acceptance requires TM_E2E_DEPOSIT_CLOCK_FILE")
+        .map(Some)
+}
+
 fn acceptance_proactive_refresh_hold_enabled() -> anyhow::Result<bool> {
     let Some(value) = std::env::var_os("TM_ACCEPTANCE_HOLD_PROACTIVE_REFRESH") else {
         return Ok(false);
@@ -465,6 +793,17 @@ fn acceptance_proactive_refresh_hold_enabled() -> anyhow::Result<bool> {
             "TM_ACCEPTANCE_HOLD_PROACTIVE_REFRESH must be exactly 0 or 1, got {value:?}"
         ),
     }
+}
+
+fn required_exact_refresh_epoch() -> anyhow::Result<Option<u64>> {
+    let Some(value) = std::env::var_os("TM_ACCEPTANCE_REQUIRE_EXACT_REFRESH_EPOCH") else {
+        return Ok(None);
+    };
+    let value =
+        value.to_str().context("TM_ACCEPTANCE_REQUIRE_EXACT_REFRESH_EPOCH must be valid UTF-8")?;
+    let epoch = value.parse::<u64>()?;
+    anyhow::ensure!(epoch > 0, "an exact refresh target epoch must be positive");
+    Ok(Some(epoch))
 }
 
 fn required_recovered_party() -> anyhow::Result<Option<PartyId>> {
@@ -536,8 +875,9 @@ fn tenant_certified_request_id(request: DepositAddressRequest) -> LedgerRequestI
     deposit_request_id_for_binding(tenant_bound_request_binding(request))
 }
 
-/// Exercise DKG, a grow, timer-driven same-committee refreshes both inside and beyond the finite
-/// scenario chain, a shrink, and a real BFT deposit consolidation against the configured daemon.
+/// Exercise DKG, a grow, timer-driven fixed-size refreshes or reshares both inside and beyond the
+/// finite scenario chain, a shrink, and a real BFT deposit consolidation against the configured
+/// daemon.
 ///
 /// # Errors
 ///
@@ -551,6 +891,7 @@ pub async fn run(scenario: &Scenario) -> anyhow::Result<()> {
         "demo-only scenario cannot target a public network"
     );
     anyhow::ensure!(scenario.confirmation_blocks > 0, "confirmation_blocks must be positive");
+    let deposit_ttl_acceptance = exact_deposit_ttl_acceptance_flag()?;
     let deposits_enabled = environment_flag("TM_E2E_DEPOSITS")?;
     let consolidation_required = environment_flag("TM_E2E_REQUIRE_DEPOSIT_CONSOLIDATION")?;
     let protocol_only = verify_protocol_only_environment(deposits_enabled, consolidation_required)?;
@@ -582,21 +923,64 @@ pub async fn run(scenario: &Scenario) -> anyhow::Result<()> {
         );
     }
     let faulty = configured_faulty_parties(scenario)?;
+    let mut deposit_ttl_clock = configured_deposit_ttl_clock(
+        scenario,
+        deposit_ttl_acceptance,
+        deposits_enabled,
+        consolidation_required,
+        protocol_only,
+        &faulty,
+    )?;
+    let required_exact_refresh_epoch = required_exact_refresh_epoch()?;
+    anyhow::ensure!(
+        required_exact_refresh_epoch.is_none() || required_exact_refresh_epoch == Some(2),
+        "this acceptance lifecycle can require an exact same-committee refresh only at epoch 2"
+    );
+    anyhow::ensure!(
+        required_exact_refresh_epoch.is_none() || scenario.network == NetworkKind::Regtest,
+        "exact same-committee refresh acceptance is restricted to private Regtest"
+    );
     let timeout = std::time::Duration::from_secs(scenario.protocol_timeout_seconds);
     let parties = PartyClient::new(timeout, scenario).await?;
 
-    tracing::info!("running epoch-0 distributed key generation");
+    tracing::info!("observing epoch-0 distributed key generation");
     let initial = scenario.genesis_committee()?;
-    let (key_id, dkg_session) = crate::server::canonical_dkg_identity(scenario)?;
-    let mut current = run_dkg(
-        &parties,
-        dkg_session,
-        key_id,
-        &initial,
-        scenario.committee_spec(0)?.fault_bound,
-        &faulty,
-    )
-    .await?;
+    let dkg_transition = canonical_dkg_transition(scenario)?;
+    let manual_genesis = acceptance_protocol_fault_specification()?.is_some();
+    anyhow::ensure!(
+        deposit_ttl_clock.is_none() || !manual_genesis,
+        "focused deposit-TTL acceptance requires autonomous observe-only genesis"
+    );
+    let mut current = if manual_genesis {
+        let public = run_dkg(
+            &parties,
+            dkg_transition.session,
+            dkg_transition.key_id,
+            &initial,
+            scenario.committee_spec(0)?.fault_bound,
+            &faulty,
+        )
+        .await?;
+        anyhow::ensure!(
+            parties.avss_start_calls() > 0,
+            "manual genesis completed without an acceptance-client AVSS start call"
+        );
+        public
+    } else {
+        let public = wait_for_transition_activation(&parties, &dkg_transition, &faulty).await?;
+        let avss_start_calls = parties.avss_start_calls();
+        anyhow::ensure!(
+            avss_start_calls == 0,
+            "ordinary genesis invoked /v1/avss/start {avss_start_calls} times"
+        );
+        println!(
+            "TM_ACCEPTANCE_AUTONOMOUS_GENESIS epoch=0 control=observe-only avss_start_calls={} key_id={} group_key={}",
+            avss_start_calls,
+            hex::encode(public.key_id),
+            hex::encode(public.group_key_bytes()),
+        );
+        public
+    };
     tracing::info!(group_key = %hex::encode(current.group_key_bytes()), "DKG installed");
 
     let daemon =
@@ -618,6 +1002,26 @@ pub async fn run(scenario: &Scenario) -> anyhow::Result<()> {
         .checked_add(1)
         .context("acceptance funding height overflow")?;
     daemon.generate_blocks(&funding_address, usize::try_from(scenario.funding_blocks)?).await?;
+
+    if let Some(clock) = deposit_ttl_clock.as_mut() {
+        run_deposit_ttl_acceptance(
+            scenario,
+            &parties,
+            &current,
+            &daemon,
+            &view,
+            &threshold_address,
+            &funding_spend,
+            &funding_view,
+            &funding_address,
+            funding_start_height,
+            scenario.committee_spec(0)?.fault_bound,
+            &faulty,
+            clock,
+        )
+        .await?;
+        return Ok(());
+    }
 
     let mut deposit_acceptance = None;
     let mut consolidation_transaction = None;
@@ -644,6 +1048,8 @@ pub async fn run(scenario: &Scenario) -> anyhow::Result<()> {
                 .context("certified allocation omitted its address")?
                 .as_str(),
         )?;
+        let initial_output_count =
+            if consolidation_required { INITIAL_ACCEPTANCE_DEPOSIT_OUTPUTS } else { 1 };
         let (deposit_block, deposit_transaction, deposit_transaction_bytes) =
             fund_deposit_with_ordinary_transaction(
                 &daemon,
@@ -652,53 +1058,78 @@ pub async fn run(scenario: &Scenario) -> anyhow::Result<()> {
                 &funding_address,
                 funding_start_height,
                 &deposit_address,
+                initial_output_count,
+                false,
                 scenario.deposit_maximum_fee_atomic_units,
                 scenario.poll_interval_ms,
                 scenario.protocol_timeout_seconds,
             )
             .await?;
-        let (funded_output, funded_amount) = verify_deposit_transaction_output(
+        let funded_outputs = verify_deposit_transaction_outputs(
             &daemon,
             &view,
             deposit_block,
             &certified,
             deposit_transaction,
+            initial_output_count,
         )
         .await?;
-        validate_consolidation_fixture_economics(
-            funded_amount,
-            scenario.deposit_maximum_fee_atomic_units,
-        )?;
-        certified.funded_output = Some(funded_output);
-        certified.funded_amount = Some(funded_amount);
-        maybe_pause_at_deposit_fault_barrier(&parties, deposit_transaction, funded_output.id)
-            .await?;
+        for output in &funded_outputs {
+            validate_consolidation_fixture_economics(
+                output.amount_atomic_units,
+                scenario.deposit_maximum_fee_atomic_units,
+            )?;
+        }
+        let checkpoint_output =
+            funded_outputs.first().copied().context("deposit funding omitted its first output")?;
+        certified.funded_outputs.extend(funded_outputs);
+        let deposit_fault_mode = configured_acceptance_deposit_fault_mode()?;
+        let (confirmations_before_barrier, confirmations_after_barrier) =
+            deposit_fault_confirmation_plan(deposit_fault_mode, scenario.confirmation_blocks)?;
+        for _ in 0..confirmations_before_barrier {
+            daemon.generate_blocks(&threshold_address, 1).await?;
+        }
+        maybe_pause_at_deposit_fault_barrier(
+            &parties,
+            deposit_transaction,
+            checkpoint_output.id,
+            deposit_fault_mode,
+        )
+        .await?;
         println!(
-            "TM_ACCEPTANCE_DEPOSIT_FUNDING_TRANSACTION txid={} bytes={}",
+            "TM_ACCEPTANCE_DEPOSIT_FUNDING_TRANSACTION txid={} bytes={} outputs={}",
             hex::encode(deposit_transaction),
-            deposit_transaction_bytes.len()
+            deposit_transaction_bytes.len(),
+            initial_output_count
         );
         println!(
             "TM_ACCEPTANCE_DEPOSIT_FUNDING_TRANSACTION_HEX={}",
             hex::encode(&deposit_transaction_bytes)
         );
-        for _ in 1..scenario.confirmation_blocks {
+        anyhow::ensure!(
+            !consolidation_required
+                || certified.funded_outputs.len() == INITIAL_ACCEPTANCE_DEPOSIT_OUTPUTS,
+            "full acceptance did not create exactly two simultaneously mined deposit outputs"
+        );
+        for _ in 0..confirmations_after_barrier {
             daemon.generate_blocks(&threshold_address, 1).await?;
         }
         wait_for_permanent_deposit(
             scenario,
             &parties,
-            &initial,
+            &current,
             scenario.committee_spec(0)?.fault_bound,
             &faulty,
             &certified,
         )
         .await?;
+        let certified_amount = certified_deposit_total(&certified)?;
         tracing::info!(
             txid = %hex::encode(deposit_transaction),
             address = %deposit_address,
-            amount = funded_amount,
-            "ordinary wallet transaction deposit was observed and made permanent"
+            outputs = certified.funded_outputs.len(),
+            total_amount = certified_amount,
+            "ordinary wallet transaction deposits were observed and made permanent"
         );
         if consolidation_required {
             arm_consolidation_bootstrap_fault_gate(&parties, &initial, &faulty).await?;
@@ -775,11 +1206,12 @@ pub async fn run(scenario: &Scenario) -> anyhow::Result<()> {
                 &daemon,
                 &threshold_address,
                 signed.transaction(),
+                usize::try_from(broadcast.plan.at_tip.height)?,
                 scenario.poll_interval_ms,
                 scenario.protocol_timeout_seconds,
             )
             .await?;
-            let consolidation_height = u64::try_from(daemon.latest_block_number().await?)?;
+            let consolidation_height = u64::try_from(consolidation_block.number())?;
             let confirmation = ChainPoint::new(consolidation_height, consolidation_block.hash())?;
             let accepted_transaction = verify_consolidation_transaction(
                 &daemon,
@@ -789,6 +1221,15 @@ pub async fn run(scenario: &Scenario) -> anyhow::Result<()> {
                 &broadcast,
             )
             .await?;
+            anyhow::ensure!(
+                broadcast.plan.inputs.len() == INITIAL_ACCEPTANCE_DEPOSIT_OUTPUTS,
+                "initial production consolidation did not consume exactly two mature deposit inputs"
+            );
+            println!(
+                "TM_ACCEPTANCE_MULTI_INPUT_CONSOLIDATION txid={} inputs={}",
+                hex::encode(accepted_transaction.hash()),
+                broadcast.plan.inputs.len()
+            );
             consolidation_transaction_bytes = Some(accepted_transaction.serialize());
             for _ in 1..scenario.confirmation_blocks {
                 daemon.generate_blocks(&threshold_address, 1).await?;
@@ -803,77 +1244,12 @@ pub async fn run(scenario: &Scenario) -> anyhow::Result<()> {
                 PublicConsolidationPhase::Confirmed,
             )
             .await?;
-            anyhow::ensure!(confirmed.authorization == broadcast.authorization);
-            anyhow::ensure!(confirmed.sweep == broadcast.sweep);
-            anyhow::ensure!(confirmed.plan == broadcast.plan);
-            anyhow::ensure!(confirmed.signed == broadcast.signed);
-            anyhow::ensure!(confirmed.certificate_digest == broadcast.certificate_digest);
-            anyhow::ensure!(confirmed.confirmation == Some(confirmation));
-            anyhow::ensure!(confirmed.roast_view == broadcast.roast_view);
-            anyhow::ensure!(confirmed.roast_relay_seed == broadcast.roast_relay_seed);
-            anyhow::ensure!(confirmed.roast_signers == broadcast.roast_signers);
-            anyhow::ensure!(confirmed.roast_view_count == broadcast.roast_view_count);
-            anyhow::ensure!(confirmed.roast_candidate_count == broadcast.roast_candidate_count);
+            let mut expected_confirmed = broadcast.clone();
+            expected_confirmed.phase = PublicConsolidationPhase::Confirmed;
+            expected_confirmed.confirmation = Some(confirmation);
             anyhow::ensure!(
-                confirmed.roast_endorsed_candidate_count
-                    == broadcast.roast_endorsed_candidate_count
-            );
-            anyhow::ensure!(
-                confirmed.roast_intent_certificate_digest
-                    == broadcast.roast_intent_certificate_digest
-            );
-            anyhow::ensure!(
-                confirmed.roast_intent_certificate_signers
-                    == broadcast.roast_intent_certificate_signers
-            );
-            anyhow::ensure!(
-                confirmed.roast_attempt_binding_digest == broadcast.roast_attempt_binding_digest
-            );
-            anyhow::ensure!(
-                confirmed.roast_endorsed_witness_count == broadcast.roast_endorsed_witness_count
-            );
-            anyhow::ensure!(
-                confirmed.roast_endorsed_evidence_digest
-                    == broadcast.roast_endorsed_evidence_digest
-            );
-            anyhow::ensure!(
-                confirmed.completion_certificate_signers
-                    == broadcast.completion_certificate_signers
-            );
-            anyhow::ensure!(
-                confirmed.key_image_binding_digest == broadcast.key_image_binding_digest,
-                "confirmed consolidation changed its durable key-image family binding"
-            );
-            anyhow::ensure!(
-                confirmed.key_image_unsigned_transaction_digest
-                    == broadcast.key_image_unsigned_transaction_digest,
-                "confirmed consolidation changed its key-image-bound unsigned transaction"
-            );
-            anyhow::ensure!(
-                confirmed.key_image_preprocess_set_digest
-                    == broadcast.key_image_preprocess_set_digest,
-                "confirmed consolidation changed its proof-bearing preprocess set"
-            );
-            anyhow::ensure!(
-                confirmed.key_image_authorizers == broadcast.key_image_authorizers,
-                "confirmed consolidation changed its key-image authorization roster"
-            );
-            anyhow::ensure!(
-                confirmed.key_image_authorization_quorum
-                    == broadcast.key_image_authorization_quorum,
-                "confirmed consolidation changed its key-image authorization count"
-            );
-            anyhow::ensure!(confirmed.bootstrap_ba_view == broadcast.bootstrap_ba_view);
-            anyhow::ensure!(confirmed.bootstrap_ba_proposer == broadcast.bootstrap_ba_proposer);
-            anyhow::ensure!(
-                confirmed.bootstrap_prepared_intent_digest
-                    == broadcast.bootstrap_prepared_intent_digest
-            );
-            anyhow::ensure!(
-                confirmed.bootstrap_certificate_digest == broadcast.bootstrap_certificate_digest
-            );
-            anyhow::ensure!(
-                confirmed.bootstrap_certificate_signers == broadcast.bootstrap_certificate_signers
+                confirmed.same_quorum_decision(&expected_confirmed),
+                "confirmation changed the witness-independent certified signing decision"
             );
             tracing::info!(
                 txid = %hex::encode(signed.transaction()),
@@ -883,7 +1259,8 @@ pub async fn run(scenario: &Scenario) -> anyhow::Result<()> {
             consolidation_transaction = Some(signed.transaction());
             confirmed_consolidation = Some(confirmed.clone());
             if let Some(proof) = completed_fault {
-                maybe_pause_after_consolidation_fault_settlement(&proof, &confirmed).await?;
+                maybe_pause_after_consolidation_fault_settlement(&parties, &proof, &confirmed)
+                    .await?;
                 consolidation_fault_proof = Some(proof);
             }
             if let Some(proof) = completed_bootstrap {
@@ -920,12 +1297,20 @@ pub async fn run(scenario: &Scenario) -> anyhow::Result<()> {
     );
     let before_grow = current.clone();
     let grow_target = scenario
-        .configured_key_rotation_target_policy(&before_grow.committee)?
+        .configured_key_rotation_target_shape(&before_grow.committee)?
         .context("epoch zero lacks its configured grow target")?
         .eligible()
         .clone();
     release_held_proactive_refresh(&parties, &before_grow.committee, &grow_target, &faulty).await?;
-    current = wait_for_configured_successor(scenario, &parties, &current, 1, &faulty).await?;
+    current = wait_for_configured_successor(
+        scenario,
+        &parties,
+        &current,
+        1,
+        &faulty,
+        consolidation_fault_proof.as_ref().map(|proof| proof.fault_party),
+    )
+    .await?;
     let grow_subthreshold =
         validate_cross_epoch_subthreshold_non_identifiability(&before_grow, &current)?;
     tracing::info!(
@@ -960,7 +1345,7 @@ pub async fn run(scenario: &Scenario) -> anyhow::Result<()> {
         wait_for_deposit_checkpoint(
             scenario,
             &parties,
-            &current.committee,
+            &current,
             scenario.committee_spec(1)?.fault_bound,
             &faulty,
             deposit,
@@ -977,9 +1362,7 @@ pub async fn run(scenario: &Scenario) -> anyhow::Result<()> {
                 &funding_spend,
                 &funding_view,
                 &funding_address,
-                funding_start_height
-                    .checked_add(usize::try_from(current.committee.epoch)?)
-                    .context("successor funding height overflow")?,
+                successor_acceptance_funding_height(funding_start_height, current.committee.epoch)?,
                 &threshold_address,
                 &view,
                 &current,
@@ -994,15 +1377,56 @@ pub async fn run(scenario: &Scenario) -> anyhow::Result<()> {
         "waiting for the current 4-of-7 committee to refresh itself at the configured deadline"
     );
     let before_refresh = current.clone();
+    let exact_refresh_source_link = if required_exact_refresh_epoch == Some(2) {
+        Some(
+            observe_active_epoch_history_link(
+                &parties,
+                &before_refresh,
+                scenario.committee_spec(before_refresh.committee.epoch)?.fault_bound,
+                &faulty,
+            )
+            .await?,
+        )
+    } else {
+        None
+    };
     let refresh_target = scenario
-        .configured_key_rotation_target_policy(&before_refresh.committee)?
+        .configured_key_rotation_target_shape(&before_refresh.committee)?
         .context("epoch one lacks its configured refresh target")?
         .eligible()
         .clone();
     release_held_proactive_refresh(&parties, &before_refresh.committee, &refresh_target, &faulty)
         .await?;
-    current = wait_for_configured_successor(scenario, &parties, &current, 2, &faulty).await?;
+    current = wait_for_configured_successor(scenario, &parties, &current, 2, &faulty, None).await?;
     validate_scheduled_refresh(&before_refresh, &current, threshold_spend_bytes(&view))?;
+    if let Some(source_link) = exact_refresh_source_link {
+        let target_link = observe_active_epoch_history_link(
+            &parties,
+            &current,
+            scenario.committee_spec(current.committee.epoch)?.fault_bound,
+            &faulty,
+        )
+        .await?;
+        let evidence = validate_exact_same_committee_refresh(
+            &before_refresh,
+            &current,
+            scenario.committee_spec(2)?.fault_bound,
+            source_link.successor_parent()?,
+            target_link.transition_digest(),
+        )?;
+        println!(
+            "TM_ACCEPTANCE_EXACT_SAME_COMMITTEE_REFRESH source_epoch={} target_epoch={} purpose=refresh members={} key_id={} group_key={} source_verification_shares={} target_verification_shares={} receiver_keys=fresh transition_digest={} reshare_transition_digest={}",
+            before_refresh.committee.epoch,
+            current.committee.epoch,
+            format_party_list(&evidence.members),
+            hex::encode(current.key_id),
+            hex::encode(current.group_key_bytes()),
+            hex::encode(evidence.source_verification_shares),
+            hex::encode(evidence.target_verification_shares),
+            hex::encode(evidence.refresh_transition_digest),
+            hex::encode(evidence.reshare_transition_digest),
+        );
+    }
     let refresh_subthreshold =
         validate_cross_epoch_subthreshold_non_identifiability(&before_refresh, &current)?;
     tracing::info!(
@@ -1016,7 +1440,7 @@ pub async fn run(scenario: &Scenario) -> anyhow::Result<()> {
         wait_for_deposit_checkpoint(
             scenario,
             &parties,
-            &current.committee,
+            &current,
             scenario.committee_spec(2)?.fault_bound,
             &faulty,
             deposit,
@@ -1033,9 +1457,7 @@ pub async fn run(scenario: &Scenario) -> anyhow::Result<()> {
                 &funding_spend,
                 &funding_view,
                 &funding_address,
-                funding_start_height
-                    .checked_add(usize::try_from(current.committee.epoch)?)
-                    .context("successor funding height overflow")?,
+                successor_acceptance_funding_height(funding_start_height, current.committee.epoch)?,
                 &threshold_address,
                 &view,
                 &current,
@@ -1051,7 +1473,7 @@ pub async fn run(scenario: &Scenario) -> anyhow::Result<()> {
     );
     let before_second_refresh = current.clone();
     let second_refresh_target = scenario
-        .configured_key_rotation_target_policy(&before_second_refresh.committee)?
+        .configured_key_rotation_target_shape(&before_second_refresh.committee)?
         .context("epoch two lacks its configured refresh target")?
         .eligible()
         .clone();
@@ -1062,7 +1484,7 @@ pub async fn run(scenario: &Scenario) -> anyhow::Result<()> {
         &faulty,
     )
     .await?;
-    current = wait_for_configured_successor(scenario, &parties, &current, 3, &faulty).await?;
+    current = wait_for_configured_successor(scenario, &parties, &current, 3, &faulty, None).await?;
     validate_scheduled_refresh(&before_second_refresh, &current, threshold_spend_bytes(&view))?;
     let second_refresh_subthreshold =
         validate_cross_epoch_subthreshold_non_identifiability(&before_second_refresh, &current)?;
@@ -1077,7 +1499,7 @@ pub async fn run(scenario: &Scenario) -> anyhow::Result<()> {
         wait_for_deposit_checkpoint(
             scenario,
             &parties,
-            &current.committee,
+            &current,
             scenario.committee_spec(3)?.fault_bound,
             &faulty,
             deposit,
@@ -1094,9 +1516,7 @@ pub async fn run(scenario: &Scenario) -> anyhow::Result<()> {
                 &funding_spend,
                 &funding_view,
                 &funding_address,
-                funding_start_height
-                    .checked_add(usize::try_from(current.committee.epoch)?)
-                    .context("successor funding height overflow")?,
+                successor_acceptance_funding_height(funding_start_height, current.committee.epoch)?,
                 &threshold_address,
                 &view,
                 &current,
@@ -1113,13 +1533,13 @@ pub async fn run(scenario: &Scenario) -> anyhow::Result<()> {
     );
     let before_shrink = current.clone();
     let shrink_target = scenario
-        .configured_key_rotation_target_policy(&before_shrink.committee)?
+        .configured_key_rotation_target_shape(&before_shrink.committee)?
         .context("epoch three lacks its configured shrink target")?
         .eligible()
         .clone();
     release_held_proactive_refresh(&parties, &before_shrink.committee, &shrink_target, &faulty)
         .await?;
-    current = wait_for_configured_successor(scenario, &parties, &current, 4, &faulty).await?;
+    current = wait_for_configured_successor(scenario, &parties, &current, 4, &faulty, None).await?;
     let shrink_subthreshold =
         validate_cross_epoch_subthreshold_non_identifiability(&before_shrink, &current)?;
     anyhow::ensure!(
@@ -1138,7 +1558,7 @@ pub async fn run(scenario: &Scenario) -> anyhow::Result<()> {
         wait_for_deposit_checkpoint(
             scenario,
             &parties,
-            &current.committee,
+            &current,
             scenario.committee_spec(4)?.fault_bound,
             &faulty,
             deposit,
@@ -1155,9 +1575,7 @@ pub async fn run(scenario: &Scenario) -> anyhow::Result<()> {
                 &funding_spend,
                 &funding_view,
                 &funding_address,
-                funding_start_height
-                    .checked_add(usize::try_from(current.committee.epoch)?)
-                    .context("successor funding height overflow")?,
+                successor_acceptance_funding_height(funding_start_height, current.committee.epoch)?,
                 &threshold_address,
                 &view,
                 &current,
@@ -1168,31 +1586,58 @@ pub async fn run(scenario: &Scenario) -> anyhow::Result<()> {
         );
     }
 
-    let final_fault_bound = scenario.committee_spec(4)?.fault_bound;
-    let dynamic_faulty = configured_dynamic_rotation_faulty_parties(
-        scenario,
-        &current.committee,
+    let final_spec = scenario.committee_spec(4)?;
+    let final_fault_bound = final_spec.fault_bound;
+    let before_dynamic_refresh = current.clone();
+    let dynamic_epoch = before_dynamic_refresh
+        .committee
+        .epoch
+        .checked_add(1)
+        .context("dynamic refresh epoch exhausted")?;
+    let dynamic_target = Committee {
+        epoch: dynamic_epoch,
+        threshold: before_dynamic_refresh.committee.threshold,
+        members: scenario
+            .parties
+            .iter()
+            .map(|party| Member {
+                id: party.id,
+                signing_key: party.signing_key.0,
+                encryption_key: eligibility_reference_key(
+                    dynamic_epoch,
+                    party.id,
+                    party.signing_key.0,
+                ),
+            })
+            .collect(),
+    }
+    .canonicalized()?;
+    let (dynamic_fault_party, dynamic_faulty) = configured_dynamic_rotation_selected_member_fault(
+        &before_dynamic_refresh.committee,
+        &dynamic_target,
         final_fault_bound,
         &faulty,
     )?;
-    maybe_pause_before_dynamic_refresh(&parties, current.committee.epoch).await?;
+    maybe_pause_before_dynamic_refresh(
+        &parties,
+        before_dynamic_refresh.committee.epoch,
+        dynamic_fault_party,
+    )
+    .await?;
     tracing::info!(
         interval_seconds = scenario.proactive_refresh_interval_seconds,
-        source_epoch = current.committee.epoch,
+        source_epoch = before_dynamic_refresh.committee.epoch,
         "waiting for a dynamic refresh beyond the finite configured committee chain"
     );
-    let before_dynamic_refresh = current.clone();
-    let mut dynamic_target = before_dynamic_refresh.committee.clone();
-    dynamic_target.epoch =
-        dynamic_target.epoch.checked_add(1).context("dynamic refresh epoch exhausted")?;
     release_held_proactive_refresh(
         &parties,
         &before_dynamic_refresh.committee,
         &dynamic_target,
-        &faulty,
+        &dynamic_faulty,
     )
     .await?;
     current = wait_for_dynamic_refresh(
+        scenario,
         &parties,
         &before_dynamic_refresh,
         final_fault_bound,
@@ -1212,7 +1657,7 @@ pub async fn run(scenario: &Scenario) -> anyhow::Result<()> {
         wait_for_deposit_checkpoint(
             scenario,
             &parties,
-            &current.committee,
+            &current,
             final_fault_bound,
             &dynamic_faulty,
             deposit,
@@ -1229,9 +1674,7 @@ pub async fn run(scenario: &Scenario) -> anyhow::Result<()> {
                 &funding_spend,
                 &funding_view,
                 &funding_address,
-                funding_start_height
-                    .checked_add(usize::try_from(current.committee.epoch)?)
-                    .context("successor funding height overflow")?,
+                successor_acceptance_funding_height(funding_start_height, current.committee.epoch)?,
                 &threshold_address,
                 &view,
                 &current,
@@ -1265,14 +1708,27 @@ pub async fn run(scenario: &Scenario) -> anyhow::Result<()> {
         let bytes = consolidation_transaction_bytes
             .as_deref()
             .context("confirmed consolidation omitted exact daemon transaction bytes")?;
-        println!("TM_ACCEPTANCE_SIGNED_TRANSACTION_HEX={}", hex::encode(bytes));
+        let input_count = confirmed_consolidation
+            .as_ref()
+            .context("confirmed consolidation omitted its public status")?
+            .plan
+            .inputs
+            .len();
+        println!(
+            "TM_ACCEPTANCE_SIGNED_TRANSACTION txid={} bytes={} inputs={} hex={}",
+            hex::encode(transaction),
+            bytes.len(),
+            input_count,
+            hex::encode(bytes)
+        );
     }
     for accepted in &successor_epoch_signatures {
         println!(
-            "TM_ACCEPTANCE_SUCCESSOR_EPOCH_SIGNED_TRANSACTION epoch={} txid={} bytes={} hex={}",
+            "TM_ACCEPTANCE_SUCCESSOR_EPOCH_SIGNED_TRANSACTION epoch={} txid={} bytes={} inputs={} hex={}",
             accepted.epoch,
             hex::encode(accepted.transaction),
             accepted.exact_transaction_bytes.len(),
+            accepted.input_count,
             hex::encode(&accepted.exact_transaction_bytes),
         );
     }
@@ -1318,7 +1774,739 @@ pub async fn run(scenario: &Scenario) -> anyhow::Result<()> {
         );
     }
     println!(
-        "threshold Monero regtest accepted 3-of-5 -> 4-of-7 -> two scheduled 4-of-7 refreshes -> 2-of-4 resharing -> autonomous dynamic 2-of-4 refresh"
+        "threshold Monero regtest accepted 3-of-5 -> 4-of-7 -> two scheduled 4-of-7 refreshes -> 3-of-5 resharing -> autonomous dynamic 3-of-5 refresh-or-reshare"
+    );
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+async fn run_deposit_ttl_acceptance(
+    scenario: &Scenario,
+    client: &PartyClient,
+    public: &EpochPublic,
+    daemon: &MoneroDaemon<SimpleRequestTransport>,
+    view: &ViewPair,
+    threshold_address: &MoneroAddress,
+    funding_spend: &Zeroizing<Scalar>,
+    funding_view: &ViewPair,
+    funding_address: &MoneroAddress,
+    funding_start_height: usize,
+    fault_bound: u16,
+    faulty: &BTreeSet<PartyId>,
+    clock: &mut RegtestClockWriter,
+) -> anyhow::Result<()> {
+    let bootstrap = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .context("system clock precedes the Unix epoch")?
+        .as_secs()
+        .checked_add(1)
+        .context("deposit-TTL bootstrap time overflow")?;
+    advance_deposit_clock(clock, 1, bootstrap, "bootstrap")?;
+
+    let unused_schedule =
+        schedule_deposit_allocation(scenario, client, public, fault_bound, faulty, bootstrap)
+            .await?;
+    let unused_visible = bootstrap
+        .checked_add(DEPOSIT_ALLOCATION_ISSUANCE_LEAD_SECONDS)
+        .context("unused allocation visibility time overflow")?;
+    anyhow::ensure!(
+        unused_schedule.created_at == unused_visible,
+        "unused allocation was not scheduled at the exact issuance lead"
+    );
+    advance_deposit_clock(clock, 2, unused_visible, "unused-visible")?;
+    let (unused, _) = wait_for_scheduled_deposit_active(
+        scenario,
+        client,
+        public,
+        fault_bound,
+        faulty,
+        unused_schedule,
+    )
+    .await?;
+
+    let permanent_schedule =
+        schedule_deposit_allocation(scenario, client, public, fault_bound, faulty, unused_visible)
+            .await?;
+    let permanent_visible = unused_visible
+        .checked_add(DEPOSIT_ALLOCATION_ISSUANCE_LEAD_SECONDS)
+        .context("permanent allocation visibility time overflow")?;
+    anyhow::ensure!(
+        permanent_schedule.created_at == permanent_visible,
+        "funded allocation was not scheduled at the exact issuance lead"
+    );
+    advance_deposit_clock(clock, 3, permanent_visible, "permanent-visible")?;
+    let (mut permanent, _) = wait_for_scheduled_deposit_active(
+        scenario,
+        client,
+        public,
+        fault_bound,
+        faulty,
+        permanent_schedule,
+    )
+    .await?;
+
+    let permanent_address = MoneroAddress::from_str(
+        monero_network(scenario.network),
+        permanent
+            .response
+            .address
+            .as_ref()
+            .context("focused funded allocation omitted its address")?
+            .as_str(),
+    )?;
+    let (deposit_block, funding_transaction, funding_transaction_bytes) =
+        fund_deposit_with_ordinary_transaction(
+            daemon,
+            funding_spend,
+            funding_view,
+            funding_address,
+            funding_start_height,
+            &permanent_address,
+            1,
+            true,
+            scenario.deposit_maximum_fee_atomic_units,
+            scenario.poll_interval_ms,
+            scenario.protocol_timeout_seconds,
+        )
+        .await?;
+    let funded_outputs = verify_deposit_transaction_outputs(
+        daemon,
+        view,
+        deposit_block,
+        &permanent,
+        funding_transaction,
+        1,
+    )
+    .await?;
+    anyhow::ensure!(
+        funded_outputs.len() == 1,
+        "focused deposit-TTL funding must create exactly one certified output"
+    );
+    validate_consolidation_fixture_economics(
+        funded_outputs[0].amount_atomic_units,
+        scenario.deposit_maximum_fee_atomic_units,
+    )?;
+    permanent.funded_outputs.extend(funded_outputs);
+    println!(
+        "TM_ACCEPTANCE_DEPOSIT_FUNDING_TRANSACTION txid={} bytes={} outputs=1",
+        hex::encode(funding_transaction),
+        funding_transaction_bytes.len(),
+    );
+    println!(
+        "TM_ACCEPTANCE_DEPOSIT_FUNDING_TRANSACTION_HEX={}",
+        hex::encode(&funding_transaction_bytes)
+    );
+    for _ in 1..scenario.confirmation_blocks {
+        daemon.generate_blocks(threshold_address, 1).await?;
+    }
+    wait_for_ttl_deposit_status(
+        client,
+        public,
+        fault_bound,
+        faulty,
+        &permanent,
+        DepositHttpStatus::Permanent,
+    )
+    .await?;
+
+    let unused_last_active =
+        unused_schedule.expires_at.checked_sub(1).context("unused expiry underflow")?;
+    advance_deposit_clock(clock, 4, unused_last_active, "unused-last-active")?;
+    let active_replicas = wait_for_ttl_deposit_status(
+        client,
+        public,
+        fault_bound,
+        faulty,
+        &unused,
+        DepositHttpStatus::Active,
+    )
+    .await?;
+    let unused_facts = deposit_ttl_allocation_facts(&unused)?;
+    println!(
+        "TM_ACCEPTANCE_DEPOSIT_TTL_ACTIVE request={} sequence={} index={}:{} created_at={} observed_at={} expires_at={} statement={} replicas={} clock_generation=4",
+        hex::encode(unused_facts.request),
+        unused_facts.sequence,
+        unused_facts.account,
+        unused_facts.address_index,
+        unused_facts.created_at,
+        unused_last_active,
+        unused_facts.expires_at,
+        hex::encode(unused_facts.statement),
+        format_party_list(&active_replicas),
+    );
+
+    let unused_expired = unused_schedule.expires_at;
+    advance_deposit_clock(clock, 5, unused_expired, "unused-expired")?;
+    let expired_replicas = wait_for_ttl_deposit_status(
+        client,
+        public,
+        fault_bound,
+        faulty,
+        &unused,
+        DepositHttpStatus::Expired,
+    )
+    .await?;
+    println!(
+        "TM_ACCEPTANCE_DEPOSIT_TTL_EXPIRED request={} sequence={} index={}:{} observed_at={} expires_at={} address_hidden=true certificate_hidden=true replicas={} clock_generation=5",
+        hex::encode(unused_facts.request),
+        unused_facts.sequence,
+        unused_facts.account,
+        unused_facts.address_index,
+        unused_expired,
+        unused_facts.expires_at,
+        format_party_list(&expired_replicas),
+    );
+
+    let replacement_schedule =
+        schedule_deposit_allocation(scenario, client, public, fault_bound, faulty, unused_expired)
+            .await?;
+    let replacement_visible = permanent_schedule.expires_at;
+    anyhow::ensure!(
+        replacement_schedule.created_at == replacement_visible,
+        "replacement allocation did not become visible at the funded allocation's exact expiry"
+    );
+    advance_deposit_clock(clock, 6, replacement_visible, "replacement-visible")?;
+    let (replacement, replacement_replicas) = wait_for_scheduled_deposit_active(
+        scenario,
+        client,
+        public,
+        fault_bound,
+        faulty,
+        replacement_schedule,
+    )
+    .await?;
+
+    let permanent_facts = deposit_ttl_allocation_facts(&permanent)?;
+    let replacement_facts = deposit_ttl_allocation_facts(&replacement)?;
+    validate_deposit_ttl_acceptance_facts(
+        [
+            bootstrap,
+            unused_visible,
+            permanent_visible,
+            unused_last_active,
+            unused_expired,
+            replacement_visible,
+        ],
+        &unused_facts,
+        &permanent_facts,
+        &replacement_facts,
+    )?;
+    println!(
+        "TM_ACCEPTANCE_DEPOSIT_TTL_NOT_REUSED expired_sequence={} expired_index={}:{} expired_address={} new_sequence={} new_index={}:{} new_address={} replicas={} clock_generation=6",
+        unused_facts.sequence,
+        unused_facts.account,
+        unused_facts.address_index,
+        unused_facts.address,
+        replacement_facts.sequence,
+        replacement_facts.account,
+        replacement_facts.address_index,
+        replacement_facts.address,
+        format_party_list(&replacement_replicas),
+    );
+
+    let permanent_replicas = wait_for_ttl_deposit_status(
+        client,
+        public,
+        fault_bound,
+        faulty,
+        &permanent,
+        DepositHttpStatus::Permanent,
+    )
+    .await?;
+    let output = permanent
+        .funded_outputs
+        .first()
+        .copied()
+        .context("focused funded allocation omitted output evidence")?;
+    anyhow::ensure!(
+        permanent.funded_outputs.len() == 1
+            && output.id.transaction == funding_transaction
+            && output.id.index_in_transaction == 0,
+        "focused permanent evidence is not bound to the exact one-output funding transaction"
+    );
+    println!(
+        "TM_ACCEPTANCE_DEPOSIT_TTL_PERMANENT request={} sequence={} index={}:{} observed_at={} expires_at={} output={}:{} statement={} replicas={} clock_generation=6",
+        hex::encode(permanent_facts.request),
+        permanent_facts.sequence,
+        permanent_facts.account,
+        permanent_facts.address_index,
+        replacement_visible,
+        permanent_facts.expires_at,
+        hex::encode(output.id.transaction),
+        output.id.index_in_transaction,
+        hex::encode(permanent_facts.statement),
+        format_party_list(&permanent_replicas),
+    );
+    println!(
+        "deposit TTL acceptance passed; exact boundary, non-reuse, and permanent retrieval verified"
+    );
+    Ok(())
+}
+
+fn advance_deposit_clock(
+    clock: &mut RegtestClockWriter,
+    generation: u64,
+    unix_seconds: u64,
+    phase: &'static str,
+) -> anyhow::Result<()> {
+    let sample = clock.set_unix_seconds(unix_seconds)?;
+    anyhow::ensure!(
+        sample.unix_seconds == unix_seconds
+            && sample.unix_millis == unix_seconds.checked_mul(1_000).context("clock overflow")?,
+        "deposit clock writer returned a sample different from the committed time"
+    );
+    println!(
+        "TM_ACCEPTANCE_DEPOSIT_CLOCK generation={generation} unix_seconds={unix_seconds} phase={phase}"
+    );
+    Ok(())
+}
+
+async fn schedule_deposit_allocation(
+    scenario: &Scenario,
+    client: &PartyClient,
+    public: &EpochPublic,
+    fault_bound: u16,
+    faulty: &BTreeSet<PartyId>,
+    admitted_at: u64,
+) -> anyhow::Result<ScheduledDeposit> {
+    let request_parties = allocation_request_parties(&public.committee, fault_bound, faulty)?;
+    let required_deliveries = usize::from(
+        fault_bound.checked_add(1).context("deposit allocation delivery threshold overflow")?,
+    );
+    anyhow::ensure!(
+        request_parties.len() >= required_deliveries,
+        "deposit allocation has {} request recipients, requires f+1={required_deliveries}",
+        request_parties.len()
+    );
+    let request = fresh_deposit_request()?;
+    let expected_created_at = admitted_at
+        .checked_add(DEPOSIT_ALLOCATION_ISSUANCE_LEAD_SECONDS)
+        .context("scheduled deposit creation time overflow")?;
+    let expected_expires_at = expected_created_at
+        .checked_add(UNUSED_ALLOCATION_TTL_SECONDS)
+        .context("scheduled deposit expiry overflow")?;
+    let deadline = tokio::time::Instant::now() + client.protocol_timeout;
+    let mut observations = BTreeMap::<PartyId, String>::new();
+    let mut valid_pending = BTreeSet::new();
+    loop {
+        for request_party in &request_parties {
+            let observation = match client
+                .post_deposit::<_, DepositHttpResponse>(
+                    *request_party,
+                    "/v1/deposits/allocate",
+                    &request,
+                )
+                .await
+            {
+                Ok(response)
+                    if deposit_status_reached_current_epoch(
+                        &response,
+                        DepositHttpStatus::Pending,
+                        public,
+                        fault_bound,
+                    ) && response.created_at.is_some() =>
+                {
+                    match validate_scheduled_deposit_response(
+                        scenario,
+                        public,
+                        fault_bound,
+                        request,
+                        expected_created_at,
+                        expected_expires_at,
+                        &response,
+                    ) {
+                        Ok(()) => {
+                            valid_pending.insert(*request_party);
+                            if valid_pending.len() >= required_deliveries {
+                                return Ok(ScheduledDeposit {
+                                    request,
+                                    created_at: expected_created_at,
+                                    expires_at: expected_expires_at,
+                                });
+                            }
+                            format!(
+                                "request party {request_party} accepted the schedule; \
+                                 deliveries={}/{required_deliveries}",
+                                valid_pending.len()
+                            )
+                        }
+                        Err(error) => {
+                            format!(
+                                "request party {request_party} returned invalid Pending state: {error:#}"
+                            )
+                        }
+                    }
+                }
+                Ok(response) => format!(
+                    "request party {request_party} returned {:?} leader={} created_at={:?}",
+                    response.status, response.leader, response.created_at
+                ),
+                Err(error) => format!("request party {request_party} failed: {error:#}"),
+            };
+            observations.insert(*request_party, observation);
+            anyhow::ensure!(
+                tokio::time::Instant::now() < deadline,
+                "deposit allocation was not durably scheduled before its visibility boundary: \
+                 {observations:?}"
+            );
+        }
+        tokio::time::sleep(client.poll_interval).await;
+    }
+}
+
+fn validate_scheduled_deposit_response(
+    scenario: &Scenario,
+    public: &EpochPublic,
+    fault_bound: u16,
+    request: DepositAddressRequest,
+    expected_created_at: u64,
+    expected_expires_at: u64,
+    response: &DepositHttpResponse,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(response.request == request.request);
+    anyhow::ensure!(response.certified_request == tenant_certified_request_id(request));
+    anyhow::ensure!(response.status == DepositHttpStatus::Pending);
+    validate_serving_deposit_registry(response, public, fault_bound)?;
+    anyhow::ensure!(
+        response.address.is_none() && response.certificate.is_none(),
+        "pending deposit leaked its address or allocation certificate"
+    );
+    anyhow::ensure!(response.created_at == Some(expected_created_at));
+    anyhow::ensure!(response.expires_at == Some(expected_expires_at));
+    anyhow::ensure!(
+        expected_expires_at.checked_sub(expected_created_at) == Some(UNUSED_ALLOCATION_TTL_SECONDS)
+    );
+    let issuer =
+        response.allocation_issuer.as_ref().context("pending deposit omitted allocation issuer")?;
+    issuer.validate()?;
+    anyhow::ensure!(
+        issuer.issuer() == response.serving_registry.active(),
+        "pending deposit allocation issuer differs from its serving registry"
+    );
+    anyhow::ensure!(
+        issuer.terminal().is_none(),
+        "pending deposit returned a terminal allocation issuer"
+    );
+    anyhow::ensure!(
+        scenario.network == NetworkKind::Regtest,
+        "scheduled deposit validation is restricted to Regtest"
+    );
+    Ok(())
+}
+
+async fn wait_for_scheduled_deposit_active(
+    scenario: &Scenario,
+    client: &PartyClient,
+    public: &EpochPublic,
+    fault_bound: u16,
+    faulty: &BTreeSet<PartyId>,
+    scheduled: ScheduledDeposit,
+) -> anyhow::Result<(CertifiedDeposit, Vec<PartyId>)> {
+    let committee = &public.committee;
+    anyhow::ensure!(fault_bound < committee.n());
+    let required = usize::from(committee.n() - fault_bound);
+    let responsive = committee
+        .members
+        .iter()
+        .map(|member| member.id)
+        .filter(|party| !faulty.contains(party))
+        .collect::<Vec<_>>();
+    anyhow::ensure!(responsive.len() >= required, "not enough responsive deposit replicas");
+    let deadline = tokio::time::Instant::now() + client.protocol_timeout;
+    let mut observations = BTreeMap::<PartyId, String>::new();
+    loop {
+        let mut groups = Vec::<EqualObservationGroup<ValidatedDepositAllocationCandidate>>::new();
+        let mut responses = BTreeMap::<PartyId, ValidatedDepositAllocationResponse>::new();
+        for party in &responsive {
+            let response = match client
+                .post_deposit::<_, DepositHttpResponse>(
+                    *party,
+                    "/v1/deposits/status",
+                    &scheduled.request,
+                )
+                .await
+            {
+                Ok(response) => response,
+                Err(error) => {
+                    observations.insert(*party, format!("status error: {error:#}"));
+                    continue;
+                }
+            };
+            observations
+                .insert(*party, format!("{:?} leader={}", response.status, response.leader));
+            if !deposit_status_reached_current_epoch(
+                &response,
+                DepositHttpStatus::Active,
+                public,
+                fault_bound,
+            ) {
+                continue;
+            }
+            let candidate = match validate_new_deposit_certificate(
+                scenario.network,
+                public,
+                fault_bound,
+                scheduled.request,
+                &response,
+            ) {
+                Ok(registry) => registry,
+                Err(error) => {
+                    observations.insert(*party, format!("invalid Active response: {error:#}"));
+                    continue;
+                }
+            };
+            if response.created_at != Some(scheduled.created_at)
+                || response.expires_at != Some(scheduled.expires_at)
+            {
+                observations
+                    .insert(*party, "Active response changed its certified schedule".to_owned());
+                continue;
+            }
+            observations.insert(*party, "valid exact Active candidate".to_owned());
+            record_equal_observation(&mut groups, *party, candidate.clone());
+            responses.insert(*party, ValidatedDepositAllocationResponse { candidate, response });
+        }
+        if let Some(certified) = certified_deposit_candidate_quorum(
+            scheduled.request,
+            &groups,
+            &responses,
+            required,
+            &BTreeSet::new(),
+        )? {
+            return Ok(certified);
+        }
+        anyhow::ensure!(
+            tokio::time::Instant::now() < deadline,
+            "scheduled deposit did not become Active on n-f exact replicas: {observations:?}"
+        );
+        tokio::time::sleep(client.poll_interval).await;
+    }
+}
+
+async fn wait_for_ttl_deposit_status(
+    client: &PartyClient,
+    public: &EpochPublic,
+    fault_bound: u16,
+    faulty: &BTreeSet<PartyId>,
+    deposit: &CertifiedDeposit,
+    expected_status: DepositHttpStatus,
+) -> anyhow::Result<Vec<PartyId>> {
+    let committee = &public.committee;
+    anyhow::ensure!(fault_bound < committee.n());
+    anyhow::ensure!(
+        matches!(
+            expected_status,
+            DepositHttpStatus::Active | DepositHttpStatus::Expired | DepositHttpStatus::Permanent
+        ),
+        "focused deposit-TTL observation requested a non-terminal visibility status"
+    );
+    let required = usize::from(committee.n() - fault_bound);
+    let responsive = committee
+        .members
+        .iter()
+        .map(|member| member.id)
+        .filter(|party| !faulty.contains(party))
+        .collect::<Vec<_>>();
+    anyhow::ensure!(responsive.len() >= required, "not enough responsive deposit replicas");
+    let deadline = tokio::time::Instant::now() + client.protocol_timeout;
+    let mut observations = BTreeMap::<PartyId, String>::new();
+    loop {
+        let mut groups =
+            Vec::<EqualObservationGroup<(CompactEpochRegistry, VerifiedIssuerWindow)>>::new();
+        for party in &responsive {
+            let response = match client
+                .post_deposit::<_, DepositHttpResponse>(
+                    *party,
+                    "/v1/deposits/status",
+                    &deposit.request,
+                )
+                .await
+            {
+                Ok(response) => response,
+                Err(error) => {
+                    observations.insert(*party, format!("status error: {error:#}"));
+                    continue;
+                }
+            };
+            observations
+                .insert(*party, format!("{:?} leader={}", response.status, response.leader));
+            if !deposit_status_reached_current_epoch(
+                &response,
+                expected_status,
+                public,
+                fault_bound,
+            ) {
+                continue;
+            }
+            match validate_ttl_replica_response(
+                public,
+                fault_bound,
+                *party,
+                deposit,
+                expected_status,
+                &response,
+            ) {
+                Ok(authority) => record_equal_observation(&mut groups, *party, authority),
+                Err(error) => {
+                    observations.insert(*party, format!("invalid response: {error:#}"));
+                }
+            }
+        }
+        if let Some(group) = equal_observation_quorum(&groups, required, &BTreeSet::new())? {
+            return Ok(group.parties.iter().copied().collect());
+        }
+        anyhow::ensure!(
+            tokio::time::Instant::now() < deadline,
+            "deposit did not reach {expected_status:?} on n-f replicas; observations: {observations:?}"
+        );
+        tokio::time::sleep(client.poll_interval).await;
+    }
+}
+
+fn validate_ttl_replica_response(
+    public: &EpochPublic,
+    fault_bound: u16,
+    party: PartyId,
+    deposit: &CertifiedDeposit,
+    expected_status: DepositHttpStatus,
+    response: &DepositHttpResponse,
+) -> anyhow::Result<(CompactEpochRegistry, VerifiedIssuerWindow)> {
+    anyhow::ensure!(response.status == expected_status);
+    validate_serving_deposit_registry(response, public, fault_bound)?;
+    anyhow::ensure!(response.request == deposit.response.request);
+    anyhow::ensure!(response.certified_request == deposit.response.certified_request);
+    anyhow::ensure!(response.created_at == deposit.response.created_at);
+    anyhow::ensure!(response.expires_at == deposit.response.expires_at);
+    let issuer = validate_response_allocation_issuer(response, &deposit.allocation_issuer)?;
+    match expected_status {
+        DepositHttpStatus::Active | DepositHttpStatus::Permanent => {
+            anyhow::ensure!(response.address == deposit.response.address);
+            let certificate = response
+                .certificate
+                .as_ref()
+                .with_context(|| format!("party {party} omitted its deposit certificate"))?;
+            validate_replica_deposit_certificate(party, deposit, certificate, issuer)?;
+        }
+        DepositHttpStatus::Expired => {
+            let retained = deposit
+                .response
+                .certificate
+                .as_ref()
+                .context("expired deposit omitted its retained allocation certificate")?;
+            validate_replica_deposit_certificate(party, deposit, retained, issuer)?;
+            anyhow::ensure!(
+                response.address.is_none() && response.certificate.is_none(),
+                "party {party} leaked an expired address or allocation certificate"
+            );
+        }
+        DepositHttpStatus::Syncing | DepositHttpStatus::Pending => {
+            anyhow::bail!("focused deposit-TTL validation received a non-visible status")
+        }
+    }
+    Ok((response.serving_registry.clone(), issuer.clone()))
+}
+
+fn deposit_ttl_allocation_facts(
+    deposit: &CertifiedDeposit,
+) -> anyhow::Result<DepositTtlAllocationFacts> {
+    let address =
+        deposit.response.address.as_ref().context("certified deposit omitted its address")?;
+    let certificate = deposit
+        .response
+        .certificate
+        .as_ref()
+        .context("certified deposit omitted its certificate")?;
+    let LedgerPayload::Allocation(allocation) = &certificate.statement.payload else {
+        anyhow::bail!("certified deposit statement is not an allocation");
+    };
+    anyhow::ensure!(allocation.address == *address);
+    let index = address.index();
+    Ok(DepositTtlAllocationFacts {
+        request: deposit.response.request.0,
+        sequence: certificate.statement.sequence,
+        account: index.account(),
+        address_index: index.address(),
+        address: address.as_str().to_owned(),
+        created_at: deposit
+            .response
+            .created_at
+            .context("certified deposit omitted creation time")?,
+        expires_at: deposit.response.expires_at.context("certified deposit omitted expiry time")?,
+        statement: certificate.statement.digest(),
+    })
+}
+
+fn validate_deposit_ttl_acceptance_facts(
+    clock: [u64; 6],
+    unused: &DepositTtlAllocationFacts,
+    permanent: &DepositTtlAllocationFacts,
+    replacement: &DepositTtlAllocationFacts,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(clock.iter().all(|value| *value > 0), "deposit clock contains zero");
+    anyhow::ensure!(
+        clock.windows(2).all(|window| window[0] < window[1]),
+        "deposit clock generations are not strictly monotonic"
+    );
+    anyhow::ensure!(
+        clock[0].checked_add(DEPOSIT_ALLOCATION_ISSUANCE_LEAD_SECONDS) == Some(clock[1])
+            && clock[1].checked_add(DEPOSIT_ALLOCATION_ISSUANCE_LEAD_SECONDS) == Some(clock[2]),
+        "deposit allocations did not use the exact sixty-second issuance lead"
+    );
+    let unused_expiry =
+        clock[1].checked_add(UNUSED_ALLOCATION_TTL_SECONDS).context("unused expiry overflow")?;
+    let permanent_expiry =
+        clock[2].checked_add(UNUSED_ALLOCATION_TTL_SECONDS).context("permanent expiry overflow")?;
+    anyhow::ensure!(
+        clock[3].checked_add(1) == Some(unused_expiry)
+            && clock[4] == unused_expiry
+            && clock[5] == permanent_expiry
+            && clock[4].checked_add(DEPOSIT_ALLOCATION_ISSUANCE_LEAD_SECONDS) == Some(clock[5]),
+        "deposit clock does not encode expiry-minus-one, exact expiry, and funded expiry exactly"
+    );
+    anyhow::ensure!(
+        unused.created_at == clock[1] && unused.expires_at == clock[4],
+        "unused allocation timestamps do not match the controlled clock"
+    );
+    anyhow::ensure!(
+        permanent.created_at == clock[2] && permanent.expires_at == clock[5],
+        "funded allocation timestamps do not match the controlled clock"
+    );
+    anyhow::ensure!(
+        replacement.created_at == clock[5]
+            && replacement.expires_at
+                == clock[5]
+                    .checked_add(UNUSED_ALLOCATION_TTL_SECONDS)
+                    .context("replacement expiry overflow")?,
+        "replacement allocation timestamps do not match the controlled clock"
+    );
+    anyhow::ensure!(
+        unused.sequence < permanent.sequence && permanent.sequence < replacement.sequence,
+        "replacement allocation did not advance the durable ledger sequence"
+    );
+    anyhow::ensure!(
+        unused.account == permanent.account
+            && permanent.account == replacement.account
+            && unused.address_index < permanent.address_index
+            && permanent.address_index < replacement.address_index,
+        "replacement allocation did not advance the permanent subaddress index"
+    );
+    anyhow::ensure!(
+        unused.address != permanent.address
+            && permanent.address != replacement.address
+            && unused.address != replacement.address,
+        "deposit allocation reused a canonical Monero address"
+    );
+    anyhow::ensure!(
+        unused.request != permanent.request
+            && permanent.request != replacement.request
+            && unused.request != replacement.request,
+        "deposit allocation reused an external idempotency key"
+    );
+    anyhow::ensure!(
+        unused.statement != permanent.statement
+            && permanent.statement != replacement.statement
+            && unused.statement != replacement.statement,
+        "deposit allocation reused a ledger statement"
     );
     Ok(())
 }
@@ -1331,82 +2519,133 @@ async fn allocate_certified_deposit(
     faulty: &BTreeSet<PartyId>,
 ) -> anyhow::Result<CertifiedDeposit> {
     let committee = &public.committee;
-    let request_party = allocation_request_party(committee, faulty)?;
+    let request_parties = allocation_request_parties(committee, fault_bound, faulty)?;
+    let required = usize::from(committee.n() - fault_bound);
+    let required_parties = required_recovered_party()?.into_iter().collect::<BTreeSet<_>>();
+    anyhow::ensure!(
+        required_parties.iter().all(|party| request_parties.contains(party)),
+        "required recovered party is not a responsive deposit request party"
+    );
     let request = fresh_deposit_request()?;
-    let deadline = tokio::time::Instant::now() + client.protocol_timeout;
+    // One view timeout cannot also cover leader replacement, the independent portable
+    // checkpoint, and the allocation's deliberately delayed release.
+    let deadline = tokio::time::Instant::now()
+        + deposit_allocation_acceptance_timeout(client.protocol_timeout)?;
+    let mut observations = BTreeMap::<PartyId, String>::new();
     loop {
-        let observation = match client
-            .post_deposit::<_, DepositHttpResponse>(
-                request_party,
-                "/v1/deposits/allocate",
-                &request,
-            )
-            .await
-        {
-            Ok(response) if response.status == DepositHttpStatus::Active => {
-                let issuer_registry = validate_new_deposit_certificate(
-                    scenario,
-                    public,
-                    fault_bound,
-                    request,
-                    &response,
-                )?;
-                let certified = CertifiedDeposit {
-                    request,
-                    response,
-                    issuer_registry,
-                    funded_output: None,
-                    funded_amount: None,
-                };
-                wait_for_deposit_status(
-                    client,
-                    committee,
-                    fault_bound,
-                    faulty,
-                    &certified,
-                    DepositHttpStatus::Active,
+        let mut groups = Vec::<EqualObservationGroup<ValidatedDepositAllocationCandidate>>::new();
+        let mut responses = BTreeMap::<PartyId, ValidatedDepositAllocationResponse>::new();
+        for request_party in &request_parties {
+            match client
+                .post_deposit::<_, DepositHttpResponse>(
+                    *request_party,
+                    "/v1/deposits/allocate",
+                    &request,
                 )
-                .await?;
-                return Ok(certified);
+                .await
+            {
+                Ok(response) if response.status == DepositHttpStatus::Active => {
+                    match validate_new_deposit_certificate(
+                        scenario.network,
+                        public,
+                        fault_bound,
+                        request,
+                        &response,
+                    ) {
+                        Ok(candidate) => {
+                            observations
+                                .insert(*request_party, "valid exact Active candidate".to_owned());
+                            record_equal_observation(
+                                &mut groups,
+                                *request_party,
+                                candidate.clone(),
+                            );
+                            responses.insert(
+                                *request_party,
+                                ValidatedDepositAllocationResponse { candidate, response },
+                            );
+                        }
+                        Err(error) => {
+                            observations.insert(
+                                *request_party,
+                                format!(
+                                    "request party {request_party} returned an invalid Active state: \
+                                     {error:#}"
+                                ),
+                            );
+                        }
+                    }
+                }
+                Ok(response) => {
+                    observations.insert(
+                        *request_party,
+                        format!("request party {request_party} returned {:?}", response.status),
+                    );
+                }
+                Err(error) => {
+                    observations.insert(
+                        *request_party,
+                        format!("request party {request_party} failed: {error:#}"),
+                    );
+                }
             }
-            Ok(response) => {
-                format!("request party {request_party} returned {:?}", response.status)
-            }
-            Err(error) => format!("request party {request_party} failed: {error:#}"),
-        };
+        }
+        if let Some((certified, _)) = certified_deposit_candidate_quorum(
+            request,
+            &groups,
+            &responses,
+            required,
+            &required_parties,
+        )? {
+            return Ok(certified);
+        }
         anyhow::ensure!(
             tokio::time::Instant::now() < deadline,
-            "deposit allocation did not reach a certified active state: {observation}"
+            "deposit allocation did not reach an n-f exact certified active state: \
+             {observations:?}"
         );
         tokio::time::sleep(client.poll_interval).await;
     }
 }
 
-fn allocation_request_party(
+fn allocation_request_parties(
     committee: &Committee,
+    fault_bound: u16,
     faulty: &BTreeSet<PartyId>,
-) -> anyhow::Result<PartyId> {
-    committee
+) -> anyhow::Result<Vec<PartyId>> {
+    anyhow::ensure!(
+        fault_bound < committee.n(),
+        "deposit allocation fault bound exhausts its committee"
+    );
+    let parties = committee
         .members
         .iter()
         .map(|member| member.id)
-        .find(|party| !faulty.contains(party))
-        .context("deposit committee has no responsive request party")
+        .filter(|party| !faulty.contains(party))
+        .collect::<Vec<_>>();
+    let required = usize::from(committee.n() - fault_bound);
+    anyhow::ensure!(
+        parties.len() >= required,
+        "deposit committee has {} responsive request parties, requires n-f={required}",
+        parties.len()
+    );
+    Ok(parties)
 }
 
 fn validate_new_deposit_certificate(
-    scenario: &Scenario,
+    network: NetworkKind,
     public: &EpochPublic,
     fault_bound: u16,
     request: DepositAddressRequest,
     response: &DepositHttpResponse,
-) -> anyhow::Result<CompactEpochRegistry> {
+) -> anyhow::Result<ValidatedDepositAllocationCandidate> {
     anyhow::ensure!(response.request == request.request);
     anyhow::ensure!(response.certified_request == tenant_certified_request_id(request));
     anyhow::ensure!(response.status == DepositHttpStatus::Active);
+    validate_serving_deposit_registry(response, public, fault_bound)?;
     let address = response.address.as_ref().context("active deposit omitted address")?;
     address.validate()?;
-    anyhow::ensure!(address.network() == scenario.network);
+    anyhow::ensure!(address.network() == network);
     let certificate =
         response.certificate.as_ref().context("active deposit omitted certificate")?;
     let created_at = response.created_at.context("active deposit omitted creation time")?;
@@ -1415,19 +2654,16 @@ fn validate_new_deposit_certificate(
         expires_at.checked_sub(created_at) == Some(UNUSED_ALLOCATION_TTL_SECONDS),
         "deposit allocation does not use the exact thirty-day unused lifetime"
     );
-    let registry = response
-        .issuer_registry
-        .clone()
-        .context("active deposit omitted compact issuer registry")?;
-    registry.validate()?;
-    anyhow::ensure!(registry.wallet() == address.wallet_id());
-    anyhow::ensure!(registry.active_epoch() == public.committee.epoch);
-    anyhow::ensure!(registry.active().committee().digest() == public.committee.digest());
-    anyhow::ensure!(registry.active().fault_bound() == fault_bound);
-    anyhow::ensure!(registry.active().activation() == public.activation_digest()?);
-    anyhow::ensure!(registry.active().key_id() == public.key_id);
-    anyhow::ensure!(registry.active().group_key() == public.group_key_bytes());
-    let verified = certificate.verify_active(&registry, None)?;
+    let issuer =
+        response.allocation_issuer.as_ref().context("active deposit omitted allocation issuer")?;
+    issuer.validate()?;
+    anyhow::ensure!(
+        issuer.terminal().is_none(),
+        "active deposit returned a terminal allocation issuer"
+    );
+    anyhow::ensure!(issuer.issuer() == response.serving_registry.active());
+    anyhow::ensure!(issuer.issuer().wallet() == address.wallet_id());
+    let verified = certificate.verify(issuer, None)?;
     anyhow::ensure!(verified.required() == public.committee.n() - fault_bound);
     let LedgerPayload::Allocation(allocation) = &certificate.statement.payload else {
         anyhow::bail!("deposit response certificate is not an allocation");
@@ -1437,13 +2673,22 @@ fn validate_new_deposit_certificate(
     anyhow::ensure!(&allocation.address == address);
     anyhow::ensure!(allocation.created_at == created_at && allocation.expires_at == expires_at);
     anyhow::ensure!(certificate.statement.wallet == address.wallet_id());
-    Ok(registry)
+    Ok(ValidatedDepositAllocationCandidate {
+        allocation_issuer: issuer.issuer().clone(),
+        statement: certificate.statement.clone(),
+        address: address.clone(),
+        created_at,
+        expires_at,
+        serving_registry: response.serving_registry.clone(),
+        issuer: issuer.clone(),
+    })
 }
 
 fn validate_replica_deposit_certificate(
     party: PartyId,
     deposit: &CertifiedDeposit,
     observed: &CertifiedLedgerEntry,
+    issuer: &VerifiedIssuerWindow,
 ) -> anyhow::Result<Vec<PartyId>> {
     let expected = deposit
         .response
@@ -1454,7 +2699,9 @@ fn validate_replica_deposit_certificate(
         observed.statement == expected.statement,
         "party {party} returned a certificate for a different ledger statement"
     );
-    let verified = observed.verify_active(&deposit.issuer_registry, None)?;
+    issuer.validate()?;
+    anyhow::ensure!(issuer.issuer() == &deposit.allocation_issuer);
+    let verified = observed.verify(issuer, None)?;
     let observed_signers =
         observed.attestations.iter().map(|attestation| attestation.from).collect::<Vec<_>>();
     anyhow::ensure!(
@@ -1488,30 +2735,74 @@ fn validate_replica_deposit_certificate(
 async fn wait_for_permanent_deposit(
     _scenario: &Scenario,
     client: &PartyClient,
-    committee: &Committee,
+    public: &EpochPublic,
     fault_bound: u16,
     faulty: &BTreeSet<PartyId>,
     deposit: &CertifiedDeposit,
 ) -> anyhow::Result<()> {
     wait_for_deposit_status(
         client,
-        committee,
+        public,
         fault_bound,
         faulty,
         deposit,
         DepositHttpStatus::Permanent,
+        client.protocol_timeout,
+    )
+    .await
+}
+
+fn deposit_allocation_acceptance_timeout(
+    protocol_timeout: std::time::Duration,
+) -> anyhow::Result<std::time::Duration> {
+    // Initial view (1), backed-off replacement view (2), then checkpoint (1).
+    protocol_timeout
+        .checked_mul(4)
+        .and_then(|timeout| {
+            timeout.checked_add(std::time::Duration::from_secs(
+                DEPOSIT_ALLOCATION_ISSUANCE_LEAD_SECONDS,
+            ))
+        })
+        .context("deposit allocation acceptance timeout overflowed")
+}
+
+fn deposit_handoff_acceptance_timeout(
+    protocol_timeout: std::time::Duration,
+) -> anyhow::Result<std::time::Duration> {
+    protocol_timeout
+        .checked_mul(DEPOSIT_HANDOFF_ACCEPTANCE_WINDOWS)
+        .context("deposit handoff acceptance timeout overflowed")
+}
+
+async fn wait_for_permanent_deposit_after_handoff(
+    client: &PartyClient,
+    public: &EpochPublic,
+    fault_bound: u16,
+    faulty: &BTreeSet<PartyId>,
+    deposit: &CertifiedDeposit,
+) -> anyhow::Result<()> {
+    wait_for_deposit_status(
+        client,
+        public,
+        fault_bound,
+        faulty,
+        deposit,
+        DepositHttpStatus::Permanent,
+        deposit_handoff_acceptance_timeout(client.protocol_timeout)?,
     )
     .await
 }
 
 async fn wait_for_deposit_status(
     client: &PartyClient,
-    committee: &Committee,
+    public: &EpochPublic,
     fault_bound: u16,
     faulty: &BTreeSet<PartyId>,
     deposit: &CertifiedDeposit,
     expected_status: DepositHttpStatus,
+    observation_timeout: std::time::Duration,
 ) -> anyhow::Result<()> {
+    let committee = &public.committee;
     anyhow::ensure!(fault_bound < committee.n());
     let required = usize::from(committee.n() - fault_bound);
     let responsive = committee
@@ -1529,13 +2820,11 @@ async fn wait_for_deposit_status(
             committee.epoch
         );
     }
-    let expected_leader =
-        committee.members.first().map(|member| member.id).context("deposit committee is empty")?;
-    let deadline = tokio::time::Instant::now() + client.protocol_timeout;
+    let deadline = tokio::time::Instant::now() + observation_timeout;
     let mut observations = BTreeMap::<PartyId, String>::new();
     loop {
-        let mut matching = 0_usize;
-        let mut recovered_party_matching = recovered_party.is_none();
+        let mut groups =
+            Vec::<EqualObservationGroup<(CompactEpochRegistry, VerifiedIssuerWindow)>>::new();
         for party in &responsive {
             match client
                 .post_deposit::<_, DepositHttpResponse>(
@@ -1550,43 +2839,73 @@ async fn wait_for_deposit_status(
                         *party,
                         format!("{:?} leader={}", response.status, response.leader),
                     );
-                    // The certificate below remains the immutable historical allocation from
-                    // epoch zero, while `leader` is routing metadata for the deposit registry's
-                    // currently active issuer. Threshold-key activation can race ahead of the
-                    // durable deposit handoff, so an old leader is a retryable convergence state.
+                    // The certificate below remains the immutable historical allocation, while
+                    // `leader` is routing metadata for the active consensus view. A legitimate
+                    // view change may select any member of the expected committee; the exact
+                    // request, schedule, allocation issuer, and certificate remain checked below.
                     if !deposit_status_reached_current_epoch(
-                        response.status,
-                        response.leader,
+                        &response,
                         expected_status,
-                        expected_leader,
+                        public,
+                        fault_bound,
                     ) {
                         continue;
                     }
-                    anyhow::ensure!(response.request == deposit.response.request);
-                    anyhow::ensure!(
-                        response.certified_request == deposit.response.certified_request
-                    );
-                    anyhow::ensure!(response.address == deposit.response.address);
-                    anyhow::ensure!(response.created_at == deposit.response.created_at);
-                    anyhow::ensure!(response.expires_at == deposit.response.expires_at);
-                    let certificate = response.certificate.as_ref().with_context(|| {
-                        format!("party {party} omitted its deposit certificate")
-                    })?;
-                    let signers =
-                        validate_replica_deposit_certificate(*party, deposit, certificate)?;
+                    let validated = match (|| -> anyhow::Result<_> {
+                        anyhow::ensure!(
+                            response.request == deposit.response.request,
+                            "response names another request"
+                        );
+                        anyhow::ensure!(
+                            response.certified_request == deposit.response.certified_request,
+                            "response names another certified request"
+                        );
+                        anyhow::ensure!(
+                            response.address == deposit.response.address,
+                            "response names another address"
+                        );
+                        anyhow::ensure!(
+                            response.created_at == deposit.response.created_at
+                                && response.expires_at == deposit.response.expires_at,
+                            "response changed the allocation schedule"
+                        );
+                        let issuer = validate_response_allocation_issuer(
+                            &response,
+                            &deposit.allocation_issuer,
+                        )?;
+                        let certificate = response
+                            .certificate
+                            .as_ref()
+                            .context("response omitted certificate")?;
+                        let signers = validate_replica_deposit_certificate(
+                            *party,
+                            deposit,
+                            certificate,
+                            issuer,
+                        )?;
+                        Ok((signers, (response.serving_registry.clone(), issuer.clone())))
+                    })() {
+                        Ok(validated) => validated,
+                        Err(error) => {
+                            observations
+                                .insert(*party, format!("invalid/non-candidate status: {error:#}"));
+                            continue;
+                        }
+                    };
+                    let (signers, authority) = validated;
                     observations.insert(
                         *party,
                         format!("{:?} certificate_signers={signers:?}", response.status),
                     );
-                    matching = matching.saturating_add(1);
-                    recovered_party_matching |= Some(*party) == recovered_party;
+                    record_equal_observation(&mut groups, *party, authority);
                 }
                 Err(error) => {
                     observations.insert(*party, format!("status error: {error:#}"));
                 }
             }
         }
-        if matching >= required && recovered_party_matching {
+        let required_parties = recovered_party.into_iter().collect::<BTreeSet<_>>();
+        if equal_observation_quorum(&groups, required, &required_parties)?.is_some() {
             return Ok(());
         }
         anyhow::ensure!(
@@ -1597,13 +2916,66 @@ async fn wait_for_deposit_status(
     }
 }
 
+fn validate_serving_deposit_registry(
+    response: &DepositHttpResponse,
+    expected: &EpochPublic,
+    fault_bound: u16,
+) -> anyhow::Result<()> {
+    expected.validate()?;
+    let registry = &response.serving_registry;
+    registry.validate()?;
+    let active = registry.active();
+    anyhow::ensure!(registry.active_epoch() == expected.committee.epoch);
+    anyhow::ensure!(active.committee() == &expected.committee);
+    anyhow::ensure!(active.fault_bound() == fault_bound);
+    anyhow::ensure!(active.activation() == expected.activation_digest()?);
+    anyhow::ensure!(active.key_id() == expected.key_id);
+    anyhow::ensure!(active.group_key() == expected.group_key_bytes());
+    active.committee().member(response.leader)?;
+    Ok(())
+}
+
+fn validate_response_allocation_issuer<'a>(
+    response: &'a DepositHttpResponse,
+    expected: &ActiveIssuer,
+) -> anyhow::Result<&'a VerifiedIssuerWindow> {
+    let window =
+        response.allocation_issuer.as_ref().context("response omitted allocation issuer")?;
+    window.validate()?;
+    anyhow::ensure!(
+        window.issuer() == expected,
+        "response returned another immutable allocation issuer"
+    );
+    let serving_epoch = response.serving_registry.active_epoch();
+    anyhow::ensure!(
+        serving_epoch >= expected.epoch(),
+        "serving registry predates the allocation issuer"
+    );
+    if serving_epoch > expected.epoch() {
+        let terminal =
+            window.terminal().context("historical allocation issuer omitted its terminal seal")?;
+        anyhow::ensure!(
+            terminal.successor_epoch
+                == expected.epoch().checked_add(1).context("allocation issuer epoch overflow")?,
+            "allocation issuer terminal seal names another successor"
+        );
+    } else {
+        anyhow::ensure!(
+            window.terminal().is_none(),
+            "current allocation issuer unexpectedly retained a terminal seal"
+        );
+    }
+    Ok(window)
+}
+
 fn deposit_status_reached_current_epoch(
-    observed_status: DepositHttpStatus,
-    observed_leader: PartyId,
+    response: &DepositHttpResponse,
     expected_status: DepositHttpStatus,
-    expected_leader: PartyId,
+    expected: &EpochPublic,
+    fault_bound: u16,
 ) -> bool {
-    observed_status == expected_status && observed_leader == expected_leader
+    response.status == expected_status
+        && validate_serving_deposit_registry(response, expected, fault_bound).is_ok()
 }
 
 fn consolidation_fault_gate_enabled() -> anyhow::Result<bool> {
@@ -1830,7 +3202,7 @@ async fn maybe_pause_before_consolidation_bootstrap(
 
 fn validate_consolidation_bootstrap_recovery(
     pending: &PendingConsolidationBootstrapFault,
-    status: &PublicConsolidationStatus,
+    status: &ObservedConsolidation,
     committee: &Committee,
     fault_bound: u16,
 ) -> anyhow::Result<ConsolidationBootstrapProof> {
@@ -1889,16 +3261,13 @@ fn validate_consolidation_bootstrap_recovery(
 
 fn validate_consolidation_bootstrap_stability(
     proof: &ConsolidationBootstrapProof,
-    status: &PublicConsolidationStatus,
+    status: &ObservedConsolidation,
 ) -> anyhow::Result<()> {
     anyhow::ensure!(status.sweep == proof.sweep);
-    anyhow::ensure!(status.bootstrap_ba_view == proof.certified_ba_view);
-    anyhow::ensure!(status.bootstrap_ba_proposer == proof.certified_proposer);
     anyhow::ensure!(
         status.bootstrap_prepared_intent_digest == proof.certified_prepared_intent_digest
     );
     anyhow::ensure!(status.bootstrap_certificate_digest == proof.certificate_digest);
-    anyhow::ensure!(status.bootstrap_certificate_signers == proof.certificate_signers);
     anyhow::ensure!(
         status.roast_view == 0,
         "outer ROAST view changed after the bootstrap proposer had already rejoined"
@@ -1919,11 +3288,13 @@ async fn complete_consolidation_bootstrap_fault_before_signing(
     let required = usize::from(committee.n() - fault_bound);
     let mut bootstrap_faulty = faulty.clone();
     bootstrap_faulty.insert(pending.fault_party);
+    let no_required_gate_parties = BTreeSet::new();
     let (held_authorization, _) = wait_for_consolidation_fault_gate_state(
         client,
         committee,
         AcceptanceConsolidationGateState::Held,
         required,
+        &no_required_gate_parties,
     )
     .await?;
     let held_authorization = held_authorization
@@ -1975,15 +3346,20 @@ async fn complete_consolidation_bootstrap_fault_before_signing(
     let all_parties = committee.members.iter().map(|member| member.id).collect::<BTreeSet<_>>();
     // Docker restarts the stopped proposer and releases only its still-durable bootstrap gate.
     wait_for_consolidation_bootstrap_released(client, committee, &all_parties).await?;
+    let rejoined_required_parties = BTreeSet::from([pending.fault_party]);
     let (rejoined_authorization, held_parties) = wait_for_consolidation_fault_gate_state(
         client,
         committee,
         AcceptanceConsolidationGateState::Held,
-        committee.members.len(),
+        required,
+        &rejoined_required_parties,
     )
     .await?;
     anyhow::ensure!(rejoined_authorization == Some(held_authorization));
-    anyhow::ensure!(held_parties == all_parties);
+    anyhow::ensure!(
+        held_parties.len() >= required && held_parties.contains(&pending.fault_party),
+        "bootstrap proposer did not rejoin the n-f held-authorization observation"
+    );
     let rejoined = wait_for_consolidation_phase(
         client,
         committee,
@@ -1994,7 +3370,10 @@ async fn complete_consolidation_bootstrap_fault_before_signing(
         PublicConsolidationPhase::Reserved,
     )
     .await?;
-    anyhow::ensure!(rejoined == reserved);
+    anyhow::ensure!(
+        rejoined.same_quorum_decision(&reserved),
+        "rejoined bootstrap replicas changed the certified consolidation decision"
+    );
     validate_consolidation_bootstrap_stability(&proof, &rejoined)?;
     println!(
         "TM_ACCEPTANCE_CONSOLIDATION_BOOTSTRAP_REJOINED party={} bootstrap_ba_view={} roast_view={} authorization={}",
@@ -2011,7 +3390,8 @@ async fn complete_consolidation_bootstrap_fault_before_signing(
         client,
         committee,
         AcceptanceConsolidationGateState::Released,
-        committee.members.len(),
+        required,
+        &rejoined_required_parties,
     )
     .await?;
     Ok(proof)
@@ -2053,15 +3433,20 @@ async fn wait_for_consolidation_fault_gate_state(
     committee: &Committee,
     expected: AcceptanceConsolidationGateState,
     required: usize,
+    required_parties: &BTreeSet<PartyId>,
 ) -> anyhow::Result<(Option<ConsolidationId>, BTreeSet<PartyId>)> {
     anyhow::ensure!(required > 0 && required <= committee.members.len());
+    for party in required_parties {
+        committee.member(*party).with_context(|| {
+            format!("required consolidation-gate observer {party} is not a committee member")
+        })?;
+    }
     let deadline = tokio::time::Instant::now() + client.protocol_timeout;
     let request =
         AcceptanceConsolidationGateRequest { action: AcceptanceConsolidationGateAction::Status };
     let mut observations = BTreeMap::<PartyId, String>::new();
     loop {
-        let mut matching = 0_usize;
-        let mut agreed_authorization = None;
+        let mut held_groups = Vec::<EqualObservationGroup<ConsolidationId>>::new();
         let mut matching_parties = BTreeSet::new();
         for member in &committee.members {
             let response = match client
@@ -2078,7 +3463,6 @@ async fn wait_for_consolidation_fault_gate_state(
                     continue;
                 }
             };
-            anyhow::ensure!(response.party == member.id);
             observations.insert(
                 member.id,
                 format!(
@@ -2086,33 +3470,76 @@ async fn wait_for_consolidation_fault_gate_state(
                     response.state, response.authorization, response.roast_view
                 ),
             );
-            if response.state != expected {
-                continue;
-            }
-            if expected == AcceptanceConsolidationGateState::Held {
+            let authorization = match (|| -> anyhow::Result<Option<ConsolidationId>> {
+                anyhow::ensure!(
+                    response.party == member.id,
+                    "gate status endpoint returned another party ID"
+                );
+                if response.state != expected {
+                    return Ok(None);
+                }
+                if expected != AcceptanceConsolidationGateState::Held {
+                    anyhow::ensure!(
+                        response.authorization.is_none() && response.roast_view.is_none(),
+                        "inactive consolidation gate retained authorization or ROAST state"
+                    );
+                    return Ok(None);
+                }
                 let authorization = response
                     .authorization
                     .context("held consolidation gate omitted its authorization")?;
-                anyhow::ensure!(authorization.0 != [0; 32]);
-                anyhow::ensure!(response.roast_view == Some(0));
-                if let Some(agreed) = agreed_authorization {
-                    anyhow::ensure!(
-                        agreed == authorization,
-                        "held gates disagree on authorization"
-                    );
-                } else {
-                    agreed_authorization = Some(authorization);
+                anyhow::ensure!(
+                    authorization.0 != [0; 32],
+                    "held consolidation gate returned a zero authorization"
+                );
+                anyhow::ensure!(
+                    response.roast_view == Some(0),
+                    "held consolidation gate did not remain at ROAST view zero"
+                );
+                Ok(Some(authorization))
+            })() {
+                Ok(authorization) => authorization,
+                Err(error) => {
+                    observations
+                        .insert(member.id, format!("invalid/non-candidate gate status: {error:#}"));
+                    continue;
                 }
+            };
+            if response.state != expected {
+                continue;
             }
-            matching = matching.saturating_add(1);
-            matching_parties.insert(member.id);
+            if let Some(authorization) = authorization {
+                record_equal_observation(&mut held_groups, member.id, authorization);
+            } else {
+                matching_parties.insert(member.id);
+            }
         }
-        if matching >= required {
-            return Ok((agreed_authorization, matching_parties));
+        if expected == AcceptanceConsolidationGateState::Held {
+            if let Some(group) =
+                equal_observation_quorum(&held_groups, required, &required_parties)?
+            {
+                return Ok((Some(group.value), group.parties.clone()));
+            }
+        } else if matching_parties.len() >= required
+            && required_parties.is_subset(&matching_parties)
+        {
+            return Ok((None, matching_parties));
         }
+        let held_group_summary = held_groups
+            .iter()
+            .enumerate()
+            .map(|(index, group)| {
+                format!(
+                    "group {index}: authorization={} parties={}",
+                    hex::encode(group.value.0),
+                    format_party_list(&group.parties.iter().copied().collect::<Vec<_>>()),
+                )
+            })
+            .collect::<Vec<_>>();
         anyhow::ensure!(
             tokio::time::Instant::now() < deadline,
-            "consolidation gates did not reach {expected:?} on {required} parties; observations: {observations:?}"
+            "consolidation gates did not reach {expected:?} on {required} parties; \
+             held_groups: {held_group_summary:?}; observations: {observations:?}"
         );
         tokio::time::sleep(client.poll_interval).await;
     }
@@ -2136,11 +3563,13 @@ async fn maybe_pause_before_consolidation_signing(
     }
     anyhow::ensure!(fault_bound > 0, "consolidation omission requires a positive fault bound");
     let required = usize::from(committee.n() - fault_bound);
+    let no_required_gate_parties = BTreeSet::new();
     let (held_authorization, held_parties) = wait_for_consolidation_fault_gate_state(
         client,
         committee,
         AcceptanceConsolidationGateState::Held,
         required,
+        &no_required_gate_parties,
     )
     .await?;
     let held_authorization = held_authorization
@@ -2198,7 +3627,7 @@ async fn maybe_pause_before_consolidation_signing(
         initial_view: reserved.roast_view,
         initial_view_count: reserved.roast_view_count,
         initial_relay_seed: reserved.roast_relay_seed,
-        initial_signers: reserved.roast_signers,
+        initial_signers: reserved.roast_signers.clone(),
         initial_intent_certificate_digest: reserved.roast_intent_certificate_digest,
         initial_attempt_binding_digest: reserved.roast_attempt_binding_digest,
     };
@@ -2224,23 +3653,25 @@ async fn maybe_pause_before_consolidation_signing(
         initial_signers = ?pending.initial_signers,
         "mature consolidation is durably held at the pre-signing fault barrier"
     );
+    let rejoined_required_parties = BTreeSet::from([pending.fault_party]);
     let _ = wait_for_consolidation_fault_gate_state(
         client,
         committee,
         AcceptanceConsolidationGateState::Released,
-        committee.members.len(),
+        required,
+        &rejoined_required_parties,
     )
     .await?;
     tracing::warn!(
         authorization = %hex::encode(pending.authorization.0),
-        "all acceptance-only consolidation gates released after fault injection"
+        "n-f acceptance-only consolidation gates, including the omitted signer, released after fault injection"
     );
     Ok(Some(pending))
 }
 
 fn validate_consolidation_fault_recovery(
     pending: &PendingConsolidationFault,
-    broadcast: &PublicConsolidationStatus,
+    broadcast: &ObservedConsolidation,
 ) -> anyhow::Result<ConsolidationFaultProof> {
     anyhow::ensure!(
         broadcast.roast_view > pending.initial_view,
@@ -2299,8 +3730,9 @@ fn validate_consolidation_fault_recovery(
 }
 
 async fn maybe_pause_after_consolidation_fault_settlement(
+    client: &PartyClient,
     proof: &ConsolidationFaultProof,
-    confirmed: &PublicConsolidationStatus,
+    confirmed: &ObservedConsolidation,
 ) -> anyhow::Result<()> {
     anyhow::ensure!(confirmed.phase == PublicConsolidationPhase::Confirmed);
     anyhow::ensure!(confirmed.roast_view == proof.completed_view);
@@ -2313,7 +3745,43 @@ async fn maybe_pause_after_consolidation_fault_settlement(
     anyhow::ensure!(
         confirmed.roast_attempt_binding_digest == proof.completed_attempt_binding_digest
     );
-    let pause_seconds = acceptance_barrier_seconds("consolidation settlement")?;
+    let signed = confirmed
+        .signed
+        .context("confirmed consolidation omitted its signed transaction binding")?;
+    let confirmation = confirmed
+        .confirmation
+        .context("confirmed consolidation omitted its canonical confirmation point")?;
+    let proof_bytes = postcard::to_allocvec(proof)?;
+    let status_bytes = postcard::to_allocvec(confirmed)?;
+    let mut material = Vec::with_capacity(
+        1 + std::mem::size_of::<u64>() * 2 + proof_bytes.len() + status_bytes.len(),
+    );
+    material.push(1);
+    material.extend_from_slice(&(proof_bytes.len() as u64).to_le_bytes());
+    material.extend_from_slice(&proof_bytes);
+    material.extend_from_slice(&(status_bytes.len() as u64).to_le_bytes());
+    material.extend_from_slice(&status_bytes);
+    let kind = AcceptanceDriverLatchKind::ConsolidationPeerReconnect;
+    let binding = acceptance_driver_binding(kind, &material);
+    let armed: AcceptanceDriverLatchResponse = client
+        .post_admin(
+            proof.fault_party,
+            "/v1/acceptance/driver-latch",
+            &AcceptanceDriverLatchRequest {
+                action: AcceptanceConsolidationGateAction::Arm,
+                kind,
+                binding,
+            },
+        )
+        .await?;
+    anyhow::ensure!(
+        armed.party == proof.fault_party
+            && armed.state == AcceptanceConsolidationGateState::Held
+            && armed.kind == Some(kind)
+            && armed.binding == Some(binding)
+            && armed.event_unix_ms.is_none(),
+        "omitted signer held a different consolidation-reconnect latch"
+    );
     println!(
         "TM_ACCEPTANCE_CONSOLIDATION_FAULT_SETTLED fault_party={} initial_view={} completed_view={} completed_view_count={} completed_relay_seed={} completed_signers={} intent_certificate={} attempt_binding={} key_image_binding={} key_image_unsigned_transaction={} key_image_authorizers={} key_image_quorum={}",
         proof.fault_party,
@@ -2329,6 +3797,14 @@ async fn maybe_pause_after_consolidation_fault_settlement(
         format_party_list(&confirmed.key_image_authorizers),
         confirmed.key_image_authorization_quorum,
     );
+    println!(
+        "TM_ACCEPTANCE_CONSOLIDATION_PEER_RECONNECT_LATCH_HELD party={} txid={} confirmation_height={} confirmation_hash={} binding={}",
+        proof.fault_party,
+        hex::encode(signed.transaction()),
+        confirmation.height,
+        hex::encode(confirmation.hash),
+        hex::encode(binding),
+    );
     {
         use std::io::Write as _;
         std::io::stdout().flush()?;
@@ -2337,26 +3813,68 @@ async fn maybe_pause_after_consolidation_fault_settlement(
         fault_party = %proof.fault_party,
         completed_view = proof.completed_view,
         completed_signers = ?proof.completed_signers,
-        pause_seconds,
-        "fault-resilient consolidation settled; pausing for peer-QUIC reconnection"
+        binding = %hex::encode(binding),
+        "fault-resilient consolidation settled; awaiting authenticated peer-QUIC reconnection release"
     );
-    tokio::time::sleep(std::time::Duration::from_secs(pause_seconds)).await;
+    wait_for_authenticated_driver_release(client, proof.fault_party, kind, binding).await?;
+    println!(
+        "TM_ACCEPTANCE_CONSOLIDATION_PEER_RECONNECT_LATCH_RELEASED party={} txid={} binding={}",
+        proof.fault_party,
+        hex::encode(signed.transaction()),
+        hex::encode(binding),
+    );
     Ok(())
-}
-
-fn acceptance_barrier_seconds(kind: &str) -> anyhow::Result<u64> {
-    let pause_seconds = std::env::var("TM_ACCEPTANCE_BARRIER_SECONDS")
-        .unwrap_or_else(|_| "30".to_owned())
-        .parse::<u64>()?;
-    anyhow::ensure!(
-        (1..=120).contains(&pause_seconds),
-        "{kind} fault barrier pause must be between 1 and 120 seconds"
-    );
-    Ok(pause_seconds)
 }
 
 fn format_party_list(parties: &[PartyId]) -> String {
     parties.iter().map(ToString::to_string).collect::<Vec<_>>().join(",")
+}
+
+fn certified_deposit_inputs(deposit: &CertifiedDeposit) -> anyhow::Result<Vec<WalletOutputId>> {
+    anyhow::ensure!(!deposit.funded_outputs.is_empty(), "deposit output evidence is missing");
+    let mut inputs =
+        deposit.funded_outputs.iter().map(|output| output.id).collect::<Vec<WalletOutputId>>();
+    inputs.sort_unstable();
+    anyhow::ensure!(
+        inputs.windows(2).all(|pair| pair[0] != pair[1]),
+        "deposit output evidence contains a duplicate wallet output"
+    );
+    Ok(inputs)
+}
+
+fn certified_deposit_total(deposit: &CertifiedDeposit) -> anyhow::Result<u64> {
+    deposit.funded_outputs.iter().try_fold(0_u64, |total, output| {
+        total
+            .checked_add(output.amount_atomic_units)
+            .context("certified deposit input amount overflow")
+    })
+}
+
+fn assign_certified_input_ring(
+    ring_position: usize,
+    ring_candidates: &[Vec<WalletOutputId>],
+    visited_outputs: &mut BTreeSet<WalletOutputId>,
+    input_ring_mapping: &mut BTreeMap<WalletOutputId, usize>,
+) -> bool {
+    for output in &ring_candidates[ring_position] {
+        if !visited_outputs.insert(*output) {
+            continue;
+        }
+        let can_assign = match input_ring_mapping.get(output).copied() {
+            None => true,
+            Some(displaced_ring) => assign_certified_input_ring(
+                displaced_ring,
+                ring_candidates,
+                visited_outputs,
+                input_ring_mapping,
+            ),
+        };
+        if can_assign {
+            input_ring_mapping.insert(*output, ring_position);
+            return true;
+        }
+    }
+    false
 }
 
 fn deterministic_roast_signers(
@@ -2368,6 +3886,16 @@ fn deterministic_roast_signers(
         .map_err(Into::into)
 }
 
+fn consolidation_phase_satisfies_observer(
+    actual: PublicConsolidationPhase,
+    expected: PublicConsolidationPhase,
+) -> bool {
+    // Polling can miss Broadcast when an earlier maturity-block advance already mined the tx.
+    actual == expected
+        || (expected == PublicConsolidationPhase::Broadcast
+            && actual == PublicConsolidationPhase::Confirmed)
+}
+
 async fn wait_for_consolidation_phase(
     client: &PartyClient,
     committee: &Committee,
@@ -2376,8 +3904,13 @@ async fn wait_for_consolidation_phase(
     deposit: &CertifiedDeposit,
     expected_destination: [u8; 32],
     expected_phase: PublicConsolidationPhase,
-) -> anyhow::Result<PublicConsolidationStatus> {
+) -> anyhow::Result<ObservedConsolidation> {
     anyhow::ensure!(fault_bound < committee.n());
+    let expected_inputs = certified_deposit_inputs(deposit)?;
+    let queried_output =
+        *expected_inputs.first().context("certified deposit has no consolidation output")?;
+    let status_request =
+        DepositConsolidationStatusRequest { request: deposit.request, output: queried_output };
     let required = usize::from(committee.n() - fault_bound);
     let responsive = committee
         .members
@@ -2397,15 +3930,13 @@ async fn wait_for_consolidation_phase(
     let deadline = tokio::time::Instant::now() + client.protocol_timeout;
     let mut observations = BTreeMap::<PartyId, String>::new();
     loop {
-        let mut agreed = None::<PublicConsolidationStatus>;
-        let mut matching = 0_usize;
-        let mut recovered_party_matching = recovered_party.is_none();
+        let mut decision_groups = Vec::<(ObservedConsolidation, usize, bool, Vec<PartyId>)>::new();
         for party in &responsive {
             let response = match client
                 .post_deposit::<_, DepositConsolidationStatusResponse>(
                     *party,
                     "/v1/deposits/consolidations/status",
-                    &deposit.request,
+                    &status_request,
                 )
                 .await
             {
@@ -2415,31 +3946,50 @@ async fn wait_for_consolidation_phase(
                     continue;
                 }
             };
-            anyhow::ensure!(response.request == deposit.request.request);
-            anyhow::ensure!(
-                response.certified_request == tenant_certified_request_id(deposit.request)
-            );
-            let funded = deposit.funded_output.context("deposit output evidence is missing")?;
-            let candidates = response
-                .consolidations
-                .into_iter()
-                .filter(|status| status.plan.inputs.contains(&funded.id))
-                .collect::<Vec<_>>();
-            anyhow::ensure!(
-                candidates.len() <= 1,
-                "party {party} reported multiple consolidations claiming one deposit output"
-            );
-            let Some(status) = candidates.into_iter().next() else {
-                observations.insert(*party, "not discovered".to_owned());
-                continue;
+            let status = match (|| -> anyhow::Result<ObservedConsolidation> {
+                anyhow::ensure!(
+                    response.request == deposit.request.request,
+                    "response names another request"
+                );
+                anyhow::ensure!(
+                    response.certified_request == tenant_certified_request_id(deposit.request),
+                    "response names another certified request"
+                );
+                anyhow::ensure!(
+                    response.output == queried_output,
+                    "response names another deposit output"
+                );
+                let status = response
+                    .consolidation
+                    .context("consolidation is not discovered on this replica")?;
+                let status = ObservedConsolidation::from_public(status)?;
+                anyhow::ensure!(
+                    status.plan.inputs.as_slice() == expected_inputs.as_slice(),
+                    "consolidation did not claim the queried deposit set"
+                );
+                validate_public_consolidation(
+                    &status,
+                    committee,
+                    fault_bound,
+                    deposit,
+                    expected_destination,
+                )?;
+                anyhow::ensure!(
+                    !matches!(
+                        status.phase,
+                        PublicConsolidationPhase::Quarantined | PublicConsolidationPhase::Aborted
+                    ),
+                    "consolidation entered terminal failure phase {:?}",
+                    status.phase
+                );
+                Ok(status)
+            })() {
+                Ok(status) => status,
+                Err(error) => {
+                    observations.insert(*party, format!("invalid/non-candidate status: {error:#}"));
+                    continue;
+                }
             };
-            validate_public_consolidation(
-                &status,
-                committee,
-                fault_bound,
-                deposit,
-                expected_destination,
-            )?;
             observations.insert(
                 *party,
                 format!(
@@ -2468,56 +4018,73 @@ async fn wait_for_consolidation_phase(
                     hex::encode(status.roast_endorsed_evidence_digest),
                 ),
             );
-            anyhow::ensure!(
-                !matches!(
-                    status.phase,
-                    PublicConsolidationPhase::Quarantined | PublicConsolidationPhase::Aborted
-                ),
-                "consolidation entered terminal failure phase {:?}",
-                status.phase
-            );
-            if status.phase != expected_phase {
+            if !consolidation_phase_satisfies_observer(status.phase, expected_phase) {
                 continue;
             }
-            if let Some(expected) = &agreed {
-                anyhow::ensure!(
-                    expected == &status,
-                    "party {party} reported conflicting public consolidation state"
-                );
+            if let Some((_, count, recovered, parties)) = decision_groups
+                .iter_mut()
+                .find(|(candidate, _, _, _)| candidate.same_quorum_decision(&status))
+            {
+                *count = count.saturating_add(1);
+                *recovered |= Some(*party) == recovered_party;
+                parties.push(*party);
             } else {
-                agreed = Some(status);
+                decision_groups.push((
+                    status,
+                    1,
+                    recovered_party.is_none() || Some(*party) == recovered_party,
+                    vec![*party],
+                ));
             }
-            matching = matching.saturating_add(1);
-            recovered_party_matching |= Some(*party) == recovered_party;
         }
-        if matching >= required && recovered_party_matching {
-            return agreed.context("consolidation quorum omitted its agreed state");
+        if let Some((agreed, _, _, _)) =
+            decision_groups.iter().find(|(_, count, recovered, _)| *count >= required && *recovered)
+        {
+            return Ok(agreed.clone());
         }
+        let decision_summary = decision_groups
+            .iter()
+            .enumerate()
+            .map(|(index, (_, count, _, parties))| {
+                format!("group {index}: replicas={} parties={}", count, format_party_list(parties))
+            })
+            .collect::<Vec<_>>();
         anyhow::ensure!(
             tokio::time::Instant::now() < deadline,
-            "consolidation did not reach {expected_phase:?} on n-f replicas; observations: {observations:?}"
+            "consolidation did not reach {expected_phase:?} on n-f replicas; \
+             decisions: {decision_summary:?}; observations: {observations:?}"
         );
         tokio::time::sleep(client.poll_interval).await;
     }
 }
 
-/// Require the exact already-validated confirmation record to survive a committee transition and
-/// be served byte-for-byte by `n-f` members of the new active committee. The immutable plan and
-/// its certificates remain bound to the committee that signed them; equality with the original
-/// fully validated record is therefore the correct handoff predicate instead of reinterpreting
-/// its signer roster under the successor epoch.
+/// Require the exact witness-independent portable terminal and ledger statements to survive a
+/// committee transition on `n-f` members. Different valid witness subsets are not treated as
+/// forks; the observation quorum, rather than those representation bytes, establishes agreement.
+/// Hot worker/coordinator/ROAST diagnostics may already have been compacted and are deliberately
+/// not part of this handoff predicate.
 async fn wait_for_confirmed_consolidation_checkpoint(
-    scenario: &Scenario,
+    _scenario: &Scenario,
     client: &PartyClient,
-    committee: &Committee,
+    public: &EpochPublic,
     fault_bound: u16,
     faulty: &BTreeSet<PartyId>,
     deposit: &CertifiedDeposit,
-    expected: &PublicConsolidationStatus,
+    expected: &ObservedConsolidation,
 ) -> anyhow::Result<()> {
-    wait_for_permanent_deposit(scenario, client, committee, fault_bound, faulty, deposit).await?;
+    wait_for_permanent_deposit_after_handoff(client, public, fault_bound, faulty, deposit).await?;
+    let committee = &public.committee;
     anyhow::ensure!(expected.phase == PublicConsolidationPhase::Confirmed);
-    let funded = deposit.funded_output.context("deposit output evidence is missing")?;
+    let expected_inputs = certified_deposit_inputs(deposit)?;
+    let queried_output =
+        *expected_inputs.first().context("certified deposit has no consolidation output")?;
+    let status_request =
+        DepositConsolidationStatusRequest { request: deposit.request, output: queried_output };
+    expected
+        .0
+        .portable
+        .as_ref()
+        .context("confirmed consolidation omitted portable terminal evidence")?;
     let required = usize::from(committee.n() - fault_bound);
     let responsive = committee
         .members
@@ -2547,7 +4114,7 @@ async fn wait_for_confirmed_consolidation_checkpoint(
                 .post_deposit::<_, DepositConsolidationStatusResponse>(
                     *party,
                     "/v1/deposits/consolidations/status",
-                    &deposit.request,
+                    &status_request,
                 )
                 .await
             {
@@ -2557,31 +4124,30 @@ async fn wait_for_confirmed_consolidation_checkpoint(
                     continue;
                 }
             };
-            anyhow::ensure!(response.request == deposit.request.request);
-            anyhow::ensure!(
-                response.certified_request == tenant_certified_request_id(deposit.request)
-            );
-            let candidates = response
-                .consolidations
-                .into_iter()
-                .filter(|status| status.plan.inputs.contains(&funded.id))
-                .collect::<Vec<_>>();
-            anyhow::ensure!(
-                candidates.len() <= 1,
-                "party {party} reported multiple checkpoint consolidations for one deposit"
-            );
-            let Some(status) = candidates.into_iter().next() else {
+            if response.request != deposit.request.request
+                || response.certified_request != tenant_certified_request_id(deposit.request)
+                || response.output != queried_output
+            {
+                observations.insert(*party, "response names another request or output".to_owned());
+                continue;
+            }
+            let Some(status) = response.consolidation else {
                 observations.insert(*party, "not handed off".to_owned());
                 continue;
             };
-            if &status != expected {
-                observations.insert(
-                    *party,
-                    format!("conflicting {:?} epoch-{} plan", status.phase, status.plan.epoch),
-                );
+            if !same_portable_consolidation_decision(&status, &expected.0) {
+                observations
+                    .insert(*party, "conflicting portable terminal or ledger statement".to_owned());
                 continue;
             }
-            observations.insert(*party, "exact confirmed record".to_owned());
+            observations.insert(
+                *party,
+                if status.live.is_some() {
+                    "same portable decision with live diagnostics".to_owned()
+                } else {
+                    "same compacted portable decision".to_owned()
+                },
+            );
             matching = matching.saturating_add(1);
             recovered_party_matching |= Some(*party) == recovered_party;
         }
@@ -2611,17 +4177,17 @@ async fn wait_for_confirmed_consolidation_checkpoint(
 async fn wait_for_deposit_checkpoint(
     scenario: &Scenario,
     client: &PartyClient,
-    committee: &Committee,
+    public: &EpochPublic,
     fault_bound: u16,
     faulty: &BTreeSet<PartyId>,
     deposit: &CertifiedDeposit,
-    confirmed: Option<&PublicConsolidationStatus>,
+    confirmed: Option<&ObservedConsolidation>,
 ) -> anyhow::Result<()> {
     if let Some(confirmed) = confirmed {
         wait_for_confirmed_consolidation_checkpoint(
             scenario,
             client,
-            committee,
+            public,
             fault_bound,
             faulty,
             deposit,
@@ -2629,7 +4195,7 @@ async fn wait_for_deposit_checkpoint(
         )
         .await
     } else {
-        wait_for_permanent_deposit(scenario, client, committee, fault_bound, faulty, deposit).await
+        wait_for_permanent_deposit_after_handoff(client, public, fault_bound, faulty, deposit).await
     }
 }
 
@@ -2660,6 +4226,7 @@ async fn exercise_successor_epoch_signing(
 
     let mut deposit =
         allocate_certified_deposit(scenario, client, public, fault_bound, faulty).await?;
+    tracing::info!(epoch = public.committee.epoch, "successor epoch deposit allocation certified");
     let deposit_address = MoneroAddress::from_str(
         monero_network(scenario.network),
         deposit
@@ -2676,31 +4243,41 @@ async fn exercise_successor_epoch_signing(
         funding_address,
         funding_height,
         &deposit_address,
+        1,
+        false,
         scenario.deposit_maximum_fee_atomic_units,
         scenario.poll_interval_ms,
         scenario.protocol_timeout_seconds,
     )
     .await?;
-    let (funded_output, funded_amount) = verify_deposit_transaction_output(
+    let funded_output = verify_deposit_transaction_outputs(
         daemon,
         threshold_view,
         deposit_block,
         &deposit,
         deposit_transaction,
+        1,
     )
-    .await?;
+    .await?
+    .into_iter()
+    .next()
+    .context("successor funding omitted its deposit output")?;
     validate_consolidation_fixture_economics(
-        funded_amount,
+        funded_output.amount_atomic_units,
         scenario.deposit_maximum_fee_atomic_units,
     )?;
-    deposit.funded_output = Some(funded_output);
-    deposit.funded_amount = Some(funded_amount);
+    deposit.funded_outputs.push(funded_output);
+    tracing::info!(
+        epoch = public.committee.epoch,
+        txid = %hex::encode(deposit_transaction),
+        "successor epoch deposit funding mined and independently verified"
+    );
 
     for _ in 1..scenario.confirmation_blocks {
         daemon.generate_blocks(threshold_address, 1).await?;
     }
-    wait_for_permanent_deposit(scenario, client, &public.committee, fault_bound, faulty, &deposit)
-        .await?;
+    wait_for_permanent_deposit(scenario, client, public, fault_bound, faulty, &deposit).await?;
+    tracing::info!(epoch = public.committee.epoch, "successor epoch deposit became permanent");
 
     // The worker's confirmed horizon trails the daemon by confirmation_depth - 1. Advancing the
     // chain through the normal Monero lock window makes this exact output eligible for a sweep.
@@ -2723,11 +4300,12 @@ async fn exercise_successor_epoch_signing(
         daemon,
         threshold_address,
         signed.transaction(),
+        usize::try_from(broadcast.plan.at_tip.height)?,
         scenario.poll_interval_ms,
         scenario.protocol_timeout_seconds,
     )
     .await?;
-    let confirmation_height = u64::try_from(daemon.latest_block_number().await?)?;
+    let confirmation_height = u64::try_from(containing_block.number())?;
     let confirmation = ChainPoint::new(confirmation_height, containing_block.hash())?;
     let accepted_transaction = verify_consolidation_transaction(
         daemon,
@@ -2738,6 +4316,12 @@ async fn exercise_successor_epoch_signing(
     )
     .await?;
     let exact_transaction_bytes = accepted_transaction.serialize();
+    let input_count = broadcast.plan.inputs.len();
+    anyhow::ensure!(
+        input_count == 1,
+        "epoch-{} single-deposit acceptance unexpectedly consolidated {input_count} inputs",
+        public.committee.epoch,
+    );
 
     for _ in 1..scenario.confirmation_blocks {
         daemon.generate_blocks(threshold_address, 1).await?;
@@ -2756,8 +4340,8 @@ async fn exercise_successor_epoch_signing(
     expected_confirmed.phase = PublicConsolidationPhase::Confirmed;
     expected_confirmed.confirmation = Some(confirmation);
     anyhow::ensure!(
-        confirmed == expected_confirmed,
-        "epoch-{} confirmation changed the certified signing transcript",
+        confirmed.same_quorum_decision(&expected_confirmed),
+        "epoch-{} confirmation changed the witness-independent certified signing decision",
         public.committee.epoch
     );
     anyhow::ensure!(
@@ -2777,19 +4361,20 @@ async fn exercise_successor_epoch_signing(
     Ok(SuccessorEpochSigningAcceptance {
         epoch: public.committee.epoch,
         transaction: signed.transaction(),
+        input_count,
         exact_transaction_bytes,
     })
 }
 
 fn validate_public_consolidation(
-    status: &PublicConsolidationStatus,
+    status: &ObservedConsolidation,
     committee: &Committee,
     fault_bound: u16,
     deposit: &CertifiedDeposit,
     expected_destination: [u8; 32],
 ) -> anyhow::Result<()> {
-    let funded = deposit.funded_output.context("deposit output evidence is missing")?;
-    let amount = deposit.funded_amount.context("deposit amount evidence is missing")?;
+    let expected_inputs = certified_deposit_inputs(deposit)?;
+    let amount = certified_deposit_total(deposit)?;
     let wallet = deposit
         .response
         .address
@@ -2800,7 +4385,10 @@ fn validate_public_consolidation(
     anyhow::ensure!(status.sweep == status.plan.id && status.sweep.0 != [0_u8; 32]);
     anyhow::ensure!(status.plan.wallet == wallet);
     anyhow::ensure!(status.plan.epoch == committee.epoch);
-    anyhow::ensure!(status.plan.inputs.as_slice() == [funded.id]);
+    anyhow::ensure!(
+        status.plan.inputs.as_slice() == expected_inputs.as_slice(),
+        "consolidation plan did not claim every exact certified deposit input"
+    );
     anyhow::ensure!(status.plan.total_input_atomic_units == amount);
     anyhow::ensure!(status.plan.destination_binding == expected_destination);
     anyhow::ensure!(status.destination_binding == expected_destination);
@@ -2853,10 +4441,10 @@ fn validate_public_consolidation(
     );
     anyhow::ensure!(
         usize::from(status.roast_view_count)
-            == usize::try_from(status.roast_view)?
+            >= usize::try_from(status.roast_view)?
                 .checked_add(1)
                 .context("ROAST view count overflow")?,
-        "consolidation ROAST view count does not include exactly the current view chain"
+        "consolidation ROAST view count does not include its winning view"
     );
     let relay_index = usize::try_from(status.roast_view)? % status.roast_signers.len();
     anyhow::ensure!(
@@ -2903,6 +4491,27 @@ fn validate_public_consolidation(
         anyhow::ensure!(
             status.certificate_digest.is_some_and(|digest| digest != [0; 32]),
             "certified consolidation lacks its completion certificate digest"
+        );
+        let portable = status
+            .0
+            .portable
+            .as_ref()
+            .context("certified consolidation lacks its exact portable terminal evidence")?;
+        anyhow::ensure!(
+            portable.terminal.sweep_id() == status.sweep
+                && portable.terminal.inputs() == expected_inputs.as_slice()
+                && Some(portable.current_certificate.statement.digest())
+                    == status.certificate_digest,
+            "portable terminal does not match the live certified consolidation"
+        );
+        anyhow::ensure!(
+            portable
+                .current_certificate
+                .attestations
+                .iter()
+                .map(|attestation| attestation.from)
+                .eq(status.completion_certificate_signers.iter().copied()),
+            "portable and live completion certificate signer rosters differ"
         );
         anyhow::ensure!(
             status.roast_candidate_count > 0 && status.roast_endorsed_candidate_count > 0,
@@ -2997,6 +4606,15 @@ fn validate_consolidation_fixture_economics(
     Ok(())
 }
 
+fn successor_acceptance_funding_height(
+    funding_start_height: usize,
+    epoch: u64,
+) -> anyhow::Result<usize> {
+    anyhow::ensure!(epoch > 0, "successor funding requires a nonzero epoch");
+    let successor_offset = usize::try_from(epoch)?;
+    funding_start_height.checked_add(successor_offset).context("successor funding height overflow")
+}
+
 fn acceptance_funding_wallet(
     network: Network,
 ) -> anyhow::Result<(Zeroizing<Scalar>, ViewPair, MoneroAddress)> {
@@ -3011,6 +4629,32 @@ fn acceptance_funding_wallet(
     Ok((spend, pair, address))
 }
 
+/// Inspect the wallet crate's public `SignableTransaction` encoding before any signature or
+/// publication. Monero requires a change output and the wallet deliberately shuffles it with the
+/// payment. The focused TTL contract needs a canonical output identifier (`txid:0`), so its
+/// private-Regtest-only call samples a fresh outgoing-view seed until the actual payment is first.
+fn signable_transaction_starts_with_payment(
+    signable: &SignableTransaction,
+) -> anyhow::Result<bool> {
+    let encoded = Zeroizing::new(signable.serialize());
+    let mut cursor = std::io::Cursor::new(encoded.as_slice());
+    let _rct_type = monero_wallet::io::read_byte(&mut cursor)?;
+    let mut outgoing_view_key = Zeroizing::new([0_u8; 32]);
+    std::io::Read::read_exact(&mut cursor, outgoing_view_key.as_mut())?;
+    let input_count = <usize as monero_wallet::io::VarInt>::read(&mut cursor)?;
+    anyhow::ensure!(
+        input_count == 1,
+        "acceptance funding transaction unexpectedly encoded {input_count} inputs"
+    );
+    OutputWithDecoys::read(&mut cursor)?;
+    let payment_count = <usize as monero_wallet::io::VarInt>::read(&mut cursor)?;
+    anyhow::ensure!(
+        payment_count == 2,
+        "focused one-payment funding transaction unexpectedly encoded {payment_count} outputs"
+    );
+    Ok(monero_wallet::io::read_byte(&mut cursor)? == 0)
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn fund_deposit_with_ordinary_transaction(
     daemon: &MoneroDaemon<SimpleRequestTransport>,
@@ -3019,10 +4663,20 @@ async fn fund_deposit_with_ordinary_transaction(
     mining_address: &MoneroAddress,
     funding_start_height: usize,
     deposit_address: &MoneroAddress,
+    deposit_output_count: usize,
+    require_deposit_output_zero: bool,
     maximum_consolidation_fee: u64,
     poll_interval_ms: u64,
     timeout_seconds: u64,
 ) -> anyhow::Result<(monero_wallet::block::Block, [u8; 32], Vec<u8>)> {
+    anyhow::ensure!(
+        (1..=INITIAL_ACCEPTANCE_DEPOSIT_OUTPUTS).contains(&deposit_output_count),
+        "acceptance funding output count is outside 1..={INITIAL_ACCEPTANCE_DEPOSIT_OUTPUTS}"
+    );
+    anyhow::ensure!(
+        !require_deposit_output_zero || deposit_output_count == 1,
+        "a fixed deposit output index is available only to the focused one-output Regtest fixture"
+    );
     let latest = daemon.latest_block_number().await?;
     let latest_block = daemon.block_by_number(latest).await?;
     anyhow::ensure!(
@@ -3045,40 +4699,61 @@ async fn fund_deposit_with_ordinary_transaction(
     let deposit_amount = maximum_consolidation_fee
         .checked_add(1_000_000_000)
         .context("acceptance deposit amount overflow")?;
-    let required_input = deposit_amount
+    let deposit_total = deposit_amount
+        .checked_mul(u64::try_from(deposit_output_count)?)
+        .context("acceptance aggregate deposit amount overflow")?;
+    let required_input = deposit_total
         .checked_add(maximum_consolidation_fee)
         .context("acceptance funding requirement overflow")?;
     anyhow::ensure!(
         funding_amount > required_input,
-        "mature funding output {funding_amount} cannot cover deposit {deposit_amount} plus \
+        "mature funding output {funding_amount} cannot cover deposits {deposit_total} plus \
          consolidation-fee headroom {maximum_consolidation_fee}"
     );
 
     let mut rng = OsRng;
     let input = OutputWithDecoys::new(&mut rng, daemon, 16, latest, funding_output).await?;
     let fee_rate = daemon.fee_rate(FeePriority::Unimportant, u64::MAX).await?;
-    let mut outgoing_view_key = Zeroizing::new([0_u8; 32]);
-    rng.fill_bytes(outgoing_view_key.as_mut());
-    anyhow::ensure!(
-        outgoing_view_key.as_ref() != &[0_u8; 32],
-        "sampled a zero acceptance outgoing-view seed"
-    );
-    let signable = SignableTransaction::new(
-        RctType::ClsagBulletproofPlus,
-        outgoing_view_key,
-        vec![input],
-        vec![(*deposit_address, deposit_amount)],
-        Change::new(funding_view.clone(), None),
-        vec![],
-        fee_rate,
-    )?;
+    let signable = {
+        let mut selected = None;
+        for _ in 0..256 {
+            let mut outgoing_view_key = Zeroizing::new([0_u8; 32]);
+            rng.fill_bytes(outgoing_view_key.as_mut());
+            if outgoing_view_key.as_ref() == &[0_u8; 32] {
+                continue;
+            }
+            let candidate = SignableTransaction::new(
+                RctType::ClsagBulletproofPlus,
+                outgoing_view_key,
+                vec![input.clone()],
+                vec![(*deposit_address, deposit_amount); deposit_output_count],
+                Change::new(funding_view.clone(), None),
+                vec![],
+                fee_rate,
+            )?;
+            if !require_deposit_output_zero || signable_transaction_starts_with_payment(&candidate)?
+            {
+                selected = Some(candidate);
+                break;
+            }
+        }
+        selected.context(
+            "failed to construct a focused Regtest funding transaction with deposit output zero",
+        )?
+    };
     let signed = signable.sign(&mut rng, funding_spend)?;
     let transaction = signed.hash();
     let locally_signed_bytes = signed.serialize();
     daemon.publish_transaction(&signed).await?;
-    let containing_block =
-        mine_confirmation(daemon, mining_address, transaction, poll_interval_ms, timeout_seconds)
-            .await?;
+    let containing_block = mine_confirmation(
+        daemon,
+        mining_address,
+        transaction,
+        latest,
+        poll_interval_ms,
+        timeout_seconds,
+    )
+    .await?;
     let daemon_transaction = daemon.transaction(transaction).await?;
     let daemon_bytes = daemon_transaction.serialize();
     anyhow::ensure!(daemon_transaction.hash() == transaction);
@@ -3103,9 +4778,20 @@ async fn verify_consolidation_transaction(
     view: &ViewPair,
     block: monero_wallet::block::Block,
     deposit: &CertifiedDeposit,
-    status: &PublicConsolidationStatus,
+    status: &ObservedConsolidation,
 ) -> anyhow::Result<Transaction> {
-    let funded = deposit.funded_output.context("deposit output evidence is missing")?;
+    let expected_inputs = certified_deposit_inputs(deposit)?;
+    let mut expected_by_global_index = BTreeMap::<u64, WalletOutputId>::new();
+    for output in &deposit.funded_outputs {
+        anyhow::ensure!(
+            expected_by_global_index.insert(output.index_on_blockchain, output.id).is_none(),
+            "two certified deposit outputs share one global output index"
+        );
+    }
+    anyhow::ensure!(
+        expected_by_global_index.len() == expected_inputs.len(),
+        "certified deposit input/global-index evidence is incomplete"
+    );
     let signed = status.signed.context("consolidation omitted signed transaction binding")?;
     let transaction = daemon.transaction(signed.transaction()).await?;
     let bytes = transaction.serialize();
@@ -3117,23 +4803,56 @@ async fn verify_consolidation_transaction(
     );
     let prefix = transaction.prefix();
     anyhow::ensure!(prefix.inputs.len() == status.plan.inputs.len());
-    for input in &prefix.inputs {
+    anyhow::ensure!(
+        status.plan.inputs.as_slice() == expected_inputs.as_slice(),
+        "daemon transaction belongs to a plan with different certified inputs"
+    );
+    let mut ring_candidates = Vec::<Vec<WalletOutputId>>::with_capacity(prefix.inputs.len());
+    for (ring_position, input) in prefix.inputs.iter().enumerate() {
         let Input::ToKey { amount, key_offsets, key_image: _ } = input else {
             anyhow::bail!("consolidation contains a miner input");
         };
         anyhow::ensure!(amount.is_none(), "consolidation input is not RingCT");
         anyhow::ensure!(key_offsets.len() == 16, "consolidation ring size is not sixteen");
         let mut absolute = 0_u64;
-        let mut includes_deposit = false;
+        let mut certified_ring_members = Vec::<WalletOutputId>::new();
         for offset in key_offsets {
             absolute = absolute.checked_add(*offset).context("ring offset overflow")?;
-            includes_deposit |= absolute == funded.index_on_blockchain;
+            if let Some(output) = expected_by_global_index.get(&absolute) {
+                certified_ring_members.push(*output);
+            }
         }
+        certified_ring_members.sort_unstable();
+        certified_ring_members.dedup();
         anyhow::ensure!(
-            includes_deposit,
-            "consolidation ring does not contain the certified deposit output"
+            !certified_ring_members.is_empty(),
+            "consolidation input ring {ring_position} contains no certified deposit output"
+        );
+        ring_candidates.push(certified_ring_members);
+    }
+    let mut input_ring_mapping = BTreeMap::<WalletOutputId, usize>::new();
+    for ring_position in 0..ring_candidates.len() {
+        anyhow::ensure!(
+            assign_certified_input_ring(
+                ring_position,
+                &ring_candidates,
+                &mut BTreeSet::new(),
+                &mut input_ring_mapping,
+            ),
+            "transaction rings cannot be mapped bijectively to the certified deposit outputs"
         );
     }
+    anyhow::ensure!(
+        input_ring_mapping.len() == expected_inputs.len()
+            && expected_inputs.iter().all(|input| input_ring_mapping.contains_key(input)),
+        "transaction input rings do not map bijectively to every certified deposit output"
+    );
+    tracing::info!(
+        txid = %hex::encode(signed.transaction()),
+        inputs = input_ring_mapping.len(),
+        ?input_ring_mapping,
+        "daemon transaction input rings map bijectively to the certified deposit outputs"
+    );
 
     let mut scanner = Scanner::new(view.clone());
     let root_outputs = scanner
@@ -3160,15 +4879,6 @@ async fn verify_consolidation_transaction(
     Ok(transaction)
 }
 
-fn acceptance_driver_binding(kind: AcceptanceDriverLatchKind, material: &[u8]) -> [u8; 32] {
-    let mut hasher =
-        blake3::Hasher::new_derive_key("threshold-monero/e2e-acceptance-driver-binding/v1");
-    hasher.update(kind.marker().as_bytes());
-    hasher.update(&(material.len() as u64).to_le_bytes());
-    hasher.update(material);
-    *hasher.finalize().as_bytes()
-}
-
 async fn wait_for_authenticated_driver_release(
     client: &PartyClient,
     party: PartyId,
@@ -3193,7 +4903,10 @@ async fn wait_for_authenticated_driver_release(
                 anyhow::ensure!(
                     response.party == party
                         && response.kind == Some(kind)
-                        && response.binding == Some(binding),
+                        && response.binding == Some(binding)
+                        && (response.event_unix_ms.is_none()
+                            || (kind == AcceptanceDriverLatchKind::ProactiveDeadline
+                                && response.event_unix_ms.is_some_and(|event| event != 0))),
                     "party {party} reported another acceptance driver latch"
                 );
                 match response.state {
@@ -3213,24 +4926,22 @@ async fn wait_for_authenticated_driver_release(
     }
 }
 
-/// Optional Compose-only durable barrier after a real deposit is mined. The driver selects either
-/// an observer-fork latch or p2's exact `n-f` portable-output checkpoint crash gate. Neither path
-/// has a timer: only an authenticated release lets the acceptance client continue.
+/// Optional Compose-only durable barrier after a real deposit is mined. The observer-fork latch is
+/// reached immediately after inclusion, while p2's crash gate is reached only after the exact
+/// output has enough confirmations to enter an `n-f` portable checkpoint. Neither path has a
+/// timer: only an authenticated release lets the acceptance client continue.
 async fn maybe_pause_at_deposit_fault_barrier(
     client: &PartyClient,
     transaction: [u8; 32],
     output: WalletOutputId,
+    mode: Option<AcceptanceDepositFaultMode>,
 ) -> anyhow::Result<()> {
-    if std::env::var("TM_ACCEPTANCE_ENABLE_FAULT_HOOKS").as_deref() != Ok("1")
-        || std::env::var("TM_ACCEPTANCE_PAUSE_AFTER_DEPOSIT_FUNDING").as_deref() != Ok("1")
-    {
+    let Some(mode) = mode else {
         return Ok(());
-    }
+    };
     anyhow::ensure!(output.transaction == transaction);
-    let mode = std::env::var("TM_ACCEPTANCE_DEPOSIT_FAULT_MODE")
-        .context("deposit fault hook requires TM_ACCEPTANCE_DEPOSIT_FAULT_MODE")?;
-    match mode.as_str() {
-        "observer_fork" => {
+    match mode {
+        AcceptanceDepositFaultMode::ObserverFork => {
             let mut material = Vec::with_capacity(40);
             material.extend_from_slice(&transaction);
             material.extend_from_slice(&output.index_in_transaction.to_le_bytes());
@@ -3252,7 +4963,8 @@ async fn maybe_pause_at_deposit_fault_barrier(
                 armed.party == party
                     && armed.state == AcceptanceConsolidationGateState::Held
                     && armed.kind == Some(AcceptanceDriverLatchKind::ObserverFork)
-                    && armed.binding == Some(binding),
+                    && armed.binding == Some(binding)
+                    && armed.event_unix_ms.is_none(),
                 "p1 held a different observer-fault latch"
             );
             println!(
@@ -3278,7 +4990,7 @@ async fn maybe_pause_at_deposit_fault_barrier(
             );
             Ok(())
         }
-        "deposit_checkpoint" => {
+        AcceptanceDepositFaultMode::DepositCheckpoint => {
             let party = PartyId::new(2)?;
             let request = AcceptanceDepositCheckpointGateRequest {
                 action: AcceptanceConsolidationGateAction::Arm,
@@ -3372,19 +5084,21 @@ async fn maybe_pause_at_deposit_fault_barrier(
             );
             Ok(())
         }
-        value => anyhow::bail!(
-            "TM_ACCEPTANCE_DEPOSIT_FAULT_MODE must be observer_fork or deposit_checkpoint, got {value:?}"
-        ),
     }
 }
 
-async fn verify_deposit_transaction_output(
+async fn verify_deposit_transaction_outputs(
     daemon: &MoneroDaemon<SimpleRequestTransport>,
     view: &ViewPair,
     block: monero_wallet::block::Block,
     deposit: &CertifiedDeposit,
     transaction: [u8; 32],
-) -> anyhow::Result<(DepositOutputEvidence, u64)> {
+    expected_output_count: usize,
+) -> anyhow::Result<Vec<DepositOutputEvidence>> {
+    anyhow::ensure!(
+        (1..=INITIAL_ACCEPTANCE_DEPOSIT_OUTPUTS).contains(&expected_output_count),
+        "expected deposit output count is outside 1..={INITIAL_ACCEPTANCE_DEPOSIT_OUTPUTS}"
+    );
     let allocated =
         deposit.response.address.as_ref().context("certified deposit omitted its address")?.index();
     let subaddress = SubaddressIndex::new(allocated.account(), allocated.address())
@@ -3400,18 +5114,18 @@ async fn verify_deposit_transaction_output(
         })
         .collect::<Vec<_>>();
     anyhow::ensure!(
-        received.len() == 1,
-        "deposit transaction created {} outputs for the certified subaddress, expected one",
-        received.len()
+        received.len() == expected_output_count,
+        "deposit transaction created {} outputs for the certified subaddress, expected {expected_output_count}",
+        received.len(),
     );
-    let output = &received[0];
-    Ok((
-        DepositOutputEvidence {
+    Ok(received
+        .into_iter()
+        .map(|output| DepositOutputEvidence {
             id: WalletOutputId { transaction, index_in_transaction: output.index_in_transaction() },
             index_on_blockchain: output.index_on_blockchain(),
-        },
-        output.commitment().amount,
-    ))
+            amount_atomic_units: output.commitment().amount,
+        })
+        .collect())
 }
 
 async fn run_dkg(
@@ -3496,19 +5210,25 @@ async fn release_held_proactive_refresh(
             .context("TM_ACCEPTANCE_PROACTIVE_DEADLINE_SOURCE_EPOCH must be valid UTF-8")?
             .parse::<u64>()?;
         if selected == source.epoch {
-            let party = PartyId::new(2)?;
-            let due_unix_ms = *deadlines
-                .get(&party)
-                .context("proactive deadline campaign requires p2 in the transition")?;
+            let (party, due_unix_ms) = source
+                .members
+                .iter()
+                .map(|member| member.id)
+                .filter(|party| !faulty.contains(party))
+                .find_map(|party| deadlines.get(&party).copied().map(|due| (party, due)))
+                .context(
+                    "proactive deadline campaign requires one responsive certified source member",
+                )?;
             let interval_ms = acceptance_refresh_interval_millis()?;
             let released_at_unix_ms = due_unix_ms
                 .checked_sub(interval_ms)
                 .context("proactive refresh deadline precedes its configured interval")?;
-            let mut material = Vec::with_capacity(32);
+            let mut material = Vec::with_capacity(34);
             material.extend_from_slice(&source.epoch.to_le_bytes());
             material.extend_from_slice(&target.epoch.to_le_bytes());
             material.extend_from_slice(&due_unix_ms.to_le_bytes());
             material.extend_from_slice(&interval_ms.to_le_bytes());
+            material.extend_from_slice(&party.0.to_le_bytes());
             let kind = AcceptanceDriverLatchKind::ProactiveDeadline;
             let binding = acceptance_driver_binding(kind, &material);
             let armed: AcceptanceDriverLatchResponse = client
@@ -3526,11 +5246,12 @@ async fn release_held_proactive_refresh(
                 armed.party == party
                     && armed.state == AcceptanceConsolidationGateState::Held
                     && armed.kind == Some(kind)
-                    && armed.binding == Some(binding),
-                "p2 held a different proactive-deadline latch"
+                    && armed.binding == Some(binding)
+                    && armed.event_unix_ms.is_none(),
+                "party {party} held a different proactive-deadline latch"
             );
             println!(
-                "TM_ACCEPTANCE_PROACTIVE_DEADLINE_HELD party=2 source_epoch={} target_epoch={} released_at_unix_ms={} interval_ms={} due_unix_ms={} binding={}",
+                "TM_ACCEPTANCE_PROACTIVE_DEADLINE_HELD party={party} source_epoch={} target_epoch={} released_at_unix_ms={} interval_ms={} due_unix_ms={} binding={}",
                 source.epoch,
                 target.epoch,
                 released_at_unix_ms,
@@ -3544,7 +5265,7 @@ async fn release_held_proactive_refresh(
             }
             wait_for_authenticated_driver_release(client, party, kind, binding).await?;
             println!(
-                "TM_ACCEPTANCE_PROACTIVE_DEADLINE_RELEASED party=2 source_epoch={} target_epoch={} due_unix_ms={} binding={}",
+                "TM_ACCEPTANCE_PROACTIVE_DEADLINE_RELEASED party={party} source_epoch={} target_epoch={} due_unix_ms={} binding={}",
                 source.epoch,
                 target.epoch,
                 due_unix_ms,
@@ -3575,6 +5296,7 @@ async fn wait_for_configured_successor(
     old: &EpochPublic,
     new_epoch: u64,
     faulty: &BTreeSet<PartyId>,
+    required_observer: Option<PartyId>,
 ) -> anyhow::Result<EpochPublic> {
     old.validate()?;
     let expected_epoch =
@@ -3584,9 +5306,15 @@ async fn wait_for_configured_successor(
         "configured successor must be immediate epoch {expected_epoch}, requested {new_epoch}"
     );
     let policy = scenario
-        .configured_key_rotation_target_policy(&old.committee)?
+        .configured_key_rotation_target_shape(&old.committee)?
         .context("configured successor lacks a target key-rotation policy")?;
     anyhow::ensure!(policy.target_epoch() == new_epoch);
+    let required = usize::from(
+        policy
+            .desired_n()
+            .checked_sub(policy.target_fault_bound())
+            .context("configured successor fault bound exhausts its target committee")?,
+    );
     let responsive = policy
         .eligible()
         .members
@@ -3595,24 +5323,27 @@ async fn wait_for_configured_successor(
         .filter(|party| !faulty.contains(party))
         .collect::<Vec<_>>();
     anyhow::ensure!(
-        responsive.len() >= policy.selection_size(),
+        responsive.len() >= required,
         "configured epoch-{new_epoch} has {} responsive target members, requires n-f={}",
         responsive.len(),
-        policy.selection_size()
+        required
     );
+    let mut required_parties = required_recovered_party()?.into_iter().collect::<BTreeSet<_>>();
+    required_parties.extend(required_observer);
+    for recovered_party in &required_parties {
+        anyhow::ensure!(
+            responsive.contains(recovered_party),
+            "required recovered party {recovered_party} is not an eligible epoch-{new_epoch} observer"
+        );
+    }
 
     let deadline = tokio::time::Instant::now() + client.protocol_timeout;
     let mut observations = BTreeMap::<PartyId, String>::new();
     loop {
-        let mut activated = BTreeMap::<PartyId, EpochPublic>::new();
+        let mut activated = Vec::<EqualObservationGroup<EpochPublic>>::new();
         for party in &responsive {
             match client.get_admin::<PartyStatus>(*party, "/v1/status").await {
                 Ok(status) => {
-                    anyhow::ensure!(
-                        status.party == *party,
-                        "status endpoint returned another party ID"
-                    );
-                    anyhow::ensure!(status.ready, "party {party} reported that it is not ready");
                     observations.insert(
                         *party,
                         format!(
@@ -3623,29 +5354,58 @@ async fn wait_for_configured_successor(
                             status.proactive_refresh,
                         ),
                     );
-                    if let Some(observed) = status.active_epoch {
+                    let public = match (|| -> anyhow::Result<Option<EpochPublic>> {
                         anyhow::ensure!(
-                            observed <= new_epoch,
-                            "party {party} advanced past configured target epoch {new_epoch} to {observed}"
+                            status.party == *party,
+                            "status endpoint returned another party ID"
                         );
+                        anyhow::ensure!(
+                            status.ready,
+                            "party {party} reported that it is not ready"
+                        );
+                        if let Some(observed) = status.active_epoch {
+                            anyhow::ensure!(
+                                observed <= new_epoch,
+                                "party {party} advanced past configured target epoch {new_epoch} to {observed}"
+                            );
+                        }
+                        if status.active_epoch != Some(new_epoch) {
+                            return Ok(None);
+                        }
+                        let matching = status
+                            .epochs
+                            .iter()
+                            .filter(|epoch| epoch.epoch == new_epoch)
+                            .collect::<Vec<_>>();
+                        anyhow::ensure!(
+                            matching.len() == 1,
+                            "party {party} reported configured epoch {new_epoch} without exactly one public value"
+                        );
+                        let public = matching[0].public.clone();
+                        validate_configured_successor(scenario, old, &public).with_context(
+                            || {
+                                format!(
+                                    "party {party} reported an invalid configured epoch-{new_epoch}"
+                                )
+                            },
+                        )?;
+                        public.committee.member(*party).with_context(|| {
+                            format!(
+                                "party {party} is not a member of its reported epoch-{new_epoch} committee"
+                            )
+                        })?;
+                        Ok(Some(public))
+                    })() {
+                        Ok(public) => public,
+                        Err(error) => {
+                            observations
+                                .insert(*party, format!("invalid/non-candidate status: {error:#}"));
+                            continue;
+                        }
+                    };
+                    if let Some(public) = public {
+                        record_equal_observation(&mut activated, *party, public);
                     }
-                    if status.active_epoch != Some(new_epoch) {
-                        continue;
-                    }
-                    let matching = status
-                        .epochs
-                        .iter()
-                        .filter(|epoch| epoch.epoch == new_epoch)
-                        .collect::<Vec<_>>();
-                    anyhow::ensure!(
-                        matching.len() == 1,
-                        "party {party} reported configured epoch {new_epoch} without exactly one public value"
-                    );
-                    let public = matching[0].public.clone();
-                    validate_configured_successor(scenario, old, &public).with_context(|| {
-                        format!("party {party} reported an invalid configured epoch-{new_epoch}")
-                    })?;
-                    activated.insert(*party, public);
                 }
                 Err(error) => {
                     observations.insert(*party, format!("status error: {error:#}"));
@@ -3653,27 +5413,37 @@ async fn wait_for_configured_successor(
             }
         }
 
-        if activated.len() == responsive.len() {
-            let expected = activated.values().next().context("empty activated party set")?.clone();
-            for (party, public) in &activated {
-                anyhow::ensure!(
-                    public == &expected,
-                    "party {party} activated a conflicting public value for configured epoch {new_epoch}"
-                );
-            }
+        if let Some(group) = equal_observation_quorum(&activated, required, &required_parties)? {
+            let expected = group.value.clone();
+            let agreeing_parties = group.parties.clone();
+            let selected_ids =
+                expected.committee.members.iter().map(|member| member.id).collect::<BTreeSet<_>>();
             let rotated = validate_configured_successor(scenario, old, &expected)?;
             tracing::info!(
                 epoch = new_epoch,
-                parties = activated.len(),
+                parties = selected_ids.len(),
+                agreeing_parties = ?agreeing_parties,
+                omitted = responsive.len().saturating_sub(selected_ids.len()),
                 rotated_encryption_keys = rotated,
                 "configured timer-driven QUIC successor activated"
             );
             return Ok(expected);
         }
 
+        let group_summary = activated
+            .iter()
+            .enumerate()
+            .map(|(index, group)| {
+                format!(
+                    "group {index}: parties={}",
+                    format_party_list(&group.parties.iter().copied().collect::<Vec<_>>()),
+                )
+            })
+            .collect::<Vec<_>>();
         anyhow::ensure!(
             tokio::time::Instant::now() < deadline,
-            "configured epoch-{new_epoch} did not activate before the protocol deadline; observations: {observations:?}"
+            "configured epoch-{new_epoch} did not activate before the protocol deadline; \
+             groups: {group_summary:?}; observations: {observations:?}"
         );
         tokio::time::sleep(client.poll_interval).await;
     }
@@ -3687,7 +5457,7 @@ fn validate_configured_successor(
     before.validate()?;
     after.validate()?;
     let policy = scenario
-        .configured_key_rotation_target_policy(&before.committee)?
+        .configured_key_rotation_target_shape(&before.committee)?
         .context("configured successor lacks a target key-rotation policy")?;
     let eligible = policy.eligible();
     anyhow::ensure!(
@@ -3740,6 +5510,250 @@ fn validate_configured_successor(
     Ok(rotated)
 }
 
+async fn observe_active_epoch_history_link(
+    client: &PartyClient,
+    expected: &EpochPublic,
+    fault_bound: u16,
+    faulty: &BTreeSet<PartyId>,
+) -> anyhow::Result<EpochHistoryLink> {
+    expected.validate()?;
+    let committee = &expected.committee;
+    anyhow::ensure!(
+        fault_bound < committee.n(),
+        "history-link fault bound exhausts epoch-{} committee",
+        committee.epoch
+    );
+    let required = usize::from(committee.n() - fault_bound);
+    let responsive = committee
+        .members
+        .iter()
+        .map(|member| member.id)
+        .filter(|party| !faulty.contains(party))
+        .collect::<Vec<_>>();
+    anyhow::ensure!(
+        responsive.len() >= required,
+        "active epoch has {} responsive history observers, requires n-f={required}",
+        responsive.len()
+    );
+    let recovered_party = required_recovered_party()?;
+    if let Some(recovered_party) = recovered_party {
+        anyhow::ensure!(
+            responsive.contains(&recovered_party),
+            "required recovered party {recovered_party} is not a responsive epoch-{} history observer",
+            committee.epoch
+        );
+    }
+    let required_parties = recovered_party.into_iter().collect::<BTreeSet<_>>();
+    let deadline = tokio::time::Instant::now() + client.protocol_timeout;
+    let mut observations = BTreeMap::<PartyId, String>::new();
+    loop {
+        let mut links = Vec::<EqualObservationGroup<EpochHistoryLink>>::new();
+        for party in &responsive {
+            match client.get_admin::<PartyStatus>(*party, "/v1/status").await {
+                Ok(status) => {
+                    let matching = status
+                        .epochs
+                        .iter()
+                        .filter(|epoch| epoch.epoch == committee.epoch)
+                        .collect::<Vec<_>>();
+                    observations.insert(
+                        *party,
+                        format!(
+                            "active={:?}, matching_history_entries={}",
+                            status.active_epoch,
+                            matching.len()
+                        ),
+                    );
+                    let link = match (|| -> anyhow::Result<Option<EpochHistoryLink>> {
+                        anyhow::ensure!(
+                            status.party == *party,
+                            "status endpoint returned another party ID"
+                        );
+                        anyhow::ensure!(
+                            status.ready,
+                            "party {party} reported that it is not ready"
+                        );
+                        if status.active_epoch != Some(committee.epoch) {
+                            return Ok(None);
+                        }
+                        anyhow::ensure!(
+                            matching.len() == 1,
+                            "party {party} reported active epoch {} without exactly one history entry",
+                            committee.epoch
+                        );
+                        let epoch = matching[0];
+                        let _ = epoch.history_link.root()?;
+                        anyhow::ensure!(
+                            epoch.public == *expected
+                                && epoch.history_link.network() == client.network_id
+                                && epoch.history_link.epoch() == committee.epoch
+                                && epoch.history_link.key_id() == epoch.public.key_id
+                                && epoch.history_link.activation_digest()
+                                    == epoch.public.activation_digest()?,
+                            "party {party} exposed a history link for a different active public epoch"
+                        );
+                        Ok(Some(epoch.history_link))
+                    })() {
+                        Ok(link) => link,
+                        Err(error) => {
+                            observations.insert(
+                                *party,
+                                format!("invalid/non-candidate history status: {error:#}"),
+                            );
+                            continue;
+                        }
+                    };
+                    if let Some(link) = link {
+                        record_equal_observation(&mut links, *party, link);
+                    }
+                }
+                Err(error) => {
+                    observations.insert(*party, format!("status error: {error:#}"));
+                }
+            }
+        }
+        if let Some(group) = equal_observation_quorum(&links, required, &required_parties)? {
+            return Ok(group.value);
+        }
+        let group_summary = links
+            .iter()
+            .enumerate()
+            .map(|(index, group)| {
+                format!(
+                    "group {index}: parties={}",
+                    format_party_list(&group.parties.iter().copied().collect::<Vec<_>>()),
+                )
+            })
+            .collect::<Vec<_>>();
+        anyhow::ensure!(
+            tokio::time::Instant::now() < deadline,
+            "responsive parties did not expose one n-f active epoch-history link before the \
+             deadline; groups: {group_summary:?}; observations: {observations:?}"
+        );
+        tokio::time::sleep(client.poll_interval).await;
+    }
+}
+
+fn acceptance_avss_transition_digest(transition: &AvssTransition) -> anyhow::Result<[u8; 32]> {
+    let mut hasher = blake3::Hasher::new_derive_key("threshold-monero/avss-transition/v3");
+    hasher.update(&[match transition.purpose {
+        DealPurpose::Dkg => 0,
+        DealPurpose::Refresh => 1,
+        DealPurpose::Reshare => 2,
+    }]);
+    hasher.update(&transition.session.0);
+    hasher.update(&transition.key_id);
+    hasher.update(&transition.fault_bound.to_le_bytes());
+    hasher.update(&transition.history_parent.transition_binding()?);
+    hasher.update(&transition.old.as_ref().map_or(Ok([0; 32]), EpochPublic::activation_digest)?);
+    hasher.update(&transition.target.digest());
+    for dealer in &transition.eligible_dealers {
+        hasher.update(&dealer.0.to_le_bytes());
+    }
+    Ok(*hasher.finalize().as_bytes())
+}
+
+fn verification_shares_digest(public: &EpochPublic) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new_derive_key("threshold-monero/e2e-verification-shares/v1");
+    for (party, share) in &public.verification_shares {
+        hasher.update(&party.0.to_le_bytes());
+        hasher.update(&share.0);
+    }
+    *hasher.finalize().as_bytes()
+}
+
+fn validate_exact_same_committee_refresh(
+    before: &EpochPublic,
+    after: &EpochPublic,
+    fault_bound: u16,
+    history_parent: EpochHistoryParent,
+    observed_transition_digest: [u8; 32],
+) -> anyhow::Result<ExactRefreshEvidence> {
+    before.validate()?;
+    after.validate()?;
+    anyhow::ensure!(
+        before.committee.epoch.checked_add(1) == Some(after.committee.epoch),
+        "exact proactive refresh is not an immediate successor"
+    );
+    anyhow::ensure!(
+        before.key_id == after.key_id && before.group_key_bytes() == after.group_key_bytes(),
+        "exact proactive refresh changed its key ID or group spend key"
+    );
+    anyhow::ensure!(
+        before.committee.threshold == after.committee.threshold
+            && before.committee.n() == after.committee.n(),
+        "exact proactive refresh changed its committee shape"
+    );
+    let source_members = before
+        .committee
+        .members
+        .iter()
+        .map(|member| (member.id, member.signing_key))
+        .collect::<Vec<_>>();
+    let target_members = after
+        .committee
+        .members
+        .iter()
+        .map(|member| (member.id, member.signing_key))
+        .collect::<Vec<_>>();
+    anyhow::ensure!(
+        target_members == source_members,
+        "required proactive refresh substituted a stable committee identity"
+    );
+    let source_receiver_keys = before
+        .committee
+        .members
+        .iter()
+        .map(|member| member.encryption_key)
+        .collect::<BTreeSet<_>>();
+    anyhow::ensure!(
+        after
+            .committee
+            .members
+            .iter()
+            .all(|member| !source_receiver_keys.contains(&member.encryption_key)),
+        "required proactive refresh reused a source receiver key"
+    );
+    anyhow::ensure!(
+        before.verification_shares.keys().eq(after.verification_shares.keys())
+            && before.verification_shares != after.verification_shares,
+        "required proactive refresh did not install a fresh verification-share polynomial"
+    );
+
+    let members = source_members.iter().map(|(party, _)| *party).collect::<Vec<_>>();
+    let refresh = AvssTransition {
+        purpose: DealPurpose::Refresh,
+        session: canonical_refresh_session(before, &after.committee, history_parent)?,
+        key_id: before.key_id,
+        fault_bound,
+        history_parent,
+        old: Some(before.clone()),
+        target: after.committee.clone(),
+        eligible_dealers: members.clone(),
+    };
+    let refresh_transition_digest = acceptance_avss_transition_digest(&refresh)?;
+    anyhow::ensure!(
+        observed_transition_digest == refresh_transition_digest,
+        "authenticated epoch history does not bind the expected zero-constant refresh transition"
+    );
+    let mut reshare = refresh;
+    reshare.purpose = DealPurpose::Reshare;
+    reshare.session = canonical_reshare_session(before, &after.committee, history_parent)?;
+    let reshare_transition_digest = acceptance_avss_transition_digest(&reshare)?;
+    anyhow::ensure!(
+        observed_transition_digest != reshare_transition_digest,
+        "authenticated epoch history ambiguously matches old-share redistribution"
+    );
+
+    Ok(ExactRefreshEvidence {
+        members,
+        source_verification_shares: verification_shares_digest(before),
+        target_verification_shares: verification_shares_digest(after),
+        refresh_transition_digest,
+        reshare_transition_digest,
+    })
+}
+
 fn validate_scheduled_refresh(
     before: &EpochPublic,
     after: &EpochPublic,
@@ -3751,11 +5765,7 @@ fn validate_scheduled_refresh(
     );
     anyhow::ensure!(
         before.committee.threshold == after.committee.threshold
-            && before.committee.members.iter().map(|member| member.id).eq(after
-                .committee
-                .members
-                .iter()
-                .map(|member| member.id)),
+            && before.committee.n() == after.committee.n(),
         "scheduled proactive refresh unexpectedly changed the committee shape"
     );
     anyhow::ensure!(
@@ -4004,10 +6014,12 @@ fn fixed_width_party_subsets(parties: &[PartyId], width: usize) -> Vec<Vec<Party
     subsets
 }
 
-/// Validate a same-committee proactive refresh whose target was learned from the live network,
-/// not from the finite scenario fixture. The returned count is useful acceptance evidence for the
-/// independently rotated X25519 keys.
+/// Validate a fixed-size, fixed-threshold proactive successor whose target was learned from the
+/// live network, not from the finite scenario fixture. Eligible-member substitution may make this
+/// a reshare instead of a true same-membership refresh. The returned count is useful acceptance
+/// evidence for the independently rotated X25519 keys.
 fn validate_dynamic_refresh(
+    scenario: &Scenario,
     before: &EpochPublic,
     after: &EpochPublic,
     fault_bound: u16,
@@ -4039,36 +6051,33 @@ fn validate_dynamic_refresh(
         after.committee.threshold == before.committee.threshold,
         "dynamic proactive refresh changed the signing threshold"
     );
+    anyhow::ensure!(
+        after.committee.n() == before.committee.n(),
+        "dynamic proactive refresh selected {} members, expected exact desired_n={}",
+        after.committee.n(),
+        before.committee.n()
+    );
 
     let before_members = before.committee.by_id();
     let after_members = after.committee.by_id();
-    anyhow::ensure!(
-        before_members.keys().eq(after_members.keys()),
-        "dynamic proactive refresh changed committee member IDs"
-    );
     let mut rotated_encryption_keys = 0_usize;
-    for (party, old_member) in before_members {
-        let new_member = after_members
-            .get(&party)
-            .context("dynamic proactive refresh omitted a source member")?;
+    for (party, new_member) in &after_members {
+        let configured = scenario.party(*party)?;
         anyhow::ensure!(
-            new_member.signing_key == old_member.signing_key,
+            new_member.signing_key == configured.signing_key.0,
             "dynamic proactive refresh changed party {party}'s stable signing key"
         );
-        if new_member.encryption_key != old_member.encryption_key {
-            rotated_encryption_keys = rotated_encryption_keys.saturating_add(1);
-        }
+        anyhow::ensure!(
+            before_members
+                .values()
+                .all(|old_member| old_member.encryption_key != new_member.encryption_key),
+            "dynamic proactive refresh reused a source receiver key for party {party}"
+        );
+        rotated_encryption_keys = rotated_encryption_keys.saturating_add(1);
     }
-    let required_rotations = usize::from(
-        before
-            .committee
-            .n()
-            .checked_sub(fault_bound)
-            .context("dynamic proactive refresh fault bound exceeds committee size")?,
-    );
     anyhow::ensure!(
-        rotated_encryption_keys >= required_rotations,
-        "dynamic proactive refresh rotated {rotated_encryption_keys} X25519 keys, requires at least n-f={required_rotations}"
+        rotated_encryption_keys == usize::from(after.committee.n()),
+        "dynamic proactive refresh must rotate every certificate-selected receiver key"
     );
     anyhow::ensure!(
         after.verification_shares != before.verification_shares,
@@ -4081,6 +6090,7 @@ fn validate_dynamic_refresh(
 /// no target committee argument by design: every target key and the public sharing polynomial are
 /// learned independently from each responsive party's authenticated status endpoint.
 async fn wait_for_dynamic_refresh(
+    scenario: &Scenario,
     client: &PartyClient,
     old: &EpochPublic,
     fault_bound: u16,
@@ -4088,37 +6098,38 @@ async fn wait_for_dynamic_refresh(
 ) -> anyhow::Result<EpochPublic> {
     let target_epoch =
         old.committee.epoch.checked_add(1).context("dynamic proactive refresh epoch exhausted")?;
-    let responsive = old
-        .committee
-        .members
-        .iter()
-        .map(|member| member.id)
+    anyhow::ensure!(
+        fault_bound < old.committee.n(),
+        "dynamic proactive refresh fault bound exhausts the target committee"
+    );
+    let required = usize::from(old.committee.n() - fault_bound);
+    let responsive = client
+        .admin_endpoints
+        .keys()
+        .copied()
         .filter(|party| !faulty.contains(party))
         .collect::<Vec<_>>();
-    let required_responsive = usize::from(
-        old.committee
-            .n()
-            .checked_sub(fault_bound)
-            .context("dynamic proactive refresh fault bound exceeds committee size")?,
-    );
     anyhow::ensure!(
-        responsive.len() >= required_responsive,
-        "dynamic proactive refresh has {} responsive final-committee parties, requires n-f={required_responsive}",
+        responsive.len() >= required,
+        "dynamic proactive refresh has {} responsive final-committee parties, requires n-f={required}",
         responsive.len()
     );
+    let recovered_party = required_recovered_party()?;
+    if let Some(recovered_party) = recovered_party {
+        anyhow::ensure!(
+            responsive.contains(&recovered_party),
+            "required recovered party {recovered_party} has no responsive dynamic-refresh endpoint"
+        );
+    }
+    let required_parties = recovered_party.into_iter().collect::<BTreeSet<_>>();
 
     let deadline = tokio::time::Instant::now() + client.protocol_timeout;
     let mut observations = BTreeMap::<PartyId, String>::new();
     loop {
-        let mut activated = BTreeMap::<PartyId, EpochPublic>::new();
+        let mut activated = Vec::<EqualObservationGroup<EpochPublic>>::new();
         for party in &responsive {
             match client.get_admin::<PartyStatus>(*party, "/v1/status").await {
                 Ok(status) => {
-                    anyhow::ensure!(
-                        status.party == *party,
-                        "status endpoint returned another party ID"
-                    );
-                    anyhow::ensure!(status.ready, "party {party} reported that it is not ready");
                     observations.insert(
                         *party,
                         format!(
@@ -4129,29 +6140,57 @@ async fn wait_for_dynamic_refresh(
                             status.proactive_refresh,
                         ),
                     );
-                    if let Some(observed) = status.active_epoch {
+                    let public = match (|| -> anyhow::Result<Option<EpochPublic>> {
                         anyhow::ensure!(
-                            observed <= target_epoch,
-                            "party {party} advanced past dynamic target epoch {target_epoch} to {observed}"
+                            status.party == *party,
+                            "status endpoint returned another party ID"
                         );
+                        anyhow::ensure!(
+                            status.ready,
+                            "party {party} reported that it is not ready"
+                        );
+                        if let Some(observed) = status.active_epoch {
+                            anyhow::ensure!(
+                                observed <= target_epoch,
+                                "party {party} advanced past dynamic target epoch {target_epoch} to {observed}"
+                            );
+                        }
+                        if status.active_epoch != Some(target_epoch) {
+                            return Ok(None);
+                        }
+                        let matching = status
+                            .epochs
+                            .iter()
+                            .filter(|epoch| epoch.epoch == target_epoch)
+                            .collect::<Vec<_>>();
+                        anyhow::ensure!(
+                            matching.len() == 1,
+                            "party {party} reported dynamic epoch {target_epoch} without exactly one public epoch value"
+                        );
+                        let public = matching[0].public.clone();
+                        validate_dynamic_refresh(scenario, old, &public, fault_bound)
+                            .with_context(|| {
+                                format!(
+                                    "party {party} reported an invalid dynamic epoch-{target_epoch}"
+                                )
+                            })?;
+                        public.committee.member(*party).with_context(|| {
+                            format!(
+                                "party {party} is not a member of its reported epoch-{target_epoch} committee"
+                            )
+                        })?;
+                        Ok(Some(public))
+                    })() {
+                        Ok(public) => public,
+                        Err(error) => {
+                            observations
+                                .insert(*party, format!("invalid/non-candidate status: {error:#}"));
+                            continue;
+                        }
+                    };
+                    if let Some(public) = public {
+                        record_equal_observation(&mut activated, *party, public);
                     }
-                    if status.active_epoch != Some(target_epoch) {
-                        continue;
-                    }
-                    let matching = status
-                        .epochs
-                        .iter()
-                        .filter(|epoch| epoch.epoch == target_epoch)
-                        .collect::<Vec<_>>();
-                    anyhow::ensure!(
-                        matching.len() == 1,
-                        "party {party} reported dynamic epoch {target_epoch} without exactly one public epoch value"
-                    );
-                    let public = matching[0].public.clone();
-                    validate_dynamic_refresh(old, &public, fault_bound).with_context(|| {
-                        format!("party {party} reported an invalid dynamic epoch-{target_epoch}")
-                    })?;
-                    activated.insert(*party, public);
                 }
                 Err(error) => {
                     observations.insert(*party, format!("status error: {error:#}"));
@@ -4159,27 +6198,37 @@ async fn wait_for_dynamic_refresh(
             }
         }
 
-        if activated.len() == responsive.len() {
-            let expected = activated.values().next().context("empty activated party set")?.clone();
-            for (party, public) in &activated {
-                anyhow::ensure!(
-                    public == &expected,
-                    "party {party} activated a conflicting public value for dynamic epoch {target_epoch}"
-                );
-            }
-            let rotated = validate_dynamic_refresh(old, &expected, fault_bound)?;
+        if let Some(group) = equal_observation_quorum(&activated, required, &required_parties)? {
+            let expected = group.value.clone();
+            let agreeing_parties = group.parties.clone();
+            let selected_ids =
+                expected.committee.members.iter().map(|member| member.id).collect::<BTreeSet<_>>();
+            let rotated = validate_dynamic_refresh(scenario, old, &expected, fault_bound)?;
             tracing::info!(
                 epoch = target_epoch,
-                parties = activated.len(),
+                parties = selected_ids.len(),
+                agreeing_parties = ?agreeing_parties,
+                omitted = responsive.len().saturating_sub(selected_ids.len()),
                 rotated_encryption_keys = rotated,
                 "autonomous dynamic QUIC refresh activated"
             );
             return Ok(expected);
         }
 
+        let group_summary = activated
+            .iter()
+            .enumerate()
+            .map(|(index, group)| {
+                format!(
+                    "group {index}: parties={}",
+                    format_party_list(&group.parties.iter().copied().collect::<Vec<_>>()),
+                )
+            })
+            .collect::<Vec<_>>();
         anyhow::ensure!(
             tokio::time::Instant::now() < deadline,
-            "dynamic epoch-{target_epoch} did not activate before the protocol deadline; observations: {observations:?}"
+            "dynamic epoch-{target_epoch} did not activate before the protocol deadline; \
+             groups: {group_summary:?}; observations: {observations:?}"
         );
         tokio::time::sleep(client.poll_interval).await;
     }
@@ -4196,6 +6245,10 @@ async fn run_avss(
         transition.fault_bound == fault_bound,
         "transition fault bound differs from the runner configuration"
     );
+    anyhow::ensure!(
+        transition.fault_bound < transition.target.n(),
+        "transition fault bound exhausts its target committee"
+    );
     let dealers = match transition.purpose {
         DealPurpose::Dkg => {
             transition.target.members.iter().map(|member| member.id).collect::<Vec<_>>()
@@ -4208,27 +6261,56 @@ async fn run_avss(
     if let Some(specification) = matching_fault {
         arm_acceptance_protocol_fault_gate(client, &transition, specification).await?;
     }
-    let responsive_dealers = dealers.iter().filter(|dealer| !faulty.contains(dealer)).count();
-    let mut started_dealers = 0_usize;
+    let minimum_started_dealers = match (&transition.purpose, &transition.old) {
+        (DealPurpose::Dkg, None) | (DealPurpose::Refresh, Some(_)) => {
+            usize::from(transition.target.n() - transition.fault_bound)
+        }
+        (DealPurpose::Reshare, Some(old)) => usize::from(old.committee.threshold),
+        _ => anyhow::bail!("AVSS purpose and old epoch are inconsistent"),
+    };
+    let available_dealers = dealers.iter().filter(|dealer| !faulty.contains(dealer)).count();
+    anyhow::ensure!(
+        available_dealers >= minimum_started_dealers,
+        "transition has {available_dealers} available AVSS dealers, requires {minimum_started_dealers}"
+    );
+    let mut started_dealers = BTreeSet::new();
+    let mut start_observations = BTreeMap::<PartyId, String>::new();
     let mut fault_boundary_observed = false;
     for dealer in &dealers {
         if faulty.contains(dealer) {
             continue;
         }
-        let response: AvssStepResponse = client
+        let response: AvssStepResponse = match client
             .post_admin(
                 *dealer,
                 "/v1/avss/start",
                 &AvssStartRequest { transition: transition.clone() },
             )
-            .await?;
-        anyhow::ensure!(response.party == *dealer && response.dealer == *dealer);
-        started_dealers = started_dealers.saturating_add(1);
-        if let Some(specification) = matching_fault {
+            .await
+        {
+            Ok(response) => response,
+            Err(error) => {
+                start_observations.insert(*dealer, format!("AVSS start error: {error:#}"));
+                continue;
+            }
+        };
+        if response.party != *dealer || response.dealer != *dealer {
+            start_observations.insert(
+                *dealer,
+                format!(
+                    "invalid AVSS start response: party={} dealer={}",
+                    response.party, response.dealer
+                ),
+            );
+            continue;
+        }
+        start_observations.insert(*dealer, "started".to_owned());
+        started_dealers.insert(*dealer);
+        if let Some(specification) = matching_fault.filter(|_| !fault_boundary_observed) {
             let boundary_reachable = match specification.boundary {
                 AcceptanceProtocolFaultBoundary::DealerStarted => *dealer == specification.party,
                 AcceptanceProtocolFaultBoundary::QualRoundZero => {
-                    started_dealers == responsive_dealers
+                    started_dealers.len() >= minimum_started_dealers
                 }
             };
             if boundary_reachable {
@@ -4239,13 +6321,13 @@ async fn run_avss(
         }
     }
     anyhow::ensure!(
+        started_dealers.len() >= minimum_started_dealers,
+        "transition started {} valid AVSS dealers, requires {minimum_started_dealers}; observations: {start_observations:?}",
+        started_dealers.len()
+    );
+    anyhow::ensure!(
         matching_fault.is_none() || fault_boundary_observed,
         "configured acceptance protocol fault boundary was not reachable"
-    );
-
-    anyhow::ensure!(
-        dealers.iter().any(|dealer| !faulty.contains(dealer)),
-        "transition has no responsive AVSS dealer"
     );
 
     wait_for_transition_activation(client, &transition, faulty).await
@@ -4261,6 +6343,11 @@ async fn wait_for_transition_activation(
     // party's durable QUIC runtime. HTTP is used only to observe the resulting state.
     let target_epoch = transition.target.epoch;
     let expected_committee_digest = transition.target.digest();
+    anyhow::ensure!(
+        transition.fault_bound < transition.target.n(),
+        "transition fault bound exhausts epoch-{target_epoch} target committee"
+    );
+    let required = usize::from(transition.target.n() - transition.fault_bound);
     let deadline = tokio::time::Instant::now() + client.protocol_timeout;
     let responsive = transition
         .target
@@ -4269,19 +6356,30 @@ async fn wait_for_transition_activation(
         .map(|member| member.id)
         .filter(|party| !faulty.contains(party))
         .collect::<Vec<_>>();
-    anyhow::ensure!(!responsive.is_empty(), "transition has no responsive target party");
+    anyhow::ensure!(
+        responsive.len() >= required,
+        "transition has {} responsive target parties, requires n-f={required}",
+        responsive.len()
+    );
+    let mut required_parties = required_recovered_party()?.into_iter().collect::<BTreeSet<_>>();
+    if let Some(specification) = acceptance_protocol_fault_specification()?
+        .filter(|specification| specification.epoch == target_epoch)
+    {
+        required_parties.insert(specification.party);
+    }
+    for party in &required_parties {
+        anyhow::ensure!(
+            responsive.contains(party),
+            "required recovered transition party {party} is not a responsive epoch-{target_epoch} target member"
+        );
+    }
 
     let mut observations = BTreeMap::<PartyId, String>::new();
     loop {
-        let mut activated = BTreeMap::<PartyId, EpochPublic>::new();
+        let mut activated = Vec::<EqualObservationGroup<EpochPublic>>::new();
         for party in &responsive {
             match client.get_admin::<PartyStatus>(*party, "/v1/status").await {
                 Ok(status) => {
-                    anyhow::ensure!(
-                        status.party == *party,
-                        "status endpoint returned another party ID"
-                    );
-                    anyhow::ensure!(status.ready, "party {party} reported that it is not ready");
                     observations.insert(
                         *party,
                         format!(
@@ -4291,35 +6389,55 @@ async fn wait_for_transition_activation(
                             status.epochs.iter().map(|epoch| epoch.epoch).collect::<Vec<_>>()
                         ),
                     );
-                    if let Some(observed) = status.active_epoch {
+                    let public = match (|| -> anyhow::Result<Option<EpochPublic>> {
                         anyhow::ensure!(
-                            observed <= target_epoch,
-                            "party {party} advanced past target epoch {target_epoch} to {observed}"
+                            status.party == *party,
+                            "status endpoint returned another party ID"
                         );
+                        anyhow::ensure!(
+                            status.ready,
+                            "party {party} reported that it is not ready"
+                        );
+                        if let Some(observed) = status.active_epoch {
+                            anyhow::ensure!(
+                                observed <= target_epoch,
+                                "party {party} advanced past target epoch {target_epoch} to {observed}"
+                            );
+                        }
+                        if status.active_epoch != Some(target_epoch) {
+                            return Ok(None);
+                        }
+                        let matching = status
+                            .epochs
+                            .iter()
+                            .filter(|epoch| epoch.epoch == target_epoch)
+                            .collect::<Vec<_>>();
+                        anyhow::ensure!(
+                            matching.len() == 1,
+                            "party {party} reported active epoch {target_epoch} without exactly one public epoch value"
+                        );
+                        let public = matching[0].public.clone();
+                        public.validate()?;
+                        anyhow::ensure!(
+                            public.key_id == transition.key_id,
+                            "party {party} activated the wrong key ID for epoch {target_epoch}"
+                        );
+                        anyhow::ensure!(
+                            public.committee.digest() == expected_committee_digest,
+                            "party {party} activated a different epoch-{target_epoch} committee"
+                        );
+                        Ok(Some(public))
+                    })() {
+                        Ok(public) => public,
+                        Err(error) => {
+                            observations
+                                .insert(*party, format!("invalid/non-candidate status: {error:#}"));
+                            continue;
+                        }
+                    };
+                    if let Some(public) = public {
+                        record_equal_observation(&mut activated, *party, public);
                     }
-                    if status.active_epoch != Some(target_epoch) {
-                        continue;
-                    }
-                    let matching = status
-                        .epochs
-                        .iter()
-                        .filter(|epoch| epoch.epoch == target_epoch)
-                        .collect::<Vec<_>>();
-                    anyhow::ensure!(
-                        matching.len() == 1,
-                        "party {party} reported active epoch {target_epoch} without exactly one public epoch value"
-                    );
-                    let public = matching[0].public.clone();
-                    public.validate()?;
-                    anyhow::ensure!(
-                        public.key_id == transition.key_id,
-                        "party {party} activated the wrong key ID for epoch {target_epoch}"
-                    );
-                    anyhow::ensure!(
-                        public.committee.digest() == expected_committee_digest,
-                        "party {party} activated a different epoch-{target_epoch} committee"
-                    );
-                    activated.insert(*party, public);
                 }
                 Err(error) => {
                     observations.insert(*party, format!("status error: {error:#}"));
@@ -4327,25 +6445,31 @@ async fn wait_for_transition_activation(
             }
         }
 
-        if activated.len() == responsive.len() {
-            let expected = activated.values().next().context("empty activated party set")?.clone();
-            for (party, public) in &activated {
-                anyhow::ensure!(
-                    public == &expected,
-                    "party {party} activated a conflicting public value for epoch {target_epoch}"
-                );
-            }
+        if let Some(group) = equal_observation_quorum(&activated, required, &required_parties)? {
+            let expected = group.value.clone();
             tracing::info!(
                 epoch = target_epoch,
-                parties = activated.len(),
+                parties = group.parties.len(),
+                agreeing_parties = ?group.parties,
                 "autonomous QUIC transition activated"
             );
             return Ok(expected);
         }
 
+        let group_summary = activated
+            .iter()
+            .enumerate()
+            .map(|(index, group)| {
+                format!(
+                    "group {index}: parties={}",
+                    format_party_list(&group.parties.iter().copied().collect::<Vec<_>>()),
+                )
+            })
+            .collect::<Vec<_>>();
         anyhow::ensure!(
             tokio::time::Instant::now() < deadline,
-            "epoch-{target_epoch} did not activate through QUIC before the protocol deadline; observations: {observations:?}"
+            "epoch-{target_epoch} did not activate through QUIC before the protocol deadline; \
+             groups: {group_summary:?}; observations: {observations:?}"
         );
         tokio::time::sleep(client.poll_interval).await;
     }
@@ -4542,11 +6666,13 @@ async fn wait_for_acceptance_protocol_fault_release(
 
 /// Demo-only barrier emitted after the configured epoch chain has completed and immediately before
 /// the runner begins observing the dynamic successor. The rotation-silent campaign uses the pause
-/// to remove p2 only from the peer-QUIC Docker network while keeping its process and HTTP endpoint
-/// healthy. Production party processes never enable this hook.
+/// to remove one actual certificate-selected source member only from the peer-QUIC Docker network
+/// while keeping its process and HTTP endpoint healthy. Production party processes never enable
+/// this hook.
 async fn maybe_pause_before_dynamic_refresh(
     client: &PartyClient,
     source_epoch: u64,
+    fault_party: Option<PartyId>,
 ) -> anyhow::Result<()> {
     if std::env::var("TM_ACCEPTANCE_ENABLE_FAULT_HOOKS").as_deref() != Ok("1")
         || !environment_flag("TM_ACCEPTANCE_PAUSE_BEFORE_DYNAMIC_REFRESH")?
@@ -4556,12 +6682,14 @@ async fn maybe_pause_before_dynamic_refresh(
     let target_epoch = source_epoch
         .checked_add(1)
         .context("dynamic proactive refresh epoch exhausted at fault barrier")?;
-    let mut material = Vec::with_capacity(16);
+    let party = fault_party
+        .context("dynamic refresh fault barrier requires the selected-member fault mode")?;
+    let mut material = Vec::with_capacity(18);
     material.extend_from_slice(&source_epoch.to_le_bytes());
     material.extend_from_slice(&target_epoch.to_le_bytes());
+    material.extend_from_slice(&party.0.to_le_bytes());
     let kind = AcceptanceDriverLatchKind::DynamicRotationOmission;
     let binding = acceptance_driver_binding(kind, &material);
-    let party = PartyId::new(2)?;
     let armed: AcceptanceDriverLatchResponse = client
         .post_admin(
             party,
@@ -4577,15 +6705,16 @@ async fn maybe_pause_before_dynamic_refresh(
         armed.party == party
             && armed.state == AcceptanceConsolidationGateState::Held
             && armed.kind == Some(kind)
-            && armed.binding == Some(binding),
-        "p2 held a different dynamic-rotation latch"
+            && armed.binding == Some(binding)
+            && armed.event_unix_ms.is_none(),
+        "party {party} held a different dynamic-rotation latch"
     );
 
     println!(
         "TM_ACCEPTANCE_DYNAMIC_REFRESH_BARRIER source_epoch={source_epoch} target_epoch={target_epoch}"
     );
     println!(
-        "TM_ACCEPTANCE_DYNAMIC_REFRESH_LATCH_HELD party=2 source_epoch={source_epoch} target_epoch={target_epoch} binding={}",
+        "TM_ACCEPTANCE_DYNAMIC_REFRESH_LATCH_HELD party={party} source_epoch={source_epoch} target_epoch={target_epoch} binding={}",
         hex::encode(binding)
     );
     {
@@ -4595,7 +6724,7 @@ async fn maybe_pause_before_dynamic_refresh(
     tracing::warn!(source_epoch, target_epoch, "dynamic refresh fault barrier reached");
     wait_for_authenticated_driver_release(client, party, kind, binding).await?;
     println!(
-        "TM_ACCEPTANCE_DYNAMIC_REFRESH_LATCH_RELEASED party=2 source_epoch={source_epoch} target_epoch={target_epoch} binding={}",
+        "TM_ACCEPTANCE_DYNAMIC_REFRESH_LATCH_RELEASED party={party} source_epoch={source_epoch} target_epoch={target_epoch} binding={}",
         hex::encode(binding)
     );
     Ok(())
@@ -4605,26 +6734,30 @@ async fn mine_confirmation(
     daemon: &MoneroDaemon<SimpleRequestTransport>,
     mining_address: &MoneroAddress,
     tx_hash: [u8; 32],
+    mut next_height: usize,
     poll_interval_ms: u64,
     timeout_seconds: u64,
 ) -> anyhow::Result<monero_wallet::block::Block> {
-    // A locally submitted transaction first enters Monero's Dandelion++ stem pool. In an offline
-    // regtest daemon there is no peer to relay it to, so it becomes mineable only after the local
-    // embargo expires. This mirrors monero-oxide's own `mine_until_unlocked` test helper, with an
-    // explicit deadline so a rejected or lost transaction cannot spin forever.
+    // Signing may finish during an earlier maturity-block advance. Inspect every block since
+    // the funding/signing snapshot before mining more; watching only newly generated blocks
+    // permanently misses a transaction which is already canonical.
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_seconds);
     loop {
-        let number = daemon.latest_block_number().await? + 1;
-        daemon.generate_blocks(mining_address, 1).await?;
-        let block = daemon.block_by_number(number).await?;
-        if block.transactions.contains(&tx_hash) {
-            return Ok(block);
+        let tip = daemon.latest_block_number().await?;
+        while next_height <= tip {
+            let block = daemon.block_by_number(next_height).await?;
+            if block.transactions.contains(&tx_hash) {
+                return Ok(block);
+            }
+            next_height = next_height.checked_add(1).context("confirmation height overflow")?;
         }
         anyhow::ensure!(
             tokio::time::Instant::now() < deadline,
             "transaction {} was not mined before the protocol deadline",
             hex::encode(tx_hash)
         );
+        // Unrelayed Dandelion++ stem transactions may need another block after their embargo.
+        daemon.generate_blocks(mining_address, 1).await?;
         tokio::time::sleep(std::time::Duration::from_millis(poll_interval_ms)).await;
     }
 }
@@ -4649,10 +6782,10 @@ fn configured_faulty_parties(scenario: &Scenario) -> anyhow::Result<BTreeSet<Par
         anyhow::ensure!(faulty.insert(party), "duplicate faulty party {party}");
     }
     for spec in &scenario.committees {
-        let actual = spec.members.iter().filter(|party| faulty.contains(party)).count();
+        let actual = spec.eligible_members.iter().filter(|party| faulty.contains(party)).count();
         anyhow::ensure!(
             actual <= usize::from(spec.fault_bound),
-            "epoch {} declares f={} but {} configured faulty members are present",
+            "epoch {} declares f={} but {} configured faulty eligible members are present",
             spec.epoch,
             spec.fault_bound,
             actual
@@ -4664,47 +6797,55 @@ fn configured_faulty_parties(scenario: &Scenario) -> anyhow::Result<BTreeSet<Par
     Ok(faulty)
 }
 
-/// Add omission faults which begin only after the finite scenario chain has completed. Keeping
-/// this separate from `TM_FAULTY_PARTIES` ensures the rotation-silent campaign does not obtain an
-/// easier DKG/grow/shrink path by asking the client to ignore p2 before the Docker fault exists.
-fn configured_dynamic_rotation_faulty_parties(
-    scenario: &Scenario,
+/// Add one selected-source-member omission which begins only after the finite scenario chain has
+/// completed. Keeping this separate from `TM_FAULTY_PARTIES` ensures the rotation-silent campaign
+/// cannot obtain an easier DKG/grow/shrink path by asking the client to ignore that party before
+/// the Docker fault actually exists.
+fn configured_dynamic_rotation_selected_member_fault(
     source: &Committee,
+    eligible_target: &Committee,
     fault_bound: u16,
     already_faulty: &BTreeSet<PartyId>,
-) -> anyhow::Result<BTreeSet<PartyId>> {
+) -> anyhow::Result<(Option<PartyId>, BTreeSet<PartyId>)> {
     source.validate_async_security_with_faults(fault_bound)?;
-    let configured = std::env::var("TM_DYNAMIC_ROTATION_FAULTY_PARTIES").unwrap_or_default();
-    let mut dynamic_only = BTreeSet::new();
-    for value in configured.split(',').map(str::trim).filter(|value| !value.is_empty()) {
-        let party = PartyId::new(value.parse::<u16>()?)?;
-        scenario.party(party)?;
-        source.member(party).with_context(|| {
-            format!("dynamic rotation fault party {party} is not in epoch-{}", source.epoch)
-        })?;
-        anyhow::ensure!(
-            dynamic_only.insert(party),
-            "duplicate dynamic rotation faulty party {party}"
-        );
-    }
-
+    eligible_target.validate()?;
     let mut combined = already_faulty.clone();
-    combined.extend(dynamic_only);
-    let source_faults =
-        source.members.iter().filter(|member| combined.contains(&member.id)).count();
+    let prior_eligible_faults =
+        eligible_target.members.iter().filter(|member| combined.contains(&member.id)).count();
     anyhow::ensure!(
-        source_faults <= usize::from(fault_bound),
-        "dynamic epoch {} declares f={fault_bound} but {source_faults} configured faulty members are present",
-        source.epoch
+        prior_eligible_faults <= usize::from(fault_bound),
+        "dynamic epoch {} declares f={fault_bound} but {prior_eligible_faults} configured faulty \
+         eligible members are present",
+        eligible_target.epoch
     );
-    if !configured.is_empty() {
-        tracing::warn!(
-            ?combined,
-            source_epoch = source.epoch,
-            "enabling faults only for the post-scenario dynamic refresh"
-        );
+    if !environment_flag("TM_ACCEPTANCE_DYNAMIC_ROTATION_SELECTED_MEMBER_FAULT")? {
+        return Ok((None, combined));
     }
-    Ok(combined)
+    anyhow::ensure!(
+        std::env::var("TM_ACCEPTANCE_ENABLE_FAULT_HOOKS").as_deref() == Ok("1")
+            && environment_flag("TM_ACCEPTANCE_PAUSE_BEFORE_DYNAMIC_REFRESH")?,
+        "dynamic selected-member fault requires the acceptance-only dynamic-refresh barrier"
+    );
+    anyhow::ensure!(
+        prior_eligible_faults < usize::from(fault_bound),
+        "dynamic selected-member fault would exceed epoch {} eligible-roster fault bound \
+         f={fault_bound}",
+        eligible_target.epoch
+    );
+    let selected = source
+        .members
+        .iter()
+        .map(|member| member.id)
+        .find(|party| !combined.contains(party) && eligible_target.member(*party).is_ok())
+        .context("dynamic selected-member fault has no responsive certified source member")?;
+    anyhow::ensure!(combined.insert(selected));
+    tracing::warn!(
+        party = %selected,
+        ?combined,
+        source_epoch = source.epoch,
+        "enabling one certified-source-member fault only for the post-scenario dynamic transition"
+    );
+    Ok((Some(selected), combined))
 }
 
 fn monero_network(network: NetworkKind) -> Network {
@@ -4717,30 +6858,715 @@ fn monero_network(network: NetworkKind) -> Network {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn consolidation_observer_accepts_confirmed_broadcast_without_weakening_other_phases() {
+        use PublicConsolidationPhase::*;
+
+        let phases =
+            [Reserved, Signing, Certified, Broadcast, Confirmed, Quarantined, Aborted, Abandoned];
+        for expected in [Reserved, Broadcast, Confirmed] {
+            for actual in phases {
+                let allowed = match expected {
+                    Reserved => actual == Reserved,
+                    Broadcast => matches!(actual, Broadcast | Confirmed),
+                    Confirmed => actual == Confirmed,
+                    _ => unreachable!(),
+                };
+                assert_eq!(
+                    super::consolidation_phase_satisfies_observer(actual, expected),
+                    allowed,
+                    "actual={actual:?}, expected={expected:?}"
+                );
+            }
+        }
+
+        // Eligibility must not merge different phases or confirmation chain points into a quorum.
+        let broadcast = observed_consolidation_decision_fixture();
+        let mut confirmed = broadcast.clone();
+        confirmed.phase = Confirmed;
+        confirmed.confirmation = Some(ChainPoint::new(102, [0x31; 32]).unwrap());
+        assert!(!broadcast.same_quorum_decision(&confirmed));
+        assert!(confirmed.same_quorum_decision(&confirmed.clone()));
+        let mut conflicting = confirmed.clone();
+        conflicting.confirmation = Some(ChainPoint::new(102, [0x32; 32]).unwrap());
+        assert!(!confirmed.same_quorum_decision(&conflicting));
+    }
+
+    #[tokio::test]
+    async fn confirmation_finds_an_already_mined_transaction_without_mining_more() {
+        use axum::{Json, Router, routing::post};
+        use monero_oxide::{
+            block::{Block, BlockHeader},
+            transaction::{Input, Timelock, Transaction, TransactionPrefix},
+        };
+        use serde_json::{Value, json};
+
+        let tx_hash = [0x39; 32];
+        let app = Router::new()
+            .route("/get_height", post(|| async { Json(json!({"height": 11})) }))
+            .route("/json_rpc", post(move |body: axum::body::Bytes| async move {
+                let request: Value = serde_json::from_slice(&body).unwrap();
+                if request.is_array() {
+                    return Json(json!({"error": {"code": -32700}}));
+                }
+                assert_eq!(request["method"], "get_block", "already-mined transactions must not trigger mining");
+                let height = request["params"]["height"].as_u64().unwrap() as usize;
+                let block = Block::new(
+                    BlockHeader { hardfork_version: 16, hardfork_signal: 16, timestamp: 1, previous: [9; 32], nonce: 0 },
+                    Transaction::V1 {
+                        prefix: TransactionPrefix { additional_timelock: Timelock::None, inputs: vec![Input::Gen(height)], outputs: vec![], extra: vec![] },
+                        signatures: vec![],
+                    },
+                    if height == 8 { vec![tx_hash] } else { vec![] },
+                ).unwrap();
+                Json(json!({"id": request["id"], "result": {"blob": hex::encode(block.serialize())}}))
+            }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let daemon =
+            monero_simple_request_rpc::SimpleRequestTransport::new(format!("http://{address}"))
+                .await
+                .unwrap();
+        let (_, _, mining_address) =
+            super::acceptance_funding_wallet(monero_wallet::address::Network::Mainnet).unwrap();
+        let result = super::mine_confirmation(&daemon, &mining_address, tx_hash, 6, 1, 0).await;
+        server.abort();
+        let block = result.unwrap();
+        assert_eq!(block.number(), 8, "confirmation must use the containing height, not tip 10");
+        assert_eq!(block.transactions, vec![tx_hash]);
+    }
+
     use super::{
-        AcceptanceProtocolFaultBoundary, AcceptanceProtocolFaultSpecification, DepositHttpStatus,
-        PartyId, allocation_request_party, deposit_status_reached_current_epoch,
-        deterministic_roast_signers, parse_acceptance_protocol_fault_specification,
-        validate_consolidation_fixture_economics,
-        validate_cross_epoch_subthreshold_non_identifiability, validate_dynamic_refresh,
+        AcceptanceDepositFaultMode, AcceptanceProtocolFaultBoundary,
+        AcceptanceProtocolFaultSpecification, CertifiedDeposit, DEPOSIT_HANDOFF_ACCEPTANCE_WINDOWS,
+        DepositHttpStatus, DepositTtlAllocationFacts, ObservedConsolidation, PartyId,
+        ValidatedDepositAllocationResponse, acceptance_avss_transition_digest,
+        allocation_request_parties, assign_certified_input_ring,
+        certified_deposit_candidate_quorum, deposit_fault_confirmation_plan,
+        deposit_handoff_acceptance_timeout, deposit_status_reached_current_epoch,
+        deterministic_roast_signers, equal_observation_quorum, parse_acceptance_deposit_fault_mode,
+        parse_acceptance_protocol_fault_specification, record_equal_observation,
+        successor_acceptance_funding_height, tenant_bound_request_binding,
+        tenant_certified_request_id, validate_consolidation_fixture_economics,
+        validate_cross_epoch_subthreshold_non_identifiability,
+        validate_deposit_ttl_acceptance_facts, validate_dynamic_refresh,
+        validate_exact_same_committee_refresh, validate_new_deposit_certificate,
+        validate_ttl_replica_response,
     };
     use crate::{
-        committee::Committee,
-        config::Scenario,
-        deposit_wallet::{DepositWalletId, SweepId, derive_sweep_signing_session},
+        committee::{Committee, Member, SessionId},
+        compact_epoch_registry::{
+            CompactEpochRegistry, IssuerTerminalSeal, RegistryLink, VerifiedIssuerWindow,
+        },
+        compact_registry_archive::prepare_compact_registry_genesis,
+        config::{NetworkKind, Scenario},
+        deposit_consolidation::{ConsolidationId, OpaqueIntentBinding, SignedTransactionBinding},
+        deposit_ledger::{
+            CertifiedLedgerEntry, LedgerRequestId, LedgerStatement, RequestBinding,
+            UNUSED_ALLOCATION_TTL_SECONDS,
+        },
+        deposit_service::{
+            DepositAddressRequest, PublicConsolidationPhase, PublicConsolidationStatus,
+            PublicLiveConsolidationStatus,
+        },
+        deposit_wallet::{
+            ChainPoint, DepositAddressDeriver, DepositSubaddressIndex, DepositWalletId, SweepId,
+            WalletOutputId, derive_sweep_signing_session,
+        },
+        deposit_worker::SweepPlan,
+        epoch_history::EpochHistoryParent,
         identity::Identity,
+        key_rotation::VerifiedRegistryHandoffTarget,
         keys::{EpochPublic, PointBytes, scalar_for_party},
+        server::{
+            AvssTransition, DealPurpose, DepositHttpResponse, canonical_refresh_session,
+            canonical_reshare_session,
+        },
     };
     use curve25519_dalek::{Scalar, constants::ED25519_BASEPOINT_POINT};
     use std::collections::{BTreeMap, BTreeSet};
+    use zeroize::Zeroizing;
 
-    fn polynomial_public(
-        committee: Committee,
-        key_id: [u8; 32],
-        constant: u64,
-        nonconstant: u64,
-    ) -> EpochPublic {
-        polynomial_public_with_coefficients(committee, key_id, &[constant, nonconstant])
+    #[test]
+    fn deposit_allocation_budget_covers_failover_checkpoint_and_release() {
+        assert_eq!(
+            super::deposit_allocation_acceptance_timeout(std::time::Duration::from_secs(180))
+                .unwrap(),
+            std::time::Duration::from_secs(780)
+        );
+        assert!(super::deposit_allocation_acceptance_timeout(std::time::Duration::MAX).is_err());
+    }
+
+    #[test]
+    fn deposit_handoff_budget_covers_each_serial_bft_stage() {
+        let protocol_timeout = std::time::Duration::from_secs(180);
+        assert_eq!(DEPOSIT_HANDOFF_ACCEPTANCE_WINDOWS, 4);
+        assert_eq!(
+            deposit_handoff_acceptance_timeout(protocol_timeout).unwrap(),
+            std::time::Duration::from_secs(720)
+        );
+        assert!(deposit_handoff_acceptance_timeout(std::time::Duration::MAX).is_err());
+    }
+
+    #[test]
+    fn exact_observation_quorum_ignores_a_conflicting_first_response() {
+        let mut groups = Vec::new();
+        record_equal_observation(&mut groups, PartyId(1), 1_u8);
+        for party in 2_u16..=5 {
+            record_equal_observation(&mut groups, PartyId(party), 2_u8);
+        }
+
+        let required_parties = BTreeSet::from([PartyId(2)]);
+        let quorum = equal_observation_quorum(&groups, 4, &required_parties).unwrap().unwrap();
+        assert_eq!(quorum.value, 2);
+        assert_eq!(quorum.parties, (2_u16..=5).map(PartyId).collect::<BTreeSet<_>>());
+
+        // Re-observing one identity under the honest value cannot count that identity in both
+        // groups, and the required-party predicate is additive to the numeric quorum.
+        let required_parties = BTreeSet::from([PartyId(1)]);
+        assert!(equal_observation_quorum(&groups, 4, &required_parties).unwrap().is_none());
+        record_equal_observation(&mut groups, PartyId(1), 2_u8);
+        let quorum = equal_observation_quorum(&groups, 4, &required_parties).unwrap().unwrap();
+        assert_eq!(quorum.parties.len(), 5);
+        assert_eq!(groups.iter().filter(|group| group.parties.contains(&PartyId(1))).count(), 1);
+    }
+
+    #[test]
+    fn exact_observation_quorum_rejects_two_conflicting_quorums() {
+        let mut groups = Vec::new();
+        record_equal_observation(&mut groups, PartyId(1), 1_u8);
+        record_equal_observation(&mut groups, PartyId(2), 1_u8);
+        record_equal_observation(&mut groups, PartyId(3), 2_u8);
+        record_equal_observation(&mut groups, PartyId(4), 2_u8);
+
+        assert!(
+            equal_observation_quorum(&groups, 2, &BTreeSet::new()).is_err(),
+            "the selector must never anchor on the first of two conflicting quorums"
+        );
+    }
+
+    fn observed_consolidation_decision_fixture() -> ObservedConsolidation {
+        let wallet = DepositWalletId([0x11; 32]);
+        let sweep = SweepId([0x12; 32]);
+        let session = SessionId([0x13; 32]);
+        let plan = SweepPlan {
+            id: sweep,
+            wallet,
+            sequence: 7,
+            epoch: 0,
+            destination_binding: [0x14; 32],
+            at_tip: ChainPoint::new(101, [0x15; 32]).unwrap(),
+            inputs: vec![WalletOutputId { transaction: [0x16; 32], index_in_transaction: 0 }],
+            total_input_atomic_units: 12_000_000_000,
+        };
+        let signed = SignedTransactionBinding {
+            authorization: [0x17; 32],
+            attempt: 1,
+            attempt_binding: [0x18; 32],
+            session,
+            signing_context: [0x19; 32],
+            opaque_intent: OpaqueIntentBinding([0x1a; 32]),
+            transaction: [0x1b; 32],
+            exact_bytes: [0x1c; 32],
+            exact_bytes_len: 2_167,
+        };
+        ObservedConsolidation(PublicConsolidationStatus {
+            portable: None,
+            live: Some(PublicLiveConsolidationStatus {
+                authorization: ConsolidationId([0x1d; 32]),
+                sweep,
+                plan,
+                signed: Some(signed),
+                certificate_digest: Some([0x1e; 32]),
+                phase: PublicConsolidationPhase::Broadcast,
+                destination_binding: [0x14; 32],
+                confirmation: None,
+                bootstrap_ba_view: 0,
+                bootstrap_ba_proposer: PartyId(2),
+                bootstrap_prepared_intent_digest: [0x1f; 32],
+                bootstrap_certificate_digest: [0x20; 32],
+                bootstrap_certificate_signers: vec![PartyId(1), PartyId(2), PartyId(3), PartyId(4)],
+                roast_view: 0,
+                roast_relay_seed: PartyId(1),
+                roast_signers: vec![PartyId(1), PartyId(2), PartyId(3), PartyId(4)],
+                roast_view_count: 1,
+                roast_candidate_count: 1,
+                roast_endorsed_candidate_count: 1,
+                roast_intent_certificate_digest: [0x20; 32],
+                roast_intent_certificate_signers: vec![
+                    PartyId(1),
+                    PartyId(2),
+                    PartyId(3),
+                    PartyId(4),
+                ],
+                roast_attempt_binding_digest: [0x18; 32],
+                roast_endorsed_witness_count: 2,
+                roast_endorsed_evidence_digest: [0x21; 32],
+                completion_certificate_signers: vec![
+                    PartyId(1),
+                    PartyId(2),
+                    PartyId(3),
+                    PartyId(4),
+                ],
+                key_image_binding_digest: [0x22; 32],
+                key_image_unsigned_transaction_digest: [0x23; 32],
+                key_image_preprocess_set_digest: [0x24; 32],
+                key_image_authorizers: vec![PartyId(1), PartyId(2), PartyId(3), PartyId(4)],
+                key_image_authorization_quorum: 4,
+            }),
+        })
+    }
+
+    #[test]
+    fn consolidation_quorum_ignores_valid_witness_subset_and_diagnostic_supersets() {
+        let expected = observed_consolidation_decision_fixture();
+        let mut alternate = expected.clone();
+        let live = alternate.0.live.as_mut().unwrap();
+        live.bootstrap_ba_view = 3;
+        live.bootstrap_ba_proposer = PartyId(5);
+        live.bootstrap_certificate_signers = vec![PartyId(1), PartyId(2), PartyId(3), PartyId(5)];
+        live.roast_intent_certificate_signers =
+            vec![PartyId(1), PartyId(3), PartyId(4), PartyId(5)];
+        live.completion_certificate_signers = vec![PartyId(2), PartyId(3), PartyId(4), PartyId(5)];
+        live.roast_candidate_count = 3;
+        live.roast_endorsed_candidate_count = 2;
+        live.roast_endorsed_witness_count = 4;
+        live.roast_endorsed_evidence_digest = [0x25; 32];
+        assert!(expected.same_quorum_decision(&alternate));
+
+        alternate.0.live.as_mut().unwrap().roast_attempt_binding_digest = [0x26; 32];
+        assert!(!expected.same_quorum_decision(&alternate));
+    }
+
+    fn deposit_ttl_facts_fixture()
+    -> ([u64; 6], DepositTtlAllocationFacts, DepositTtlAllocationFacts, DepositTtlAllocationFacts)
+    {
+        const TTL: u64 = crate::deposit_ledger::UNUSED_ALLOCATION_TTL_SECONDS;
+        let bootstrap = 1_700_000_000;
+        let unused_visible = bootstrap + 60;
+        let permanent_visible = unused_visible + 60;
+        let unused_expired = unused_visible + TTL;
+        let permanent_expired = permanent_visible + TTL;
+        (
+            [
+                bootstrap,
+                unused_visible,
+                permanent_visible,
+                unused_expired - 1,
+                unused_expired,
+                permanent_expired,
+            ],
+            DepositTtlAllocationFacts {
+                request: [1; 32],
+                sequence: 1,
+                account: 0,
+                address_index: 1,
+                address: "unused".to_owned(),
+                created_at: unused_visible,
+                expires_at: unused_expired,
+                statement: [11; 32],
+            },
+            DepositTtlAllocationFacts {
+                request: [2; 32],
+                sequence: 2,
+                account: 0,
+                address_index: 2,
+                address: "permanent".to_owned(),
+                created_at: permanent_visible,
+                expires_at: permanent_expired,
+                statement: [12; 32],
+            },
+            DepositTtlAllocationFacts {
+                request: [3; 32],
+                sequence: 3,
+                account: 0,
+                address_index: 3,
+                address: "replacement".to_owned(),
+                created_at: permanent_expired,
+                expires_at: permanent_expired + TTL,
+                statement: [13; 32],
+            },
+        )
+    }
+
+    #[test]
+    fn deposit_ttl_acceptance_facts_require_exact_boundaries_and_non_reuse() {
+        let (clock, unused, permanent, replacement) = deposit_ttl_facts_fixture();
+        validate_deposit_ttl_acceptance_facts(clock, &unused, &permanent, &replacement).unwrap();
+    }
+
+    #[test]
+    fn deposit_ttl_acceptance_facts_reject_an_off_by_one_expiry_boundary() {
+        let (mut clock, unused, permanent, replacement) = deposit_ttl_facts_fixture();
+        clock[3] -= 1;
+        assert!(
+            validate_deposit_ttl_acceptance_facts(clock, &unused, &permanent, &replacement)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn deposit_ttl_acceptance_facts_reject_reused_or_non_monotonic_allocations() {
+        let (clock, unused, permanent, mut replacement) = deposit_ttl_facts_fixture();
+        replacement.address = unused.address.clone();
+        assert!(
+            validate_deposit_ttl_acceptance_facts(clock, &unused, &permanent, &replacement)
+                .is_err()
+        );
+
+        let (clock, unused, permanent, mut replacement) = deposit_ttl_facts_fixture();
+        replacement.sequence = permanent.sequence;
+        assert!(
+            validate_deposit_ttl_acceptance_facts(clock, &unused, &permanent, &replacement)
+                .is_err()
+        );
+    }
+
+    fn certified_deposit_status_fixture()
+    -> (EpochPublic, CertifiedDeposit, CompactEpochRegistry, DepositHttpResponse) {
+        let identities = (1_u16..=4)
+            .map(|party| {
+                let id = PartyId(party);
+                let mut encryption_secret = [0x58; 32];
+                encryption_secret[1] = u8::try_from(party).unwrap();
+                let identity = Identity::from_test_secrets(
+                    id,
+                    0,
+                    &[u8::try_from(party).unwrap(); 32],
+                    encryption_secret,
+                )
+                .unwrap();
+                (id, identity)
+            })
+            .collect::<BTreeMap<_, _>>();
+        let committee = Committee {
+            epoch: 0,
+            threshold: 2,
+            members: identities
+                .values()
+                .map(|identity| Member {
+                    id: identity.party(),
+                    signing_key: identity.signing_public_key(),
+                    encryption_key: identity.encryption_public_key(),
+                })
+                .collect(),
+        }
+        .canonicalized()
+        .unwrap();
+        committee.validate_async_security_with_faults(1).unwrap();
+
+        let root_spend_key = (ED25519_BASEPOINT_POINT * Scalar::from(42_u64)).compress().to_bytes();
+        let deriver = DepositAddressDeriver::new(
+            crate::config::NetworkKind::Regtest,
+            root_spend_key,
+            &Zeroizing::new(Scalar::from(17_u64).to_bytes()),
+        )
+        .unwrap();
+        let index = DepositSubaddressIndex::new(0, 1).unwrap();
+        let public = polynomial_public_with_coefficients(committee.clone(), [0xd2; 32], &[42, 7]);
+        let activation = public.activation_digest().unwrap();
+        let registry_for_authority = |activation, certified_root| {
+            let target = VerifiedRegistryHandoffTarget::for_test(
+                committee.clone(),
+                1,
+                activation,
+                certified_root,
+                deriver.wallet_id(),
+                public.key_id,
+                public.group_key_bytes(),
+            )
+            .unwrap();
+            let registry = prepare_compact_registry_genesis(&target, index, [0x44; 32])
+                .unwrap()
+                .proposed_head()
+                .registry()
+                .clone();
+            let link = RegistryLink::genesis(&target, index, [0x44; 32]).unwrap();
+            let issuer =
+                VerifiedIssuerWindow::from_links(&link, registry.id().index_root(), None).unwrap();
+            (registry, issuer)
+        };
+        let (registry, issuer) = registry_for_authority(activation, [0xd1; 32]);
+        let (alternate_registry, alternate_issuer) = registry_for_authority(activation, [0xd4; 32]);
+        let (conflicting_registry, _) = registry_for_authority([0xee; 32], [0xd5; 32]);
+
+        let request = DepositAddressRequest {
+            request: LedgerRequestId([0x61; 32]),
+            binding: RequestBinding([0x62; 32]),
+        };
+        let certified_request = tenant_certified_request_id(request);
+        let address = deriver.derive(index);
+        let created_at = 1_700_000_000;
+        let statement = LedgerStatement::allocation(
+            &registry,
+            registry.active().start_sequence(),
+            registry.active().predecessor_ledger_head(),
+            certified_request,
+            tenant_bound_request_binding(request),
+            address.clone(),
+            ChainPoint::new(100, [0x63; 32]).unwrap(),
+            created_at,
+        )
+        .unwrap();
+        let payload = statement.attestation_payload().unwrap();
+        let attestations = identities
+            .values()
+            .take(3)
+            .map(|identity| {
+                identity
+                    .sign_envelope(
+                        &committee,
+                        statement.slot_session(),
+                        None,
+                        statement.sequence,
+                        payload.clone(),
+                    )
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let certificate = CertifiedLedgerEntry { statement, attestations };
+        certificate.verify_active(&registry, None).unwrap();
+        let response = DepositHttpResponse {
+            request: request.request,
+            certified_request,
+            status: DepositHttpStatus::Active,
+            address: Some(address),
+            certificate: Some(certificate),
+            allocation_issuer: Some(issuer.clone()),
+            serving_registry: registry.clone(),
+            created_at: Some(created_at),
+            expires_at: Some(created_at + UNUSED_ALLOCATION_TTL_SECONDS),
+            leader: PartyId(1),
+        };
+        let mut alternate_response = response.clone();
+        alternate_response.serving_registry = alternate_registry;
+        alternate_response.allocation_issuer = Some(alternate_issuer);
+        (
+            public,
+            CertifiedDeposit {
+                request,
+                response,
+                allocation_issuer: issuer.issuer().clone(),
+                funded_outputs: Vec::new(),
+            },
+            conflicting_registry,
+            alternate_response,
+        )
+    }
+
+    #[test]
+    fn deposit_allocation_quorum_ignores_a_valid_alternate_root_first() {
+        let (public, deposit, _, alternate_response) = certified_deposit_status_fixture();
+        let canonical = validate_new_deposit_certificate(
+            NetworkKind::Regtest,
+            &public,
+            1,
+            deposit.request,
+            &deposit.response,
+        )
+        .unwrap();
+        let alternate = validate_new_deposit_certificate(
+            NetworkKind::Regtest,
+            &public,
+            1,
+            deposit.request,
+            &alternate_response,
+        )
+        .unwrap();
+        assert_eq!(canonical.statement, alternate.statement);
+        assert_ne!(canonical, alternate);
+
+        let mut groups = Vec::new();
+        let mut responses = BTreeMap::new();
+        record_equal_observation(&mut groups, PartyId(1), alternate.clone());
+        responses.insert(
+            PartyId(1),
+            ValidatedDepositAllocationResponse {
+                candidate: alternate,
+                response: alternate_response,
+            },
+        );
+        for party in 2_u16..=4 {
+            let party = PartyId(party);
+            let mut response = deposit.response.clone();
+            response.leader = party;
+            record_equal_observation(&mut groups, party, canonical.clone());
+            responses.insert(
+                party,
+                ValidatedDepositAllocationResponse { candidate: canonical.clone(), response },
+            );
+        }
+
+        let (selected, replicas) = certified_deposit_candidate_quorum(
+            deposit.request,
+            &groups,
+            &responses,
+            3,
+            &BTreeSet::new(),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(replicas, vec![PartyId(2), PartyId(3), PartyId(4)]);
+        assert_eq!(selected.response.serving_registry, deposit.response.serving_registry);
+        assert_eq!(selected.response.certificate, deposit.response.certificate);
+    }
+
+    #[test]
+    fn current_active_status_rejects_a_terminal_issuer_window() {
+        let (public, deposit, _, _) = certified_deposit_status_fixture();
+        let mut response = deposit.response.clone();
+        let certificate = response.certificate.as_ref().unwrap();
+        let issuer = response.allocation_issuer.as_ref().unwrap();
+        let terminal = IssuerTerminalSeal {
+            sequence: certificate.statement.sequence,
+            statement_digest: certificate.statement.digest(),
+            successor_epoch: issuer.issuer().epoch().checked_add(1).unwrap(),
+        };
+        let mut encoded = serde_json::to_value(issuer).unwrap();
+        encoded["terminal"] = serde_json::to_value(terminal).unwrap();
+        let terminal_issuer: VerifiedIssuerWindow = serde_json::from_value(encoded).unwrap();
+        terminal_issuer.validate().unwrap();
+        certificate.verify(&terminal_issuer, None).unwrap();
+        response.allocation_issuer = Some(terminal_issuer);
+
+        assert!(
+            validate_new_deposit_certificate(
+                NetworkKind::Regtest,
+                &public,
+                1,
+                deposit.request,
+                &response,
+            )
+            .is_err()
+        );
+        assert!(
+            validate_ttl_replica_response(
+                &public,
+                1,
+                PartyId(2),
+                &deposit,
+                DepositHttpStatus::Active,
+                &response,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn expired_status_rejects_a_corrupt_retained_certificate() {
+        let (public, mut deposit, _, _) = certified_deposit_status_fixture();
+        deposit.response.certificate.as_mut().unwrap().statement.sequence += 1;
+        let mut expired = deposit.response.clone();
+        expired.status = DepositHttpStatus::Expired;
+        expired.address = None;
+        expired.certificate = None;
+
+        assert!(
+            validate_ttl_replica_response(
+                &public,
+                1,
+                PartyId(2),
+                &deposit,
+                DepositHttpStatus::Expired,
+                &expired,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn certified_status_accepts_consensus_view_changes_between_committee_members() {
+        let (public, deposit, _, _) = certified_deposit_status_fixture();
+
+        let mut active = deposit.response.clone();
+        active.leader = PartyId(2);
+        validate_ttl_replica_response(
+            &public,
+            1,
+            PartyId(3),
+            &deposit,
+            DepositHttpStatus::Active,
+            &active,
+        )
+        .unwrap();
+
+        let mut permanent = active.clone();
+        permanent.status = DepositHttpStatus::Permanent;
+        validate_ttl_replica_response(
+            &public,
+            1,
+            PartyId(3),
+            &deposit,
+            DepositHttpStatus::Permanent,
+            &permanent,
+        )
+        .unwrap();
+
+        let mut expired = active;
+        expired.status = DepositHttpStatus::Expired;
+        expired.address = None;
+        expired.certificate = None;
+        validate_ttl_replica_response(
+            &public,
+            1,
+            PartyId(3),
+            &deposit,
+            DepositHttpStatus::Expired,
+            &expired,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn certified_status_rejects_non_member_leaders_and_conflicting_authority() {
+        let (public, deposit, conflicting_registry, _) = certified_deposit_status_fixture();
+
+        let mut non_member = deposit.response.clone();
+        non_member.leader = PartyId(9);
+        assert!(
+            validate_ttl_replica_response(
+                &public,
+                1,
+                PartyId(3),
+                &deposit,
+                DepositHttpStatus::Active,
+                &non_member,
+            )
+            .is_err()
+        );
+
+        let mut wrong_registry = deposit.response.clone();
+        wrong_registry.leader = PartyId(2);
+        wrong_registry.serving_registry = conflicting_registry;
+        assert!(
+            validate_ttl_replica_response(
+                &public,
+                1,
+                PartyId(3),
+                &deposit,
+                DepositHttpStatus::Active,
+                &wrong_registry,
+            )
+            .is_err()
+        );
+
+        let mut wrong_certificate = deposit.response.clone();
+        wrong_certificate.leader = PartyId(2);
+        wrong_certificate.certificate.as_mut().unwrap().statement.sequence += 1;
+        assert!(
+            validate_ttl_replica_response(
+                &public,
+                1,
+                PartyId(3),
+                &deposit,
+                DepositHttpStatus::Active,
+                &wrong_certificate,
+            )
+            .is_err()
+        );
     }
 
     fn polynomial_public_with_coefficients(
@@ -4797,7 +7623,11 @@ mod tests {
     fn dynamic_refresh_fixture(rotated_members: usize) -> (EpochPublic, EpochPublic) {
         let scenario: Scenario =
             serde_json::from_str(include_str!("../docker/configs/regtest-scenario.json")).unwrap();
-        let source = polynomial_public(configured_shape(&scenario, 4), [0x5a; 32], 11, 17);
+        let source = polynomial_public_with_coefficients(
+            configured_shape(&scenario, 4),
+            [0x5a; 32],
+            &[11, 17, 19],
+        );
         let mut target = source.committee.clone();
         target.epoch = 5;
         for member in target.members.iter_mut().take(rotated_members) {
@@ -4807,7 +7637,7 @@ mod tests {
                 Identity::from_test_secrets(member.id, 5, &signing_seed, x25519_secret).unwrap();
             member.encryption_key = rotated.encryption_public_key();
         }
-        let refreshed = polynomial_public(target, source.key_id, 11, 23);
+        let refreshed = polynomial_public_with_coefficients(target, source.key_id, &[11, 23, 29]);
         (source, refreshed)
     }
 
@@ -4818,6 +7648,16 @@ mod tests {
         scenario.validate().unwrap();
         assert_eq!(scenario.committees.len(), 5);
         assert_eq!(scenario.proactive_refresh_interval_seconds, 15);
+        let refresh_source = scenario.committee_spec(1).unwrap();
+        let refresh_target = scenario.committee_spec(2).unwrap();
+        assert_eq!(refresh_source.threshold, 4);
+        assert_eq!(refresh_source.fault_bound, 1);
+        assert_eq!(refresh_source.members, refresh_target.members);
+        assert_eq!(refresh_source.eligible_members, refresh_target.eligible_members);
+        assert_eq!(
+            refresh_target.eligible_members.len(),
+            refresh_target.members.len() + usize::from(refresh_target.fault_bound)
+        );
 
         let signing_seeds = [
             include_str!("../docker/demo-secrets/p1-signing-seed.hex"),
@@ -4827,6 +7667,7 @@ mod tests {
             include_str!("../docker/demo-secrets/p5-signing-seed.hex"),
             include_str!("../docker/demo-secrets/p6-signing-seed.hex"),
             include_str!("../docker/demo-secrets/p7-signing-seed.hex"),
+            include_str!("../docker/demo-secrets/p8-signing-seed.hex"),
         ];
         let bootstrap_x25519_secrets = [
             include_str!("../docker/demo-secrets/p1-bootstrap-x25519-secret.hex"),
@@ -4834,36 +7675,46 @@ mod tests {
             include_str!("../docker/demo-secrets/p3-bootstrap-x25519-secret.hex"),
             include_str!("../docker/demo-secrets/p4-bootstrap-x25519-secret.hex"),
             include_str!("../docker/demo-secrets/p5-bootstrap-x25519-secret.hex"),
-            include_str!("../docker/demo-secrets/p6-bootstrap-x25519-secret.hex"),
-            include_str!("../docker/demo-secrets/p7-bootstrap-x25519-secret.hex"),
         ];
-        for (index, (encoded_signing_seed, encoded_bootstrap_secret)) in
-            signing_seeds.into_iter().zip(bootstrap_x25519_secrets).enumerate()
-        {
+        for (index, encoded_signing_seed) in signing_seeds.into_iter().enumerate() {
             let party_id = PartyId(u16::try_from(index + 1).unwrap());
             let signing_seed: [u8; 32] =
                 hex::decode(encoded_signing_seed.trim()).unwrap().try_into().unwrap();
-            let bootstrap_secret: [u8; 32] =
-                hex::decode(encoded_bootstrap_secret.trim()).unwrap().try_into().unwrap();
             let party = scenario.party(party_id).unwrap();
             assert_eq!(
                 Identity::signing_public_key_from_seed(&signing_seed).unwrap(),
                 party.signing_key.0
             );
+        }
+        let mut provisioned_bootstrap_keys = BTreeSet::new();
+        for (index, encoded_bootstrap_secret) in bootstrap_x25519_secrets.into_iter().enumerate() {
+            let party_id = PartyId(u16::try_from(index + 1).unwrap());
+            let bootstrap_secret: [u8; 32] =
+                hex::decode(encoded_bootstrap_secret.trim()).unwrap().try_into().unwrap();
+            let party = scenario.party(party_id).unwrap();
             let bootstrap_public =
                 x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from(bootstrap_secret))
                     .to_bytes();
             assert_eq!(bootstrap_public, party.bootstrap_encryption_key.0);
+            assert!(provisioned_bootstrap_keys.insert(bootstrap_public));
+        }
+        for party_id in (6_u16..=8).map(PartyId) {
+            let sentinel = scenario.party(party_id).unwrap().bootstrap_encryption_key.0;
+            assert_ne!(sentinel, [0; 32]);
+            assert!(
+                !provisioned_bootstrap_keys.contains(&sentinel),
+                "post-genesis party {party_id} unexpectedly has a provisioned bootstrap secret"
+            );
         }
 
         let genesis = scenario.genesis_committee().unwrap();
         let grow = scenario
-            .configured_key_rotation_target_policy(&genesis)
+            .configured_key_rotation_target_shape(&genesis)
             .unwrap()
             .expect("configured grow");
         assert_eq!(grow.eligible().epoch, 1);
         assert_eq!(grow.eligible().threshold, 4);
-        assert_eq!(grow.selection_size(), 7);
+        assert_eq!(grow.desired_n(), 7);
         // Eligible members carry a publicly derivable eligibility-reference key rather than any
         // real encryption key: the target policy overwrites every X25519 byte with a deterministic
         // domain separator that can never be used for encryption or become a successor key. Confirm
@@ -4875,16 +7726,81 @@ mod tests {
             assert_eq!(grow.eligible().member(party).unwrap().encryption_key, reference);
             assert_ne!(reference, scenario.party(party).unwrap().bootstrap_encryption_key.0);
         }
+
+        let shrink = scenario
+            .configured_key_rotation_target_shape(&configured_shape(&scenario, 3))
+            .unwrap()
+            .expect("configured shrink");
+        assert_eq!(shrink.eligible().threshold, 3);
+        assert_eq!(shrink.desired_n(), 5);
+        assert_eq!(
+            shrink.eligible().members.iter().map(|member| member.id).collect::<Vec<_>>(),
+            [2_u16, 3, 4, 6, 7, 8].into_iter().map(PartyId).collect::<Vec<_>>()
+        );
     }
 
     #[test]
-    fn dynamic_refresh_accepts_an_immediate_n_minus_f_key_rotation_and_fresh_polynomial() {
-        let (source, refreshed) = dynamic_refresh_fixture(3);
-        assert_eq!(validate_dynamic_refresh(&source, &refreshed, 1).unwrap(), 3);
+    fn dynamic_refresh_accepts_an_exact_fresh_selected_committee_and_polynomial() {
+        let scenario: Scenario =
+            serde_json::from_str(include_str!("../docker/configs/regtest-scenario.json")).unwrap();
+        let (source, refreshed) = dynamic_refresh_fixture(5);
+        assert_eq!(validate_dynamic_refresh(&scenario, &source, &refreshed, 1).unwrap(), 5);
         let evidence =
             validate_cross_epoch_subthreshold_non_identifiability(&source, &refreshed).unwrap();
-        assert_eq!(evidence.mixed_sets, 16);
-        assert_eq!(evidence.threshold_boundary_sets, 12);
+        assert_eq!(evidence.mixed_sets, 225);
+        assert_eq!(evidence.threshold_boundary_sets, 20);
+    }
+
+    #[test]
+    fn exact_refresh_evidence_authenticates_refresh_and_rejects_reshare_purpose() {
+        let (source, refreshed) = dynamic_refresh_fixture(5);
+        let history_parent =
+            EpochHistoryParent::genesis([0x71; 32], source.key_id).expect("history parent");
+        let dealers = source.committee.members.iter().map(|member| member.id).collect::<Vec<_>>();
+        let refresh = AvssTransition {
+            purpose: DealPurpose::Refresh,
+            session: canonical_refresh_session(&source, &refreshed.committee, history_parent)
+                .unwrap(),
+            key_id: source.key_id,
+            fault_bound: 1,
+            history_parent,
+            old: Some(source.clone()),
+            target: refreshed.committee.clone(),
+            eligible_dealers: dealers,
+        };
+        let refresh_digest = acceptance_avss_transition_digest(&refresh).unwrap();
+        let evidence = validate_exact_same_committee_refresh(
+            &source,
+            &refreshed,
+            1,
+            history_parent,
+            refresh_digest,
+        )
+        .unwrap();
+        assert_eq!(
+            evidence.members,
+            source.committee.members.iter().map(|member| member.id).collect::<Vec<_>>()
+        );
+        assert_ne!(evidence.source_verification_shares, evidence.target_verification_shares);
+        assert_eq!(evidence.refresh_transition_digest, refresh_digest);
+        assert_ne!(evidence.refresh_transition_digest, evidence.reshare_transition_digest);
+
+        let mut reshare = refresh;
+        reshare.purpose = DealPurpose::Reshare;
+        reshare.session =
+            canonical_reshare_session(&source, &refreshed.committee, history_parent).unwrap();
+        let reshare_digest = acceptance_avss_transition_digest(&reshare).unwrap();
+        assert_eq!(evidence.reshare_transition_digest, reshare_digest);
+        let error = validate_exact_same_committee_refresh(
+            &source,
+            &refreshed,
+            1,
+            history_parent,
+            reshare_digest,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("does not bind the expected zero-constant refresh"), "{error}");
     }
 
     #[test]
@@ -4917,50 +7833,64 @@ mod tests {
             key_id,
             &[11, 17, 19, 23],
         );
-        let after_shrink =
-            polynomial_public_with_coefficients(configured_shape(&scenario, 4), key_id, &[11, 29]);
+        let after_shrink = polynomial_public_with_coefficients(
+            configured_shape(&scenario, 4),
+            key_id,
+            &[11, 29, 31],
+        );
         assert_eq!(before_shrink.committee.frost_index(PartyId(2)).unwrap(), 2);
         assert_eq!(after_shrink.committee.frost_index(PartyId(2)).unwrap(), 1);
-        for removed in [PartyId(1), PartyId(3), PartyId(5)] {
+        for removed in [PartyId(1), PartyId(5)] {
             assert!(before_shrink.committee.member(removed).is_ok());
             assert!(after_shrink.committee.member(removed).is_err());
         }
+        assert!(after_shrink.committee.member(PartyId(3)).is_ok());
         let shrink =
             validate_cross_epoch_subthreshold_non_identifiability(&before_shrink, &after_shrink)
                 .unwrap();
-        assert_eq!(shrink.mixed_sets, 252);
-        assert_eq!(shrink.threshold_boundary_sets, 41);
+        assert_eq!(shrink.mixed_sets, 945);
+        assert_eq!(shrink.threshold_boundary_sets, 45);
     }
 
     #[test]
     fn dynamic_refresh_rejects_too_few_rotated_encryption_keys() {
+        let scenario: Scenario =
+            serde_json::from_str(include_str!("../docker/configs/regtest-scenario.json")).unwrap();
         let (source, refreshed) = dynamic_refresh_fixture(2);
-        let error = validate_dynamic_refresh(&source, &refreshed, 1).unwrap_err().to_string();
-        assert!(error.contains("requires at least n-f=3"), "{error}");
+        let error =
+            validate_dynamic_refresh(&scenario, &source, &refreshed, 1).unwrap_err().to_string();
+        assert!(error.contains("reused a source receiver key"), "{error}");
     }
 
     #[test]
     fn dynamic_refresh_rejects_reused_share_polynomial() {
-        let (source, mut refreshed) = dynamic_refresh_fixture(3);
+        let scenario: Scenario =
+            serde_json::from_str(include_str!("../docker/configs/regtest-scenario.json")).unwrap();
+        let (source, mut refreshed) = dynamic_refresh_fixture(5);
         refreshed.verification_shares.clone_from(&source.verification_shares);
         refreshed.group_key = source.group_key;
         refreshed.validate().unwrap();
-        let error = validate_dynamic_refresh(&source, &refreshed, 1).unwrap_err().to_string();
+        let error =
+            validate_dynamic_refresh(&scenario, &source, &refreshed, 1).unwrap_err().to_string();
         assert!(error.contains("reused the source verification-share polynomial"), "{error}");
     }
 
     #[test]
     fn dynamic_refresh_rejects_non_immediate_epoch_and_signing_key_change() {
-        let (source, mut skipped) = dynamic_refresh_fixture(3);
+        let scenario: Scenario =
+            serde_json::from_str(include_str!("../docker/configs/regtest-scenario.json")).unwrap();
+        let (source, mut skipped) = dynamic_refresh_fixture(5);
         skipped.committee.epoch = 6;
-        let error = validate_dynamic_refresh(&source, &skipped, 1).unwrap_err().to_string();
+        let error =
+            validate_dynamic_refresh(&scenario, &source, &skipped, 1).unwrap_err().to_string();
         assert!(error.contains("must activate immediate epoch 5"), "{error}");
 
-        let (_, mut changed_identity) = dynamic_refresh_fixture(3);
+        let (_, mut changed_identity) = dynamic_refresh_fixture(5);
         changed_identity.committee.members[0].signing_key = [0xee; 32];
         changed_identity.validate().unwrap();
-        let error =
-            validate_dynamic_refresh(&source, &changed_identity, 1).unwrap_err().to_string();
+        let error = validate_dynamic_refresh(&scenario, &source, &changed_identity, 1)
+            .unwrap_err()
+            .to_string();
         assert!(error.contains("stable signing key"), "{error}");
     }
 
@@ -4992,18 +7922,41 @@ mod tests {
     }
 
     #[test]
-    fn deposit_request_uses_the_first_responsive_committee_member() {
+    fn deposit_checkpoint_fault_premine_is_mode_specific() {
+        let checkpoint = parse_acceptance_deposit_fault_mode("deposit_checkpoint").unwrap();
+        assert_eq!(checkpoint, AcceptanceDepositFaultMode::DepositCheckpoint);
+        assert_eq!(deposit_fault_confirmation_plan(Some(checkpoint), 10).unwrap(), (9, 0));
+
+        let observer = parse_acceptance_deposit_fault_mode("observer_fork").unwrap();
+        assert_eq!(observer, AcceptanceDepositFaultMode::ObserverFork);
+        assert_eq!(deposit_fault_confirmation_plan(Some(observer), 10).unwrap(), (0, 9));
+        assert_eq!(deposit_fault_confirmation_plan(None, 10).unwrap(), (0, 9));
+        assert!(deposit_fault_confirmation_plan(Some(checkpoint), 0).is_err());
+    }
+
+    #[test]
+    fn deposit_fault_mode_rejects_unknown_values() {
+        assert!(parse_acceptance_deposit_fault_mode("future_mode").is_err());
+        assert!(parse_acceptance_deposit_fault_mode("").is_err());
+    }
+
+    #[test]
+    fn deposit_request_rotates_over_all_responsive_committee_members() {
         let scenario: Scenario =
             serde_json::from_str(include_str!("../docker/configs/regtest-scenario.json")).unwrap();
         let committee = scenario.genesis_committee().unwrap();
-        assert_eq!(allocation_request_party(&committee, &BTreeSet::new()).unwrap(), PartyId(1));
         assert_eq!(
-            allocation_request_party(&committee, &BTreeSet::from([PartyId(1)])).unwrap(),
-            PartyId(2)
+            allocation_request_parties(&committee, 1, &BTreeSet::new()).unwrap(),
+            (1_u16..=5).map(PartyId).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            allocation_request_parties(&committee, 1, &BTreeSet::from([PartyId(1)])).unwrap(),
+            vec![PartyId(2), PartyId(3), PartyId(4), PartyId(5)]
         );
         assert!(
-            allocation_request_party(
+            allocation_request_parties(
                 &committee,
+                1,
                 &committee.members.iter().map(|member| member.id).collect(),
             )
             .is_err()
@@ -5011,18 +7964,64 @@ mod tests {
     }
 
     #[test]
-    fn deposit_status_retries_a_historical_leader_until_the_current_handoff_arrives() {
-        assert!(!deposit_status_reached_current_epoch(
-            DepositHttpStatus::Permanent,
-            PartyId(1),
-            DepositHttpStatus::Permanent,
-            PartyId(2),
-        ));
+    fn deposit_status_accepts_any_expected_committee_leader_and_rejects_outsiders() {
+        let (public, deposit, _, _) = certified_deposit_status_fixture();
+        let mut response = deposit.response;
+        response.status = DepositHttpStatus::Permanent;
         assert!(deposit_status_reached_current_epoch(
+            &response,
             DepositHttpStatus::Permanent,
-            PartyId(2),
+            &public,
+            1,
+        ));
+        response.leader = PartyId(2);
+        assert!(deposit_status_reached_current_epoch(
+            &response,
             DepositHttpStatus::Permanent,
-            PartyId(2),
+            &public,
+            1,
+        ));
+        response.leader = PartyId(9);
+        assert!(!deposit_status_reached_current_epoch(
+            &response,
+            DepositHttpStatus::Permanent,
+            &public,
+            1,
+        ));
+        response.leader = PartyId(2);
+        response.status = DepositHttpStatus::Active;
+        assert!(!deposit_status_reached_current_epoch(
+            &response,
+            DepositHttpStatus::Permanent,
+            &public,
+            1,
+        ));
+    }
+
+    #[test]
+    fn overlapping_leader_cannot_make_a_stale_registry_count_as_the_successor_epoch() {
+        let (source, deposit, _, _) = certified_deposit_status_fixture();
+        let successor_committee = Committee {
+            epoch: 1,
+            threshold: source.committee.threshold,
+            members: source.committee.members.clone(),
+        }
+        .canonicalized()
+        .unwrap();
+        let successor =
+            polynomial_public_with_coefficients(successor_committee, source.key_id, &[42, 9]);
+        assert_eq!(source.group_key_bytes(), successor.group_key_bytes());
+
+        let mut stale = deposit.response;
+        stale.status = DepositHttpStatus::Permanent;
+        stale.leader = PartyId(1);
+        assert!(source.committee.member(stale.leader).is_ok());
+        assert!(successor.committee.member(stale.leader).is_ok());
+        assert!(!deposit_status_reached_current_epoch(
+            &stale,
+            DepositHttpStatus::Permanent,
+            &successor,
+            1,
         ));
     }
 
@@ -5041,6 +8040,35 @@ mod tests {
     #[test]
     fn regtest_deposit_fixture_has_policy_headroom() {
         assert!(validate_consolidation_fixture_economics(100_000_000_000, 5_000_000_000).is_ok());
+    }
+
+    #[test]
+    fn certified_outputs_map_bijectively_across_overlapping_input_rings() {
+        let first = WalletOutputId { transaction: [1; 32], index_in_transaction: 0 };
+        let second = WalletOutputId { transaction: [1; 32], index_in_transaction: 1 };
+        let candidates = vec![vec![first, second], vec![second]];
+        let mut mapping = BTreeMap::new();
+        for ring_position in 0..candidates.len() {
+            assert!(assign_certified_input_ring(
+                ring_position,
+                &candidates,
+                &mut BTreeSet::new(),
+                &mut mapping,
+            ));
+        }
+        assert_eq!(mapping, BTreeMap::from([(first, 0), (second, 1)]));
+
+        let impossible = vec![vec![first], vec![first]];
+        let mut mapping = BTreeMap::new();
+        assert!(assign_certified_input_ring(0, &impossible, &mut BTreeSet::new(), &mut mapping,));
+        assert!(!assign_certified_input_ring(1, &impossible, &mut BTreeSet::new(), &mut mapping,));
+    }
+
+    #[test]
+    fn successor_funding_uses_the_five_outputs_after_the_initial_fixture() {
+        assert_eq!(successor_acceptance_funding_height(100, 1).unwrap(), 101);
+        assert_eq!(successor_acceptance_funding_height(100, 5).unwrap(), 105);
+        assert!(successor_acceptance_funding_height(100, 0).is_err());
     }
 
     #[test]

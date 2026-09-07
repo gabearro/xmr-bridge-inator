@@ -33,7 +33,7 @@ impl ConditionallySelectable for Scalar {
   fn conditional_select(a: &Self, b: &Self, choice: Choice) -> Self {
     let mut result = [0; 32];
     #[allow(clippy::needless_range_loop)]
-    for i in 0 .. 32 {
+    for i in 0..32 {
       result[i] = u8::conditional_select(&a.0[i], &b.0[i], choice);
     }
     Self(result)

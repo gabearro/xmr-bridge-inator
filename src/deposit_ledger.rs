@@ -41,6 +41,7 @@ use crate::{
         DepositIndexCheckpointOperation, PortableDepositIndexHead, VerifiedDepositIndexCheckpoint,
     },
     deposit_index_store::VerifiedSignedDepositObservationSlot,
+    deposit_state_export::DepositHandoffStateBinding,
     deposit_wallet::{
         CanonicalDepositAddress, ChainPoint, DepositSubaddressIndex, DepositWalletId,
         SignedSweepTransaction, VerifiedRecognitionAnchor, WalletOutputId,
@@ -981,7 +982,7 @@ impl LedgerStatement {
         registry: &CompactEpochRegistry,
         sequence: u64,
         previous: [u8; 32],
-        source_portable_index: [u8; 32],
+        source_state: DepositHandoffStateBinding,
         target: &VerifiedRegistryHandoffTarget,
         next_index: DepositSubaddressIndex,
     ) -> Result<Self, LedgerError> {
@@ -989,7 +990,7 @@ impl LedgerStatement {
             registry,
             sequence,
             previous,
-            source_portable_index,
+            source_state,
             target,
             next_index,
         )?;
@@ -1361,9 +1362,10 @@ impl CertifiedLedgerEntry {
     /// Authenticate an allocation and its exact n-f portable-index checkpoint.
     ///
     /// The returned value intentionally does not expose the address. Honest checkpoint signers
-    /// reject this allocation at/after `created_at`, so the verified n-f checkpoint is the
-    /// portable timely-incorporation proof. The service releases it through
-    /// [`VerifiedAllocationIssuanceSchedule::release_at`].
+    /// require an immutable signing reservation from before `created_at`; a retry may complete the
+    /// checkpoint later but remains tied to that pre-visibility reservation. The verified n-f
+    /// checkpoint is therefore the portable timely-admission proof. The service releases it
+    /// through [`VerifiedAllocationIssuanceSchedule::release_at`].
     pub fn verify_allocation_issuance_schedule(
         &self,
         issuer_window: &VerifiedIssuerWindow,
@@ -1384,7 +1386,7 @@ impl CertifiedLedgerEntry {
     }
 }
 
-/// API-unforgeable schedule for a certificate completed before client-visible issuance.
+/// API-unforgeable schedule whose checkpoint witnesses required pre-visibility reservations.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct VerifiedAllocationIssuanceSchedule {
     wallet: DepositWalletId,
@@ -2353,11 +2355,8 @@ fn validate_deposit_observation_static(
         || statement.output_key == [0; 32]
         || statement.block_timestamp > MAX_UNIX_TIMESTAMP
         || statement.observed_block.height > statement.confirmation_horizon.height
-        || statement
-            .observed_block
-            .height
-            .checked_add(required_distance)
-            .is_none_or(|height| height > statement.confirmation_horizon.height)
+        || statement.observed_block.height.checked_add(required_distance)
+            != Some(statement.confirmation_horizon.height)
     {
         return Err(LedgerError::InvalidDepositObservation);
     }
@@ -2721,7 +2720,6 @@ fn validate_consolidation_abandonment(
         || abandonment.observation_tip.height <= abandonment.ancestor.height
         || key_images.sweep() != abandonment.authorization.sweep_id()
         || key_images.inputs() != abandonment.inputs.as_slice()
-        || key_images.family_digest() != abandonment.family
         || key_images.signing_context().into_bytes() != abandonment.attempt.signing_context()
     {
         return Err(LedgerError::InvalidConsolidationAbandonment);
@@ -3297,6 +3295,36 @@ mod tests {
     }
 
     #[test]
+    fn unused_allocation_has_exact_thirty_day_release_boundaries() {
+        let deriver = deriver();
+        let visible_at = 1_700_000_000;
+        let expires_at = visible_at + UNUSED_ALLOCATION_TTL_SECONDS;
+        let schedule = VerifiedAllocationIssuanceSchedule {
+            wallet: deriver.wallet_id(),
+            sequence: 1,
+            statement: [0xa1; 32],
+            address: deriver.derive(DepositSubaddressIndex::new(0, 1).unwrap()),
+            visible_at,
+            expires_at,
+        };
+
+        assert!(matches!(
+            schedule.clone().release_at(visible_at - 1),
+            Err(LedgerError::AllocationIssuanceNotReady)
+        ));
+        let first = schedule.clone().release_at(visible_at).unwrap();
+        assert_eq!(first.issued_at(), visible_at);
+        assert_eq!(first.expires_at(), expires_at);
+        let last = schedule.clone().release_at(expires_at - 1).unwrap();
+        assert_eq!(last.address(), first.address());
+        assert!(matches!(
+            schedule.release_at(expires_at),
+            Err(LedgerError::AllocationIssuanceMissed)
+        ));
+        assert_eq!(expires_at - visible_at, 30 * 24 * 60 * 60);
+    }
+
+    #[test]
     fn fresh_compact_genesis_allocates_and_replays() {
         let (deriver, portable, pending, identities) = genesis_fixture();
         let registry = pending.proposed_head().registry().clone();
@@ -3645,11 +3673,13 @@ mod tests {
         let ledger = CompactLedgerCursor::genesis(&source, &portable_checkpoint).unwrap();
         let (target_committee, _) = committee(1);
         let target = registry_target(source.wallet(), target_committee, [2; 32], [0xd4; 32]);
+        let source_state =
+            DepositHandoffStateBinding::new(Some([0xd5; 32]), portable_checkpoint.clone()).unwrap();
         let statement = LedgerStatement::handoff(
             &source,
             ledger.next_sequence(),
             ledger.head(),
-            portable.digest(),
+            source_state,
             &target,
             ledger.next_index(),
         )

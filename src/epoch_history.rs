@@ -5,7 +5,7 @@
 //! epoch `e`; that prevents an activation/reshare certificate from being transplanted onto a
 //! forked or truncated history. Old entries are copied into immutable content-addressed objects
 //! and indexed by a persistent 64-level binary trie. Consequently, direct historical lookup is
-//! bounded by 65 object reads and does not replay the prefix.
+//! bounded by 65 index-node reads plus the entry named by the leaf and does not replay the prefix.
 //!
 //! Mutations deliberately use a three-step contract:
 //!
@@ -25,21 +25,22 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use crate::receiver_key_accumulator::ReceiverKeyAccumulatorCommitment;
 use crate::storage::{WalletArtifactKind, WalletArtifactRef, WalletId};
 
-const HISTORY_STATE_VERSION: u16 = 1;
-const HISTORY_HEAD_VERSION: u16 = 1;
-const HISTORY_ENTRY_VERSION: u16 = 1;
-const HISTORY_PARENT_VERSION: u16 = 1;
-const HISTORY_REFERENCE_VERSION: u16 = 1;
-const HISTORY_INDEX_NODE_VERSION: u16 = 1;
-const HISTORY_SUPERSESSION_VERSION: u16 = 1;
-const HISTORY_CATCHUP_VERSION: u16 = 1;
+const HISTORY_STATE_VERSION: u16 = 2;
+const HISTORY_HEAD_VERSION: u16 = 2;
+const HISTORY_ENTRY_VERSION: u16 = 2;
+const HISTORY_PARENT_VERSION: u16 = 2;
+const HISTORY_REFERENCE_VERSION: u16 = 2;
+const HISTORY_INDEX_NODE_VERSION: u16 = 2;
+const HISTORY_SUPERSESSION_VERSION: u16 = 2;
+const HISTORY_CATCHUP_VERSION: u16 = 2;
 
-const HISTORY_ENTRY_ROOT_DOMAIN: &[u8] = b"threshold-monero/epoch-history/entry-root/v1";
-const HISTORY_PARENT_BINDING_DOMAIN: &[u8] = b"threshold-monero/epoch-history/transition-parent/v1";
-const HISTORY_GENESIS_ANCHOR_DOMAIN: &[u8] = b"threshold-monero/epoch-history/genesis-anchor/v1";
-const HISTORY_OUTBOX_ROOT_DOMAIN: &[u8] = b"threshold-monero/epoch-history/avss-outbox-closure/v1";
+const HISTORY_ENTRY_ROOT_DOMAIN: &[u8] = b"threshold-monero/epoch-history/entry-root/v2";
+const HISTORY_PARENT_BINDING_DOMAIN: &[u8] = b"threshold-monero/epoch-history/transition-parent/v2";
+const HISTORY_GENESIS_ANCHOR_DOMAIN: &[u8] = b"threshold-monero/epoch-history/genesis-anchor/v2";
+const HISTORY_OUTBOX_ROOT_DOMAIN: &[u8] = b"threshold-monero/epoch-history/avss-outbox-closure/v2";
 
 /// Maximum number of entries kept in the mutable suffix.
 ///
@@ -56,6 +57,12 @@ pub const MAX_EPOCH_ACTIVATION_ARTIFACT_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_EPOCH_KEY_ROTATION_ARTIFACT_BYTES: usize = 8 * 1024 * 1024;
 /// Exact number of trie branches traversed for a `u64` epoch key.
 pub const EPOCH_HISTORY_INDEX_DEPTH: u8 = 64;
+/// Maximum immutable objects read by one direct cold lookup.
+///
+/// The authenticated path contains one branch per key bit plus one leaf, followed by the epoch
+/// entry named by that leaf. Certificate payloads are fetched separately only when the caller
+/// needs them.
+pub const MAX_EPOCH_HISTORY_COLD_LOOKUP_OBJECTS: usize = EPOCH_HISTORY_INDEX_DEPTH as usize + 2;
 /// Maximum payload carried by one authenticated QUIC history-object response.
 pub const MAX_EPOCH_HISTORY_CHUNK_BYTES: u32 = 256 * 1024;
 /// Maximum number of object-chunk requests needed to reconstruct one immediate successor.
@@ -314,8 +321,8 @@ impl StagedEpochHistoryObject {
 
 /// Read-only view of installed immutable objects.
 ///
-/// A production adapter may preload the at-most-65 required objects asynchronously before using
-/// this synchronous protocol core.
+/// A production adapter may preload the fixed 65-node path plus its named entry asynchronously
+/// before using this synchronous protocol core.
 pub trait EpochHistoryObjectReader {
     fn load(&self, reference: EpochHistoryObjectRef) -> Result<Option<Vec<u8>>, EpochHistoryError>;
 }
@@ -369,9 +376,10 @@ pub fn epoch_history_index_step(
     Ok(EpochHistoryIndexStep::Branch { next })
 }
 
-/// Permanent proof that a certified successor closes all secret AVSS catch-up work for its
-/// predecessor transition. Once the containing epoch entry wins the history CAS, no outbox or
-/// restart path may regenerate/send messages for `predecessor_session`.
+/// Permanent proof that a certified successor authorizes closing secret AVSS catch-up work for its
+/// predecessor transition. Source-only/non-target replicas may apply it as soon as the containing
+/// epoch entry wins the history CAS. A predecessor target which has not reconstructed its own share
+/// delays local cleanup until finalization; global certification is not proof of local recovery.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct AvssSuccessorSupersession {
     version: u16,
@@ -499,6 +507,8 @@ pub struct EpochHistoryEntryInput {
     pub transition_digest: [u8; 32],
     pub activation_digest: [u8; 32],
     pub avss_transcript_digest: [u8; 32],
+    /// Authenticated global set of every receiver key used through this epoch.
+    pub receiver_keys: ReceiverKeyAccumulatorCommitment,
     /// Digest of the canonical key-rotation context/value, excluding certificate witnesses.
     pub key_rotation_digest: Option<[u8; 32]>,
     pub activation_certificate: Vec<u8>,
@@ -517,6 +527,7 @@ pub struct EpochHistoryEntry {
     transition_digest: [u8; 32],
     activation_digest: [u8; 32],
     avss_transcript_digest: [u8; 32],
+    receiver_keys: ReceiverKeyAccumulatorCommitment,
     key_rotation_digest: Option<[u8; 32]>,
     activation_certificate: EpochHistoryObjectRef,
     key_rotation_certificate: Option<EpochHistoryObjectRef>,
@@ -542,6 +553,11 @@ impl EpochHistoryEntry {
     #[must_use]
     pub const fn activation_digest(&self) -> [u8; 32] {
         self.activation_digest
+    }
+
+    #[must_use]
+    pub const fn receiver_keys(&self) -> ReceiverKeyAccumulatorCommitment {
+        self.receiver_keys
     }
 
     #[must_use]
@@ -595,6 +611,7 @@ impl EpochHistoryEntry {
             transition_digest: self.transition_digest,
             activation_digest: self.activation_digest,
             avss_transcript_digest: self.avss_transcript_digest,
+            receiver_keys: self.receiver_keys,
             key_rotation_digest: self.key_rotation_digest,
         }
     }
@@ -615,6 +632,7 @@ impl EpochHistoryEntry {
     }
 
     fn validate(&self) -> Result<(), EpochHistoryError> {
+        self.receiver_keys.validate().map_err(|_| EpochHistoryError::InvalidEntry)?;
         if self.version != HISTORY_ENTRY_VERSION
             || self.network == [0_u8; 32]
             || self.key_id == [0_u8; 32]
@@ -623,6 +641,8 @@ impl EpochHistoryEntry {
             || self.transition_digest == [0_u8; 32]
             || self.activation_digest == [0_u8; 32]
             || self.avss_transcript_digest == [0_u8; 32]
+            || self.receiver_keys.network() != self.network
+            || self.receiver_keys.through_epoch() != self.epoch
             || self.key_rotation_digest == Some([0_u8; 32])
         {
             return Err(EpochHistoryError::InvalidEntry);
@@ -973,6 +993,7 @@ pub struct EpochHistoryLink {
     transition_digest: [u8; 32],
     activation_digest: [u8; 32],
     avss_transcript_digest: [u8; 32],
+    receiver_keys: ReceiverKeyAccumulatorCommitment,
     key_rotation_digest: Option<[u8; 32]>,
 }
 
@@ -985,6 +1006,7 @@ impl EpochHistoryLink {
         transition_digest: [u8; 32],
         activation_digest: [u8; 32],
         avss_transcript_digest: [u8; 32],
+        receiver_keys: ReceiverKeyAccumulatorCommitment,
         key_rotation_digest: Option<[u8; 32]>,
     ) -> Result<Self, EpochHistoryError> {
         let link = Self {
@@ -996,6 +1018,7 @@ impl EpochHistoryLink {
             transition_digest,
             activation_digest,
             avss_transcript_digest,
+            receiver_keys,
             key_rotation_digest,
         };
         link.validate()?;
@@ -1044,6 +1067,11 @@ impl EpochHistoryLink {
     }
 
     #[must_use]
+    pub const fn receiver_keys(self) -> ReceiverKeyAccumulatorCommitment {
+        self.receiver_keys
+    }
+
+    #[must_use]
     pub const fn key_rotation_digest(self) -> Option<[u8; 32]> {
         self.key_rotation_digest
     }
@@ -1054,6 +1082,7 @@ impl EpochHistoryLink {
     }
 
     fn validate(self) -> Result<(), EpochHistoryError> {
+        self.receiver_keys.validate().map_err(|_| EpochHistoryError::InvalidEntry)?;
         if self.version != HISTORY_ENTRY_VERSION
             || self.network == [0_u8; 32]
             || self.key_id == [0_u8; 32]
@@ -1062,6 +1091,8 @@ impl EpochHistoryLink {
             || self.transition_digest == [0_u8; 32]
             || self.activation_digest == [0_u8; 32]
             || self.avss_transcript_digest == [0_u8; 32]
+            || self.receiver_keys.network() != self.network
+            || self.receiver_keys.through_epoch() != self.epoch
             || self.key_rotation_digest == Some([0_u8; 32])
         {
             return Err(EpochHistoryError::InvalidEntry);
@@ -1518,7 +1549,8 @@ impl EpochHistoryCleanup {
         &self.coldified_epochs
     }
 
-    /// Secret AVSS catch-up outbox families which must now be permanently suppressed and pruned.
+    /// Secret AVSS catch-up outbox families whose cleanup is now authorized. An unfinished local
+    /// target reducer remains live until that replica independently finalizes its share.
     #[must_use]
     pub fn superseded_avss(&self) -> &[AvssSuccessorSupersession] {
         &self.superseded_avss
@@ -1614,6 +1646,7 @@ fn build_entry(
         transition_digest: input.transition_digest,
         activation_digest: input.activation_digest,
         avss_transcript_digest: input.avss_transcript_digest,
+        receiver_keys: input.receiver_keys,
         key_rotation_digest: input.key_rotation_digest,
         activation_certificate,
         key_rotation_certificate,
@@ -1908,6 +1941,8 @@ pub enum EpochHistoryError {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
+
     use super::*;
 
     #[derive(Clone, Default)]
@@ -1934,11 +1969,49 @@ mod tests {
         }
     }
 
+    struct CountingObjects<'a> {
+        objects: &'a MemoryObjects,
+        reads: RefCell<Vec<EpochHistoryObjectKind>>,
+    }
+
+    impl<'a> CountingObjects<'a> {
+        fn new(objects: &'a MemoryObjects) -> Self {
+            Self { objects, reads: RefCell::new(Vec::new()) }
+        }
+
+        fn take_reads(&self) -> Vec<EpochHistoryObjectKind> {
+            std::mem::take(&mut *self.reads.borrow_mut())
+        }
+    }
+
+    impl EpochHistoryObjectReader for CountingObjects<'_> {
+        fn load(
+            &self,
+            reference: EpochHistoryObjectRef,
+        ) -> Result<Option<Vec<u8>>, EpochHistoryError> {
+            self.reads.borrow_mut().push(reference.kind());
+            self.objects.load(reference)
+        }
+    }
+
     const NETWORK: [u8; 32] = [0x11; 32];
     const KEY_ID: [u8; 32] = [0x22; 32];
 
     const fn digest(tag: u8) -> [u8; 32] {
         [tag; 32]
+    }
+
+    fn receiver_keys_for(epoch: u64) -> ReceiverKeyAccumulatorCommitment {
+        let mut root = digest(0xe0);
+        root[..8].copy_from_slice(&epoch.to_le_bytes());
+        root[8..16].copy_from_slice(&epoch.wrapping_mul(0x9e37_79b9).to_le_bytes());
+        ReceiverKeyAccumulatorCommitment::for_test(
+            NETWORK,
+            epoch,
+            epoch.checked_add(1).expect("small test epoch"),
+            root,
+        )
+        .expect("valid test receiver-key commitment")
     }
 
     fn input_for(
@@ -1971,6 +2044,7 @@ mod tests {
             transition_digest: digest(0x20_u8.wrapping_add(tag)),
             activation_digest: digest(0x40_u8.wrapping_add(tag)),
             avss_transcript_digest: digest(0x60_u8.wrapping_add(tag)),
+            receiver_keys: receiver_keys_for(epoch),
             key_rotation_digest: (epoch % 2 == 1).then(|| digest(0x70_u8.wrapping_add(tag))),
             activation_certificate: vec![0xc0_u8.wrapping_add(tag); 64],
             key_rotation_certificate: (epoch % 2 == 1).then(|| vec![0xd0_u8.wrapping_add(tag); 48]),
@@ -2060,6 +2134,24 @@ mod tests {
     }
 
     #[test]
+    fn consensus_root_binds_the_exact_receiver_key_accumulator() {
+        let policy = EpochHistoryPolicy::new(2).expect("policy");
+        let state = EpochHistoryState::new(NETWORK, KEY_ID, policy).expect("state");
+        let objects = MemoryObjects::default();
+        let left = input_for(&state, &objects, 0);
+        let mut right = left.clone();
+        right.receiver_keys =
+            ReceiverKeyAccumulatorCommitment::for_test(NETWORK, 0, 2, digest(0xf1))
+                .expect("alternate valid accumulator");
+
+        let left = build_entry(NETWORK, KEY_ID, left, &mut BTreeMap::new()).expect("left entry");
+        let right = build_entry(NETWORK, KEY_ID, right, &mut BTreeMap::new()).expect("right entry");
+        assert_ne!(left.receiver_keys(), right.receiver_keys());
+        assert_ne!(left.consensus_link(), right.consensus_link());
+        assert_ne!(left.root().expect("left root"), right.root().expect("right root"));
+    }
+
+    #[test]
     fn genesis_anchor_separates_network_and_key_id() {
         let a = EpochHistoryParent::genesis(NETWORK, KEY_ID).expect("a");
         let b = EpochHistoryParent::genesis(digest(0x12), KEY_ID).expect("b");
@@ -2068,6 +2160,31 @@ mod tests {
         assert_ne!(a.root(), b.root());
         assert_ne!(a.root(), c.root());
         assert_ne!(a.transition_binding().expect("binding"), b.transition_binding().expect("b"));
+    }
+
+    #[test]
+    fn receiver_key_accumulator_must_match_history_network_and_epoch() {
+        let policy = EpochHistoryPolicy::new(2).expect("policy");
+        let state = EpochHistoryState::new(NETWORK, KEY_ID, policy).expect("state");
+        let objects = MemoryObjects::default();
+
+        let mut wrong_network = input_for(&state, &objects, 0);
+        wrong_network.receiver_keys =
+            ReceiverKeyAccumulatorCommitment::for_test(digest(0x12), 0, 1, digest(0xe1))
+                .expect("valid foreign accumulator");
+        assert!(matches!(
+            state.prepare_append(wrong_network, &objects),
+            Err(EpochHistoryError::InvalidEntry)
+        ));
+
+        let mut wrong_epoch = input_for(&state, &objects, 0);
+        wrong_epoch.receiver_keys =
+            ReceiverKeyAccumulatorCommitment::for_test(NETWORK, 1, 2, digest(0xe2))
+                .expect("valid future accumulator");
+        assert!(matches!(
+            state.prepare_append(wrong_epoch, &objects),
+            Err(EpochHistoryError::InvalidEntry)
+        ));
     }
 
     #[test]
@@ -2114,6 +2231,54 @@ mod tests {
     }
 
     #[test]
+    fn direct_lookup_reads_no_hot_artifacts_and_only_one_cold_path() {
+        let policy = EpochHistoryPolicy::new(2).expect("policy");
+        let mut state = EpochHistoryState::new(NETWORK, KEY_ID, policy).expect("state");
+        let mut objects = MemoryObjects::default();
+        for epoch in 0..4 {
+            let input = input_for(&state, &objects, epoch);
+            (state, _) = commit(&state, input, &mut objects);
+        }
+        assert_eq!(state.cold_through(), Some(1));
+        assert_eq!(
+            state.hot_entries().iter().map(EpochHistoryEntry::epoch).collect::<Vec<_>>(),
+            [2, 3]
+        );
+
+        let counting = CountingObjects::new(&objects);
+        assert_eq!(state.lookup(3, &counting).expect("hot lookup").expect("hot entry").epoch(), 3);
+        assert!(
+            counting.take_reads().is_empty(),
+            "a direct hot lookup must not load certificate or index artifacts"
+        );
+
+        assert_eq!(
+            state.lookup(0, &counting).expect("cold lookup").expect("cold entry").epoch(),
+            0
+        );
+        let reads = counting.take_reads();
+        assert_eq!(reads.len(), MAX_EPOCH_HISTORY_COLD_LOOKUP_OBJECTS);
+        assert_eq!(
+            reads.iter().filter(|kind| **kind == EpochHistoryObjectKind::IndexNode).count(),
+            usize::from(EPOCH_HISTORY_INDEX_DEPTH) + 1
+        );
+        assert_eq!(
+            reads.iter().filter(|kind| **kind == EpochHistoryObjectKind::EpochEntry).count(),
+            1
+        );
+        assert!(
+            !reads.iter().any(|kind| {
+                matches!(
+                    kind,
+                    EpochHistoryObjectKind::ActivationCertificate
+                        | EpochHistoryObjectKind::KeyRotationCertificate
+                )
+            }),
+            "direct cold lookup must not preload certificate payloads"
+        );
+    }
+
+    #[test]
     fn history_remains_restartable_beyond_its_configured_hot_window() {
         let policy = EpochHistoryPolicy::new(64).expect("policy");
         let mut state = EpochHistoryState::new(NETWORK, KEY_ID, policy).expect("state");
@@ -2157,6 +2322,7 @@ mod tests {
         assert_eq!(manifest.parent().epoch(), Some(0));
         assert_eq!(manifest.parent().root(), entry.previous_root());
         assert_eq!(manifest.link(), entry.consensus_link());
+        assert_eq!(manifest.link().receiver_keys(), entry.receiver_keys());
         assert!(
             EpochHistoryCatchupQuery::next(manifest.parent())
                 .expect("next query")
@@ -2286,6 +2452,91 @@ mod tests {
         assert!(matches!(
             load_required(&objects, cold.activation_certificate()),
             Err(EpochHistoryError::MissingObject(_))
+        ));
+    }
+
+    #[test]
+    fn every_pre_accumulator_history_schema_is_rejected() {
+        let policy = EpochHistoryPolicy::new(2).expect("policy");
+        let state = EpochHistoryState::new(NETWORK, KEY_ID, policy).expect("state");
+        let objects = MemoryObjects::default();
+        let entry =
+            build_entry(NETWORK, KEY_ID, input_for(&state, &objects, 0), &mut BTreeMap::new())
+                .expect("entry");
+
+        let mut old_parent = EpochHistoryParent::genesis(NETWORK, KEY_ID).expect("parent");
+        old_parent.version = HISTORY_PARENT_VERSION - 1;
+        assert!(matches!(old_parent.validate(), Err(EpochHistoryError::InvalidParent)));
+
+        let mut old_reference = entry.activation_certificate();
+        old_reference.version = HISTORY_REFERENCE_VERSION - 1;
+        assert!(matches!(old_reference.validate(), Err(EpochHistoryError::InvalidObjectReference)));
+
+        let mut old_entry = entry.clone();
+        old_entry.version = HISTORY_ENTRY_VERSION - 1;
+        let old_entry_bytes = postcard::to_allocvec(&old_entry).expect("old entry bytes");
+        assert!(matches!(
+            EpochHistoryEntry::from_bytes(&old_entry_bytes),
+            Err(EpochHistoryError::InvalidEntry)
+        ));
+
+        let mut old_link = entry.consensus_link();
+        old_link.version = HISTORY_ENTRY_VERSION - 1;
+        assert!(matches!(old_link.root(), Err(EpochHistoryError::InvalidEntry)));
+
+        let mut old_manifest = entry.catchup_manifest().expect("manifest");
+        old_manifest.version = HISTORY_CATCHUP_VERSION - 1;
+        assert!(matches!(old_manifest.validate(), Err(EpochHistoryError::InvalidCatchup)));
+
+        let mut old_query =
+            EpochHistoryCatchupQuery::next(state.parent().expect("state parent")).expect("query");
+        let EpochHistoryCatchupQuery::Next { version, .. } = &mut old_query else {
+            panic!("next query");
+        };
+        *version = HISTORY_CATCHUP_VERSION - 1;
+        assert!(matches!(old_query.validate(), Err(EpochHistoryError::InvalidCatchup)));
+
+        let mut old_supersession = AvssSuccessorSupersession::new(
+            0,
+            entry.root().expect("entry root"),
+            entry.transition_digest(),
+            digest(0x81),
+            1,
+            digest(0x41),
+            &[digest(0xa1)],
+        )
+        .expect("supersession");
+        old_supersession.version = HISTORY_SUPERSESSION_VERSION - 1;
+        assert!(matches!(old_supersession.validate(), Err(EpochHistoryError::InvalidSupersession)));
+
+        let mut old_index = EpochIndexNode {
+            version: HISTORY_INDEX_NODE_VERSION - 1,
+            network: NETWORK,
+            body: EpochIndexNodeBody::Leaf {
+                epoch: 0,
+                consensus_root: entry.root().expect("entry root"),
+                entry: EpochHistoryObjectRef::for_contents(
+                    NETWORK,
+                    EpochHistoryObjectKind::EpochEntry,
+                    &entry.to_bytes().expect("entry bytes"),
+                )
+                .expect("entry reference"),
+            },
+        };
+        assert!(matches!(old_index.validate(), Err(EpochHistoryError::BrokenIndex)));
+        old_index.version = HISTORY_INDEX_NODE_VERSION;
+        old_index.validate().expect("current index");
+
+        let mut old_head = state.head;
+        old_head.version = HISTORY_HEAD_VERSION - 1;
+        assert!(matches!(old_head.validate(), Err(EpochHistoryError::InvalidHead)));
+
+        let mut old_state = state;
+        old_state.version = HISTORY_STATE_VERSION - 1;
+        let old_state_bytes = postcard::to_allocvec(&old_state).expect("old state bytes");
+        assert!(matches!(
+            EpochHistoryState::from_bytes(&old_state_bytes),
+            Err(EpochHistoryError::InvalidState)
         ));
     }
 

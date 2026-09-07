@@ -2,8 +2,8 @@
 
 Threshold Monero is unaudited research software. This model states the intended boundaries of the
 current clean-state implementation; it is not a security proof or a claim of public-network
-readiness. The current source has not demonstrated transaction acceptance on Monero public testnet
-or mainnet.
+readiness. Private Regtest is the sole release-acceptance target; public testnet/mainnet deployment
+and evidence are intentionally outside scope.
 
 ## Protected assets
 
@@ -23,11 +23,19 @@ The primary assets are:
 The protocol is designed around an authenticated Byzantine committee with an explicit per-epoch
 fault bound `f`. The adversary may corrupt up to that bound, send malformed or conflicting
 messages, omit messages, relay out of order, replay old traffic, stop after any phase, and restart a
-party from local state. The network may be asynchronous for an unbounded period but must eventually
-become timely for liveness.
+party from local state. The network may be asynchronous for an unbounded period. For liveness after
+stabilization, a complete honest-leader view—including proposal admission, every required
+delivery, durable prevote/precommit processing, and reducer/storage work—must finish before the
+deadline capped at `64 * protocol_timeout_seconds`; the bounded pacemaker does not claim progress
+when that pipeline takes longer.
 
 Safety is not supposed to depend on deadlines. Deadlines move a reducer or ROAST attempt to another
 view only when durable evidence says that transition is safe.
+
+Each configured signing threshold must satisfy `k > 2f` in addition to the ordinary Byzantine
+committee bounds. This is a fail-fast liveness requirement for certified safe abandonment: after up
+to `f` selected signers omit, the honest share-unexposed witnesses must still outweigh the
+Byzantine uncertainty. The scenario is rejected at load time if that proof margin is absent.
 
 The proactive model is mobile across epochs: the adversary may corrupt different parties over time,
 but must learn fewer than the active threshold's shares from every one sharing. Retired shares,
@@ -52,12 +60,12 @@ transport signing rounds. Bearer tokens separate those roles but are admission c
 transaction policy or multi-person approval.
 
 The stable Ed25519 signing seed and bootstrap X25519 secret are independently provisioned. The
-signing seed cannot derive AVSS receiver keys. Except for a certified omission baseline, each
-successor receiver secret is generated only when its rotation ceremony begins, durably persisted
-and read back before its public key is advertised, and erased after certified cutover. The
-configuration contains public bootstrap keys, not private or future epoch receiver secrets.
-Configuration rejects leave-then-rejoin membership for the same party identity so a retired
-bootstrap receiver key can never become an omission baseline again.
+signing seed cannot derive AVSS receiver keys, and the bootstrap receiver key is authoritative only
+for epoch zero. Each successor receiver secret is generated only when its rotation ceremony begins,
+durably persisted and read back before its public key is advertised, and erased after certified
+cutover. The configuration contains public genesis bootstrap keys and stable eligibility rosters,
+not private or future epoch receiver secrets. No bootstrap or prior-epoch receiver key can enter a
+successor selection.
 
 ### DKG and proactive refresh
 
@@ -77,11 +85,27 @@ least one honest AVSS dealer per reshare and on securely erasing retired shares 
 adversary moves; deterministic acceptance cannot prove either entropy or physical erasure.
 
 The fixed-interval refresh deadline is authenticated, stored, and restored. Every configured or
-dynamic successor first certifies its target receiver-key selection. Target members advertise
-fresh, durably read-back X25519 keys; target `n-f` advertisements are required, and at most target
-`f` exact omission baselines may be selected. The source committee supplies the source `n-f`
-Byzantine certificate, including when the target grows or shrinks. Persistent timers improve
-continuity but do not manufacture quorum when too many members are offline.
+dynamic successor first certifies its target receiver-key selection. Its stable eligibility roster
+contains at least `desired_n + f_target` identities. The target fault bound applies to that whole
+eligible roster (equivalently, every subset the policy permits), not only to the subset eventually
+selected. This is a governance assumption: configuration can authenticate identities and numeric
+bounds, but cryptography cannot determine which operators are corrupt.
+
+Let `m=desired_n`, `s=|source ∩ eligible|`,
+`P=min(m,s)`, and `R=min(m,s-min(f_source,f_target))`. Before the immutable, policy-bound selection
+fallback deadline, every admissible value must retain at least `P` source identities. After that
+deadline, exactly `n_source-f_source` canonical source signatures may authorize a value retaining
+`R..P-1`; fewer signatures, gratuitous authorization at `P`, and retention below `R` are rejected by
+every verifier. The vote session binds the network, source committee and activation, exact target
+epoch, receiver-key history, `P`, `R`, and fallback window. Inbound votes are stored but never cause
+a local signature; only the persistent local scheduler signs after its restored deadline.
+
+The source Byzantine certificate then selects exactly `m` fresh, durably read-back X25519
+advertisements, including when the target grows or shrinks. The successor is constructed solely
+from those advertisements, and omitted identities receive no share. A previously omitted or
+departed eligible identity may re-enter a later committee only by advertising another fresh
+receiver key and being selected. Persistent timers improve continuity but do not manufacture quorum
+when too many members are offline.
 
 ### Epoch cutover
 
@@ -89,6 +113,14 @@ New shares are staged before activation. The service serializes activation, sign
 deposit handoff, and old-share retirement. A retirement marker is bound to the certified successor,
 and startup rechecks activation indexes and certificates. These controls prevent ordinary process
 restart from reopening a locally retired epoch.
+
+Authenticated absence of a deposit snapshot under the genesis-publication fence may retire the old
+threshold share and X25519 secret before a delayed canonical deposit genesis appears. In that case,
+the stable Ed25519 seed yields only an exact-transition-bound `RecoveryAndFenceOnly` capability. Its
+durable policy admits quorum-backed pre-pin recovery, independently certified checkpoints, and the
+exact handoff Fence, but excludes new requests, raw observations, consolidation, export, and final
+Handoff authority. The portable Fence revokes it; a separate committee-bound `HandoffOnly`
+capability is limited to the final Handoff. Neither capability restores erased secret material.
 
 They do not prevent an operator from replacing the complete state volume with an older, internally
 valid copy. Valuable deployments require an external monotonic or WORM anchor and explicit restore
@@ -108,6 +140,11 @@ allocation and reproduces the output against its retained confirmed scanner. A c
 certificate is sufficient for a lagging fresh joiner to import the portable fact, but does not by
 itself make that output spendable: every consolidation signer still independently checks scanner
 state, maturity, reorg handling, fee bounds, input identity, and destination.
+
+Portable deposit-state import does not yet include authenticated ROAST archive history and
+abandoned-family watch state. The current stable handoff scope requires at least one retained
+old-committee member for ROAST late settlement. Transferring that authority to a fully disjoint
+successor remains [TODO](../TODO.md).
 
 ### Consolidation signing
 
@@ -174,7 +211,7 @@ identities may be Byzantine or have faulty/eclipsed chain observation. A Byzanti
 separately compromised honest party's daemon count as two faulty application validators. Honest
 observers must eventually converge on the same finalized Monero chain for liveness. The Compose
 laboratory gives every party a separate daemon process, volume, address, and RPC bridge, but all
-seven follow one private-Regtest block producer; that producer is an explicit test-only common
+eight follow one private-Regtest block producer; that producer is an explicit test-only common
 mode, not a production trust model.
 
 Deposits use Monero subaddresses and consolidation returns funds to the primary address. Some
@@ -188,25 +225,28 @@ reserve statement is made.
 
 ## Availability limits
 
-Liveness requires eventual synchrony, enough honest online parties for the applicable certificate,
-available Monero chain data, and storage below configured bounds. A valid safety fence, unresolved
-share exposure, missing handoff, conflicting daemon evidence, exhausted view budget, or tampered
-record intentionally stops progress.
+Liveness requires the bounded post-stabilization delay above, enough honest online parties for the
+applicable certificate, available Monero chain data, and storage below configured bounds. A valid
+safety fence, unresolved share exposure, missing handoff, conflicting daemon evidence, exhausted
+view budget, or tampered record intentionally stops progress. Exceeding the configured 64×
+pacemaker bound may also stop progress; it does not weaken safety.
 
-The seven-container Compose stack is a single-host laboratory. Its parties do not provide
+The eight-party Compose stack is a single-host laboratory. Its parties do not provide
 independent administrative domains, secret custody, power, storage, clocks, or network paths.
 Passing it demonstrates interoperability of that exact build on a private chain, not production
 Byzantine tolerance.
 
-## Required production work
+## Out-of-scope production operations
 
-Before valuable use, at minimum:
+The repository's implementation and Regtest release gate do not include the following operational
+deployment work. These are deployment-owner responsibilities, not implementation tasks in this
+repository:
 
 - obtain independent cryptographic and implementation audits;
 - retain fresh adversarial and crash/restart evidence for the exact release build;
-- establish acceptance on public testnet before considering any mainnet enablement;
+- independently validate and authorize any intended public-network deployment;
 - distribute operators, daemons, storage, clocks, and network paths across trust domains;
-- add certificate enrollment, rotation, revocation, and hardware-backed key custody;
+- supply certificate enrollment, rotation, revocation, and operator/HSM key-custody controls;
 - anchor epochs, tombstones, and archive heads outside rollbackable party volumes;
 - define verified erasure and disaster-recovery procedures;
 - add independent transaction policy and human/business authorization;

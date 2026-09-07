@@ -75,11 +75,11 @@ impl<'a> AggregateRangeStatement<'a> {
 
   fn d_j(j: usize, m: usize) -> ScalarVector {
     let mut d_j = Vec::with_capacity(m * COMMITMENT_BITS);
-    for _ in 0 .. (j - 1) * COMMITMENT_BITS {
+    for _ in 0..(j - 1) * COMMITMENT_BITS {
       d_j.push(Scalar::ZERO);
     }
     d_j.append(&mut ScalarVector::powers(Scalar::from(2u8), COMMITMENT_BITS).0);
-    for _ in 0 .. (m - j) * COMMITMENT_BITS {
+    for _ in 0..(m - j) * COMMITMENT_BITS {
       d_j.push(Scalar::ZERO);
     }
     ScalarVector(d_j)
@@ -106,7 +106,7 @@ impl<'a> AggregateRangeStatement<'a> {
     z_pow.push(z * z);
 
     let mut d = ScalarVector::new(mn);
-    for j in 1 ..= V.len() {
+    for j in 1..=V.len() {
       z_pow.push(
         *z_pow.last().expect("couldn't get last z_pow despite always being non-empty") * z_pow[0],
       );
@@ -114,7 +114,7 @@ impl<'a> AggregateRangeStatement<'a> {
     }
 
     let mut ascending_y = ScalarVector(vec![y]);
-    for i in 1 .. d.len() {
+    for i in 1..d.len() {
       ascending_y.0.push(ascending_y[i - 1] * y);
     }
     let y_pows = ascending_y.clone().sum();
@@ -190,7 +190,7 @@ impl<'a> AggregateRangeStatement<'a> {
 
     let mut d_js = Vec::with_capacity(V.len());
     let mut a_l = ScalarVector(Vec::with_capacity(V.len() * COMMITMENT_BITS));
-    for j in 1 ..= V.len() {
+    for j in 1..=V.len() {
       d_js.push(Self::d_j(j, V.len()));
       #[allow(clippy::map_unwrap_or)]
       a_l.0.append(
@@ -228,7 +228,7 @@ impl<'a> AggregateRangeStatement<'a> {
     let a_l = a_l - z;
     let a_r = a_r + &d_descending_y_plus_z;
     let mut alpha = alpha;
-    for j in 1 ..= witness.0.len() {
+    for j in 1..=witness.0.len() {
       alpha += z_pow[j - 1] * witness.0[j - 1].mask.into() * y_mn_plus_one;
     }
 

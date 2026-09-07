@@ -31,11 +31,12 @@ hkdf = "0.12"
 monero-oxide = { path = "vendor/monero-oxide/monero-oxide", features = ["std", "compile-time-generators"] }
 monero-simple-request-rpc = { path = "vendor/monero-oxide/monero-oxide/interface/daemon/simple-request", features = ["webpki-roots"] }
 monero-wallet = { path = "vendor/monero-oxide/monero-oxide/wallet", features = ["multisig", "compile-time-generators"] }
-postcard = { version = "1.1", features = ["alloc"] }
+postcard = { version = "1.1", default-features = false, features = ["alloc"] }
 quinn = { version = "=0.11.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
 rand = "0.8"
 rand_chacha = "0.3"
 rand_core = "0.6"
+redb = "=4.1.0"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 rustls = { version = "=0.23.42", default-features = false, features = ["ring", "std"] }
 serde = { version = "1.0", features = ["derive"] }
@@ -54,6 +55,9 @@ zeroize = { version = "1.8", features = ["derive"] }
 [dev-dependencies]
 rcgen = { version = "=0.14.8", default-features = false, features = ["crypto", "ring"] }
 tempfile = "3.23"
+
+[patch.crates-io]
+quinn-proto = { path = "vendor/quinn-proto" }
 
 [profile.dev.package]
 curve25519-dalek = { opt-level = 3 }

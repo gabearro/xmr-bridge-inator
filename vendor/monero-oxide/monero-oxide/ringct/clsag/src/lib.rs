@@ -177,7 +177,7 @@ fn core(
 
   // Truncate it for the round transcript, altering the DST as needed
   to_hash.truncate(((2 * n) + 1) * 32);
-  for i in 0 .. ROUND.len() {
+  for i in 0..ROUND.len() {
     to_hash[PREFIX.len() + i] = ROUND[i];
   }
   // Unfortunately, it's I D pseudo_out instead of pseudo_out I D, meaning this needs to be
@@ -212,7 +212,7 @@ fn core(
   // Perform the core loop
   let mut in_range = Choice::from(0);
   let mut c1 = c;
-  for mut i in 0 .. iter_end {
+  for mut i in 0..iter_end {
     in_range |= i.ct_eq(&start);
     in_range ^= i.ct_eq(&end);
     i %= n;
@@ -294,7 +294,7 @@ impl Clsag {
     let H = Point::biased_hash(input.decoys.signer_ring_members()[0].compress().to_bytes()).into();
     let D = H * mask_delta;
     let mut s = Vec::with_capacity(input.decoys.ring().len());
-    for _ in 0 .. input.decoys.ring().len() {
+    for _ in 0..input.decoys.ring().len() {
       s.push(Scalar::random(rng));
     }
     let ((D, c_p, c_c), c1) = core(
@@ -367,7 +367,7 @@ impl Clsag {
 
     let mut res = Vec::with_capacity(inputs.len());
     let mut sum_pseudo_outs = DScalar::ZERO;
-    for i in 0 .. inputs.len() {
+    for i in 0..inputs.len() {
       let mask;
       // If this is the last input, set the mask as described above
       if i == (inputs.len() - 1) {
@@ -393,11 +393,11 @@ impl Clsag {
         // ring member's commitment and our pseudo-out commitment (which will only have a known
         // discrete log over G if the amounts cancel out)
         let signer_s = Scalar::from(
-          nonce.deref() -
-            ((key_challenge * Zeroizing::new((*inputs[i].0.deref()).into()).deref()) +
-              challenged_mask),
+          nonce.deref()
+            - ((key_challenge * Zeroizing::new((*inputs[i].0.deref()).into()).deref())
+              + challenged_mask),
         );
-        for s_index in 0 ..= MAX_RING_SIZE {
+        for s_index in 0..=MAX_RING_SIZE {
           if usize::from(s_index) == incomplete_clsag.s.len() {
             break;
           }

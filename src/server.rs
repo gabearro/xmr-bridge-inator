@@ -1,7 +1,7 @@
 //! Persistent one-party protocol state machines and their local HTTP control adapter.
 //!
 //! Party-to-party delivery is exclusively exposed through the typed QUIC adapter. HTTP retains
-//! health, status, transition initiation, and transaction-signing coordination only.
+//! health, status, operator transition controls, and deposit-client queries only.
 
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
@@ -16,51 +16,92 @@ use anyhow::Context as _;
 use axum::{
     Json, Router,
     body::Body,
-    extract::{Extension, State},
-    http::{Request, StatusCode, header::WWW_AUTHENTICATE},
+    extract::{DefaultBodyLimit, Extension, State},
+    http::{
+        Request, StatusCode,
+        header::{RETRY_AFTER, WWW_AUTHENTICATE},
+    },
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, post},
 };
 use rand_core::OsRng;
 use serde::{Deserialize, Serialize};
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::{Mutex, RwLock, Semaphore};
 use tower_http::trace::TraceLayer;
 use zeroize::Zeroizing;
 
 use crate::{
     auth::{AllowedRoles, AuthError, AuthenticatedPrincipal, BearerAuthenticator},
     avss::{
-        AvssConfig, AvssDealer, AvssOutput, AvssParty, AvssPayload, PrivateAvssMessage,
-        preflight_avss_resources,
+        AvssConfig, AvssDealer, AvssMessage, AvssOutput, AvssParty, AvssPayload,
+        PrivateAvssMessage, preflight_avss_resources,
     },
-    committee::{Committee, Member, PartyId, SessionId},
-    compact_epoch_registry::CompactEpochRegistry,
+    committee::{Committee, CommitteeError, Member, PartyId, SessionId},
+    compact_epoch_registry::{
+        CompactEpochRegistry, RegistryHandoffCertificate, RegistryLink, VerifiedIssuerWindow,
+    },
+    compact_registry_archive::lookup_compact_registry_epoch,
     config::{NetworkKind, Operation, Scenario},
+    deposit_clock::{DepositClock, DepositClockSample},
     deposit_consensus::ConsensusError,
     deposit_consolidation::{AttemptBinding, ConsolidationId, TransactionAuthorization},
     deposit_consolidation_wire::{
-        ByzantineConsolidationWireMessage, ConsolidationAttemptWireBinding, ConsolidationWireError,
-        PortableSignedTransactionAttestation, SignedPreprocessContribution,
+        ByzantineConsolidationWireMessage, ByzantineDeliveryId, ConsolidationAttemptWireBinding,
+        ConsolidationWireError, PortableSignedTransactionAttestation, SignedPreprocessContribution,
         SignedShareContribution,
     },
-    deposit_ledger::{
-        CertifiedLedgerEntry, LedgerError, LedgerPayload, LedgerRequestId, RequestBinding,
+    deposit_index::DepositIndexError,
+    deposit_index_checkpoint::DepositIndexCheckpointError,
+    deposit_index_retention::RetentionError,
+    deposit_index_store::DepositIndexStoreError,
+    deposit_ledger::{CertifiedLedgerEntry, LedgerError, LedgerRequestId, RequestBinding},
+    deposit_prefix_collection_store::{
+        DepositPrefixCollectionRequest, DepositPrefixCollectionStatus,
     },
+    deposit_prefix_scan_store::DepositPrefixScanStoreError,
     deposit_service::{
-        ByzantineConsolidationAction, DepositAddressRequest, DepositAddressResponse,
-        DepositAddressStatus, DepositAllocateWire, DepositAttestationWire, DepositCertificateWire,
+        AuthenticatedDepositStateTransfer, AuthenticatedHistoricalDepositStateTransfer,
+        AuthenticatedPreImportDepositEpochs, ByzantineConsolidationAction,
+        ConsolidationSessionClosure, DepositAddressRequest, DepositAddressResponse,
+        DepositAddressStatus, DepositAttestationWire, DepositCertificateWire,
         DepositClientRequestWire, DepositConsensusWire, DepositObservationAttestationWire,
         DepositObservationCertificateWire, DepositObservationWire, DepositPeerMessageId,
-        DepositService, DepositServiceError, DurableDepositObservationEvidence,
-        MAX_CONSOLIDATION_ABANDONMENT_MESSAGE_BYTES, PendingDepositPeerMessage,
-        PersistedSweepRelease, PublicConsolidationStatus, deposit_request_id_for_binding,
+        DepositService, DepositServiceError, DepositStateExportSealWorkLocator,
+        DepositStateImportWorkLocator, DepositWorkerMutationHost,
+        DurableDepositObservationEvidence, MAX_CONSOLIDATION_ABANDONMENT_MESSAGE_BYTES,
+        PendingDepositPeerMessage, PersistedSweepRelease, PublicConsolidationStatus,
+        ReconstructedDepositStateExportSealWork, ReconstructedDepositStateImportWork,
+        VerifiedReopenedDepositSyncAdvertisement, deposit_request_id_for_binding,
+    },
+    deposit_state_export::{
+        DepositPostHandoffExportSealCertificate, VerifiedDepositPostHandoffExportSeal,
+        VerifiedPreImportDepositStateExportSeal,
+    },
+    deposit_state_transfer_wire::{
+        DepositPostHandoffExportSealCertificateAck,
+        DepositPostHandoffExportSealCertificateDelivery, DepositStateExportHeadRequest,
+        DepositStateExportHeadResponse, DepositStateExportObjectsRequest,
+        DepositStateExportObjectsResponse, DepositStateExportReleaseAck,
+        DepositStateExportReleaseRequest, DepositStateTransferContext,
+    },
+    deposit_sync_stage::{
+        CompletedPreImportDepositStateExportArtifacts, DepositSyncPrefixSupportWork,
+        DepositSyncSpoolAdmission, DepositSyncSpoolCheckpoint, DepositSyncSpoolManager,
+        DepositSyncSpoolStats, DepositSyncSpoolStore, InstallingCertifiedExportCheckpoint,
+        PreImportCertifiedExportRecoveryEvidence, PreImportDepositStateExportSpool,
+    },
+    deposit_sync_support::{
+        DepositSyncPrefixSupportContinue, DepositSyncPrefixSupportProgress,
+        DepositSyncPrefixSupportStart, DepositSyncSupportRequest,
+        VerifiedDepositSyncSupportCertificate,
     },
     deposit_sync_wire::{
         DepositIndexCheckpointAttestWire, DepositIndexCheckpointCertificateWire,
         DepositObservationIndexCheckpointAttestWire,
         DepositObservationIndexCheckpointCertificateWire, DepositSyncAdvertisement,
-        DepositSyncHeadRequest, DepositSyncObject, DepositSyncObjectPageRequest,
+        DepositSyncContext, DepositSyncHeadRequest, DepositSyncHeadResponse,
+        DepositSyncObjectPageRequest,
     },
     deposit_wallet::{
         CanonicalDepositAddress, ChainPoint, SignedSweepTransaction, SweepId, WalletOutputId,
@@ -74,12 +115,15 @@ use crate::{
         EpochHistoryObjectReader, EpochHistoryObjectRef, EpochHistoryParent, EpochHistoryPolicy,
         EpochHistoryState, epoch_history_index_step,
     },
-    identity::{EncryptedPayload, EpochEncryptionSecret, Identity, SignedEnvelope},
+    identity::{
+        EncryptedPayload, EnvelopeSigner, EnvelopeSignerScope, EpochEncryptionSecret, Identity,
+        SignedEnvelope, StableRecoverySigningIdentity, StableSigningIdentity,
+    },
     key_rotation::{
         KeyRotationCertificate, KeyRotationContext, KeyRotationError, KeyRotationMessageId,
         KeyRotationRound, KeyRotationTargetPolicy, KeyRotationWire, PendingKeyRotationMessage,
-        VerifiedRegistryHandoffTarget, eligibility_reference_key,
-        pending_key_rotation_advertisements, pending_key_rotation_certificate,
+        VerifiedKeyRotationCertificate, VerifiedRegistryHandoffTarget, eligibility_reference_key,
+        pending_key_rotation_advertisements, pending_verified_key_rotation_certificate,
     },
     keys::{
         EpochPublic, EpochShare, aggregate_dkg_subset, aggregate_proactive_reshare_from_public,
@@ -93,15 +137,20 @@ use crate::{
         AvssOperation, DepositOperation, EpochOperation, KeyRotationOperation, PeerRequest,
         PeerResponse, QualOperation, RejectionCode,
     },
+    receiver_key_accumulator::{
+        ReceiverKeyAccumulatorCommitment, ReceiverKeyAccumulatorReconcile,
+        ReceiverKeyAccumulatorStore, ReceiverKeyStageBinding,
+    },
     reconnecting_monero::DepositChainReadiness,
     signing::{
         AwaitingAuthorization, AwaitingCommitments, AwaitingShares, CanonicalSignerSet,
         FrostlassSigner,
     },
     storage::{
-        ActivationTransitionKey, MAX_SESSION_STATE_BYTES, PartyStateLease, ProtocolStore,
-        ShareRetirement, ShareStore, StoreError, SweepSigningNonceClaim, WalletArtifactStore,
-        WalletId, WalletSnapshotStore,
+        ActivationTransitionKey, DepositStateTransferIntentsBlob,
+        DepositStateTransferIntentsMetadata, MAX_SESSION_STATE_BYTES, PartyStateLease,
+        ProtocolStore, ShareRetirement, ShareStore, StoreError, SweepSigningNonceClaim,
+        WalletArtifactStore, WalletId, WalletSnapshotStore,
     },
 };
 
@@ -111,10 +160,19 @@ const MAX_LIVE_AVSS_RUNS: usize = 64;
 const MAX_LIVE_SIGNING_SESSIONS: usize = 64;
 const MAX_BYZANTINE_CONSOLIDATION_ACTIONS_PER_TICK: usize = 4_096;
 const MAX_PEER_OUTBOX_SNAPSHOT: usize = 256;
-const MAX_QUAL_BACKOFF_TIMEOUT_MS: u64 = 60 * 60 * 1_000;
-const PROACTIVE_REFRESH_SCHEDULE_VERSION: u16 = 4;
+const MAX_CONCURRENT_KEY_ROTATION_BLOCKING_TASKS: usize = 1;
+const MAX_CONCURRENT_DEPOSIT_ALLOCATION_ADMISSIONS: usize = 1;
+const MAX_CONCURRENT_DEPOSIT_READ_ADMISSIONS: usize = 1;
+const MAX_DEPOSIT_HTTP_JSON_BYTES: usize = 4 * 1024;
+const PROACTIVE_REFRESH_SCHEDULE_VERSION: u16 = 9;
+const PROACTIVE_REFRESH_SCHEDULE_SAVE_RETRY_INITIAL_MS: u64 = 10;
+const PROACTIVE_REFRESH_SCHEDULE_SAVE_RETRY_MAX_MS: u64 = 1_000;
 const EPOCH_HISTORY_HOT_ENTRIES: u16 = 64;
 const MAX_CURRENT_EPOCH_RECORDS: usize = EPOCH_HISTORY_HOT_ENTRIES as usize + 2;
+/// The authenticated hot suffix/cold boundary plus the durable pacemaker's source and immediate
+/// target. Exact cold reads (including deferred schedule validation) remain stateless; only these
+/// two live execution capabilities may extend the current key-rotation/history-link registries.
+const MAX_SCHEDULE_PINNED_EPOCH_RECORDS: usize = MAX_CURRENT_EPOCH_RECORDS + 2;
 const ACCEPTANCE_CONSOLIDATION_GATE_VERSION: u16 = 1;
 const ACCEPTANCE_CONSOLIDATION_GATE_ENV: &str = "TM_ACCEPTANCE_ENABLE_CONSOLIDATION_GATE";
 const ACCEPTANCE_CONSOLIDATION_BOOTSTRAP_GATE_VERSION: u16 = 1;
@@ -123,23 +181,89 @@ const ACCEPTANCE_CONSOLIDATION_BOOTSTRAP_GATE_ENV: &str =
 const ACCEPTANCE_PROTOCOL_FAULT_GATE_VERSION: u16 = 1;
 const ACCEPTANCE_PROTOCOL_FAULT_GATE_ENV: &str = "TM_ACCEPTANCE_ENABLE_PROTOCOL_FAULT_GATE";
 const ACCEPTANCE_PROACTIVE_REFRESH_HOLD_ENV: &str = "TM_ACCEPTANCE_HOLD_PROACTIVE_REFRESH";
-const ACCEPTANCE_DRIVER_LATCH_VERSION: u16 = 1;
+const ACCEPTANCE_DRIVER_LATCH_VERSION: u16 = 2;
 const ACCEPTANCE_DEPOSIT_CHECKPOINT_GATE_VERSION: u16 = 1;
+const DEPOSIT_CHECKPOINT_OPERATIONS: [DepositOperation; 13] = [
+    DepositOperation::Attest,
+    DepositOperation::Certificate,
+    DepositOperation::DepositObservation,
+    DepositOperation::DepositObservationAttest,
+    DepositOperation::DepositObservationCertificate,
+    DepositOperation::IndexCheckpointAttest,
+    DepositOperation::IndexCheckpointCertificate,
+    DepositOperation::DepositObservationIndexCheckpointAttest,
+    DepositOperation::DepositObservationIndexCheckpointCertificate,
+    DepositOperation::ClientRequest,
+    DepositOperation::ConsensusProposal,
+    DepositOperation::ConsensusMessage,
+    DepositOperation::ConsensusCertificate,
+];
+const LOCAL_DEPOSIT_CHECKPOINT_REJECTION: &str =
+    "deposit checkpoint loopback bypasses authenticated QUIC mutation admission";
 /// Reserved persisted deadline used only by the demo-Regtest acceptance hold. A release replaces
 /// it with `release_time + configured_interval`; ordinary deployments can never create it.
 const ACCEPTANCE_PROACTIVE_REFRESH_HELD_DUE_UNIX_MS: u64 = u64::MAX;
+const RECEIVER_KEY_ACCUMULATOR_FILE: &str = "receiver-key-accumulator-v1.redb";
+
+fn is_deposit_checkpoint_operation(operation: DepositOperation) -> bool {
+    DEPOSIT_CHECKPOINT_OPERATIONS.contains(&operation)
+}
 
 #[derive(Clone, Debug)]
 struct CertifiedKeyRotation {
     context: KeyRotationContext,
     certificate: KeyRotationCertificate,
     target: Committee,
+    /// Outputs retained from the one mandatory certificate verification at registry ingress.
+    /// Epoch gossip is authenticated per sender, so recomputing either value on every equivalent
+    /// sender-bound request would turn valid certificate fanout into proof-verification work.
+    receiver_keys: ReceiverKeyAccumulatorCommitment,
+    semantic_digest: [u8; 32],
+    /// Exact content-authenticated identifier produced from the verified immutable certificate
+    /// once, when it enters the registry. The recipient is a replaceable template field; the
+    /// context, delivery kind, and wire digest are invariant for every certificate retry.
+    certificate_retry_id: KeyRotationMessageId,
+}
+
+impl CertifiedKeyRotation {
+    fn certificate_message_id_for(&self, recipient: PartyId) -> Option<KeyRotationMessageId> {
+        if !self.context.is_participant(recipient) {
+            return None;
+        }
+        let mut id = self.certificate_retry_id;
+        id.recipient = recipient;
+        Some(id)
+    }
+
+    fn pending_certificate_for(&self, recipient: PartyId) -> Option<PendingKeyRotationMessage> {
+        Some(PendingKeyRotationMessage {
+            target_epoch: self.context.target_epoch(),
+            id: self.certificate_message_id_for(recipient)?,
+            wire: KeyRotationWire::Certificate(self.certificate.clone()),
+        })
+    }
 }
 
 #[derive(Clone, Debug)]
 struct LiveKeyRotation {
     round: KeyRotationRound,
     revision: u64,
+}
+
+#[cfg(test)]
+struct KeyRotationViewPublicationGate {
+    durable: tokio::sync::oneshot::Sender<()>,
+    release: tokio::sync::oneshot::Receiver<()>,
+}
+
+#[cfg(test)]
+struct ProactiveRefreshSchedulePublicationGate {
+    durable: tokio::sync::oneshot::Sender<()>,
+    release: tokio::sync::oneshot::Receiver<()>,
+    /// Treat the first successful atomic replacement as if its final durability acknowledgement
+    /// had failed. The authoritative file is already visible, so the detached writer must retry
+    /// the exact canonical schedule without exposing the older RAM image.
+    inject_ambiguous_save_error_once: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -210,8 +334,8 @@ pub struct AvssTransition {
     pub target: Committee,
     /// Canonical set of dealers eligible to start AVSS. For DKG this is empty and the target
     /// committee is implicitly eligible. Refresh names every current member and QUAL selects
-    /// exactly `n-f`; resharing names the configured old-epoch candidates and QUAL selects the
-    /// exact old threshold.
+    /// exactly `n-f`; resharing names every member of the actually certified source committee and
+    /// QUAL selects the exact old threshold.
     pub eligible_dealers: Vec<PartyId>,
 }
 
@@ -433,7 +557,16 @@ pub struct ActivationValue {
     pub history_link: EpochHistoryLink,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+/// One exact history activation plus the fault bound authenticated by its genesis specification
+/// or embedded receiver-key rotation certificate. This lets cold schedule validation remain
+/// stateless instead of repopulating the live committee registry.
+#[derive(Clone, Debug)]
+struct AuthenticatedEpochActivation {
+    value: ActivationValue,
+    fault_bound: u16,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ActivateEpochRequest {
     pub transition: AvssTransition,
     pub value: ActivationValue,
@@ -487,6 +620,7 @@ pub struct ProactiveRefreshStatus {
     pub source_epoch: u64,
     pub target_epoch: Option<u64>,
     pub due_unix_ms: Option<u64>,
+    pub selection_fallback_due_unix_ms: Option<u64>,
 }
 
 /// HTTP representation keeps the caller's tenant-local idempotency key distinct from the
@@ -499,8 +633,10 @@ pub struct DepositHttpResponse {
     pub status: DepositHttpStatus,
     pub address: Option<CanonicalDepositAddress>,
     pub certificate: Option<CertifiedLedgerEntry>,
-    /// Bounded, activation-certificate-root-bound authority for `certificate`.
-    pub issuer_registry: Option<CompactEpochRegistry>,
+    /// Exact historical or active issuer window authorizing `certificate`.
+    pub allocation_issuer: Option<VerifiedIssuerWindow>,
+    /// Exact current deposit registry, even while the scanner is synchronizing.
+    pub serving_registry: CompactEpochRegistry,
     pub created_at: Option<u64>,
     pub expires_at: Option<u64>,
     pub leader: PartyId,
@@ -516,13 +652,22 @@ pub enum DepositHttpStatus {
     Permanent,
 }
 
-/// Tenant-isolated public consolidation history for one allocation request. Exact transaction
-/// bytes remain off this API; clients can fetch them by the committed transaction id from Monero.
+/// Tenant-bound query for one exact certified deposit output. Requiring the immutable output
+/// identity prevents request-wide scan enumeration and lets the service prove allocation
+/// ownership before looking up a permanent consolidation claim.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct DepositConsolidationStatusRequest {
+    pub request: DepositAddressRequest,
+    pub output: WalletOutputId,
+}
+
+/// Portable-first public result for one tenant-owned output.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct DepositConsolidationStatusResponse {
     pub request: LedgerRequestId,
     pub certified_request: LedgerRequestId,
-    pub consolidations: Vec<PublicConsolidationStatus>,
+    pub output: WalletOutputId,
+    pub consolidation: Option<PublicConsolidationStatus>,
 }
 
 /// Read-only diagnostics for one durable AVSS/QUAL session. This intentionally exposes counts and
@@ -535,6 +680,14 @@ pub struct ProtocolSessionStatus {
     pub qual_round: Option<u64>,
     pub qual_decided: bool,
     pub finalized: bool,
+    /// Whether the durable activation certificate has authorized erasing the live AVSS/QUAL
+    /// reducer material. A compacted-but-inactive target is a recoverable activation write window,
+    /// not an ordinary protocol round.
+    pub secret_compacted: bool,
+    /// Distinct target members whose exact signed activation acknowledgement this party has
+    /// durably accepted. Sender-side outbox counts alone cannot show whether this receiver has
+    /// reached the n-f activation quorum.
+    pub activation_acknowledgements: usize,
     pub pending_avss: usize,
     pub pending_qual: usize,
     pub pending_activation_ack: usize,
@@ -621,6 +774,25 @@ pub enum AcceptanceDriverLatchKind {
     ObserverFork,
     DynamicRotationOmission,
     ProactiveDeadline,
+    ConsolidationPeerReconnect,
+}
+
+pub(crate) fn acceptance_driver_binding(
+    kind: AcceptanceDriverLatchKind,
+    material: &[u8],
+) -> [u8; 32] {
+    let marker = match kind {
+        AcceptanceDriverLatchKind::ObserverFork => "observer_fork",
+        AcceptanceDriverLatchKind::DynamicRotationOmission => "dynamic_rotation_omission",
+        AcceptanceDriverLatchKind::ProactiveDeadline => "proactive_deadline",
+        AcceptanceDriverLatchKind::ConsolidationPeerReconnect => "consolidation_peer_reconnect",
+    };
+    let mut hasher =
+        blake3::Hasher::new_derive_key("threshold-monero/e2e-acceptance-driver-binding/v1");
+    hasher.update(marker.as_bytes());
+    hasher.update(&(material.len() as u64).to_le_bytes());
+    hasher.update(material);
+    *hasher.finalize().as_bytes()
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -636,6 +808,9 @@ pub struct AcceptanceDriverLatchResponse {
     pub state: AcceptanceConsolidationGateState,
     pub kind: Option<AcceptanceDriverLatchKind>,
     pub binding: Option<[u8; 32]>,
+    /// Write-ahead wall-clock evidence for the exact proactive deadline latch. It is persisted
+    /// before this party may start the bound receiver-key/refresh transition.
+    pub event_unix_ms: Option<u64>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -658,6 +833,7 @@ struct AcceptanceDriverLatch {
     state: AcceptanceConsolidationGateState,
     kind: Option<AcceptanceDriverLatchKind>,
     binding: Option<[u8; 32]>,
+    event_unix_ms: Option<u64>,
 }
 
 impl Default for AcceptanceDriverLatch {
@@ -667,6 +843,7 @@ impl Default for AcceptanceDriverLatch {
             state: AcceptanceConsolidationGateState::Disarmed,
             kind: None,
             binding: None,
+            event_unix_ms: None,
         }
     }
 }
@@ -679,14 +856,21 @@ impl AcceptanceDriverLatch {
         );
         match self.state {
             AcceptanceConsolidationGateState::Disarmed => anyhow::ensure!(
-                self.kind.is_none() && self.binding.is_none(),
+                self.kind.is_none() && self.binding.is_none() && self.event_unix_ms.is_none(),
                 "disarmed acceptance driver latch retained a binding"
             ),
             AcceptanceConsolidationGateState::Held | AcceptanceConsolidationGateState::Released => {
                 anyhow::ensure!(
                     self.kind.is_some() && self.binding.is_some_and(|binding| binding != [0; 32]),
                     "active acceptance driver latch lacks its exact binding"
-                )
+                );
+                if let Some(event_unix_ms) = self.event_unix_ms {
+                    anyhow::ensure!(
+                        self.kind == Some(AcceptanceDriverLatchKind::ProactiveDeadline)
+                            && event_unix_ms != 0,
+                        "acceptance driver latch retained an invalid protocol event"
+                    );
+                }
             }
             AcceptanceConsolidationGateState::Armed => {
                 anyhow::bail!("acceptance driver latch cannot retain an unheld armed state")
@@ -695,12 +879,99 @@ impl AcceptanceDriverLatch {
         Ok(())
     }
 
+    fn transition(&self, request: AcceptanceDriverLatchRequest) -> anyhow::Result<Option<Self>> {
+        self.validate()?;
+        anyhow::ensure!(request.binding != [0; 32], "acceptance driver binding is invalid");
+        if matches!(
+            self.state,
+            AcceptanceConsolidationGateState::Held | AcceptanceConsolidationGateState::Released
+        ) {
+            anyhow::ensure!(
+                self.kind == Some(request.kind) && self.binding == Some(request.binding),
+                "acceptance driver request differs from the durable latch"
+            );
+        }
+        Ok(match request.action {
+            AcceptanceConsolidationGateAction::Status => None,
+            AcceptanceConsolidationGateAction::Arm => {
+                if matches!(
+                    self.state,
+                    AcceptanceConsolidationGateState::Held
+                        | AcceptanceConsolidationGateState::Released
+                ) {
+                    None
+                } else {
+                    Some(Self {
+                        version: ACCEPTANCE_DRIVER_LATCH_VERSION,
+                        state: AcceptanceConsolidationGateState::Held,
+                        kind: Some(request.kind),
+                        binding: Some(request.binding),
+                        event_unix_ms: None,
+                    })
+                }
+            }
+            AcceptanceConsolidationGateAction::Release => {
+                anyhow::ensure!(
+                    matches!(
+                        self.state,
+                        AcceptanceConsolidationGateState::Held
+                            | AcceptanceConsolidationGateState::Released
+                    ),
+                    "acceptance driver latch cannot release before it is held"
+                );
+                if self.kind == Some(AcceptanceDriverLatchKind::ProactiveDeadline) {
+                    anyhow::ensure!(
+                        self.event_unix_ms.is_some(),
+                        "proactive deadline latch cannot release before its durable start event"
+                    );
+                }
+                (self.state != AcceptanceConsolidationGateState::Released).then(|| Self {
+                    state: AcceptanceConsolidationGateState::Released,
+                    ..self.clone()
+                })
+            }
+        })
+    }
+
+    fn record_proactive_deadline_event(
+        &self,
+        binding: [u8; 32],
+        due_unix_ms: u64,
+        event_unix_ms: u64,
+    ) -> anyhow::Result<Option<Self>> {
+        self.validate()?;
+        if self.state != AcceptanceConsolidationGateState::Held
+            || self.kind != Some(AcceptanceDriverLatchKind::ProactiveDeadline)
+        {
+            return Ok(None);
+        }
+        anyhow::ensure!(
+            self.binding == Some(binding),
+            "proactive deadline event differs from the durable driver latch"
+        );
+        anyhow::ensure!(
+            due_unix_ms != 0
+                && due_unix_ms != ACCEPTANCE_PROACTIVE_REFRESH_HELD_DUE_UNIX_MS
+                && event_unix_ms >= due_unix_ms,
+            "proactive refresh began before its exact durable deadline"
+        );
+        if let Some(recorded) = self.event_unix_ms {
+            anyhow::ensure!(
+                recorded >= due_unix_ms,
+                "durable proactive deadline event predates its bound deadline"
+            );
+            return Ok(None);
+        }
+        Ok(Some(Self { event_unix_ms: Some(event_unix_ms), ..self.clone() }))
+    }
+
     fn response(&self, party: PartyId) -> AcceptanceDriverLatchResponse {
         AcceptanceDriverLatchResponse {
             party,
             state: self.state,
             kind: self.kind,
             binding: self.binding,
+            event_unix_ms: self.event_unix_ms,
         }
     }
 }
@@ -756,6 +1027,87 @@ impl AcceptanceDepositCheckpointGate {
             }
         }
         Ok(())
+    }
+
+    fn transition(
+        &self,
+        request: AcceptanceDepositCheckpointGateRequest,
+        authenticated_arm_evidence: Option<DurableDepositObservationEvidence>,
+    ) -> anyhow::Result<Option<Self>> {
+        self.validate()?;
+        anyhow::ensure!(
+            request.output.transaction != [0; 32],
+            "acceptance deposit checkpoint output is invalid"
+        );
+        if matches!(
+            self.state,
+            AcceptanceConsolidationGateState::Held | AcceptanceConsolidationGateState::Released
+        ) {
+            anyhow::ensure!(
+                self.output == Some(request.output),
+                "acceptance deposit checkpoint request names another output"
+            );
+        }
+        match request.action {
+            AcceptanceConsolidationGateAction::Status => {
+                anyhow::ensure!(
+                    authenticated_arm_evidence.is_none(),
+                    "status cannot replace durable deposit checkpoint evidence"
+                );
+                Ok(None)
+            }
+            AcceptanceConsolidationGateAction::Arm
+                if matches!(
+                    self.state,
+                    AcceptanceConsolidationGateState::Held
+                        | AcceptanceConsolidationGateState::Released
+                ) =>
+            {
+                anyhow::ensure!(
+                    authenticated_arm_evidence.is_none(),
+                    "idempotent arm cannot replace durable deposit checkpoint evidence"
+                );
+                Ok(None)
+            }
+            AcceptanceConsolidationGateAction::Arm => {
+                let evidence = authenticated_arm_evidence
+                    .context("acceptance deposit checkpoint arm lacks authenticated evidence")?;
+                anyhow::ensure!(
+                    evidence.output.output() == request.output,
+                    "authenticated deposit checkpoint evidence names another output"
+                );
+                let candidate = Self {
+                    version: ACCEPTANCE_DEPOSIT_CHECKPOINT_GATE_VERSION,
+                    state: AcceptanceConsolidationGateState::Held,
+                    output: Some(request.output),
+                    evidence: Some(evidence),
+                };
+                candidate.validate()?;
+                Ok(Some(candidate))
+            }
+            AcceptanceConsolidationGateAction::Release => {
+                anyhow::ensure!(
+                    authenticated_arm_evidence.is_none(),
+                    "release cannot replace durable deposit checkpoint evidence"
+                );
+                anyhow::ensure!(
+                    matches!(
+                        self.state,
+                        AcceptanceConsolidationGateState::Held
+                            | AcceptanceConsolidationGateState::Released
+                    ),
+                    "acceptance deposit checkpoint gate cannot release before it is held"
+                );
+                if self.state == AcceptanceConsolidationGateState::Released {
+                    Ok(None)
+                } else {
+                    let candidate =
+                        Self { state: AcceptanceConsolidationGateState::Released, ..self.clone() };
+                    candidate.validate()?;
+                    Ok(Some(candidate))
+                }
+            }
+        }
     }
 
     fn response(&self, party: PartyId) -> AcceptanceDepositCheckpointGateResponse {
@@ -1223,13 +1575,45 @@ struct ActivationCertificateRecord {
 /// decides when an honest dealer is willing to release its next independently randomized AVSS
 /// polynomial. It is bound to the exact source activation so a stale schedule cannot trigger from
 /// a restored or competing epoch.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+enum ProactiveRefreshSchedulePhase {
+    /// The locally finalized AVSS reducer authenticates this write-ahead record, but the public
+    /// activation certificate/history CAS has not necessarily reached stable storage yet.
+    PendingActivation,
+    /// The matching activation certificate is durable and the fixed interval has been re-armed
+    /// exactly once from a trusted local completion time.
+    Armed,
+}
+
+/// One bounded passive-observer successor which cannot replace the live schedule while this
+/// replica still retains signer authority for an older epoch. Keeping the locally sampled
+/// deadlines here avoids moving an already-observed epoch's fixed interval when delayed source
+/// retirement finally completes. The exact certified history is reauthenticated before promotion.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+struct DeferredObserverRefreshSchedule {
+    source_epoch: u64,
+    source_activation: [u8; 32],
+    /// Authenticated epoch-history root at `source_epoch`. This sealed cursor proves that every
+    /// earlier delta was checked once for constant-key continuity and local non-membership; a
+    /// later candidate validates only the suffix after this endpoint.
+    source_history_root: [u8; 32],
+    target_epoch: Option<u64>,
+    due_unix_ms: Option<u64>,
+    selection_fallback_due_unix_ms: Option<u64>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 struct ProactiveRefreshSchedule {
     version: u16,
+    phase: ProactiveRefreshSchedulePhase,
     source_epoch: u64,
     source_activation: [u8; 32],
     target_epoch: Option<u64>,
     due_unix_ms: Option<u64>,
+    /// Immutable source-membership fallback deadline. Before this time every admissible
+    /// key-rotation value must retain the maximum possible source overlap. At or after it, the
+    /// local scheduler may sign one context-bound fallback vote.
+    selection_fallback_due_unix_ms: Option<u64>,
     /// Persisted key-rotation pacemaker anchor. It is absent until the fixed due-time gate creates
     /// the current successor's certified receiver-key rotation reducer.
     rotation_view: Option<u64>,
@@ -1238,6 +1622,10 @@ struct ProactiveRefreshSchedule {
     /// Highest contiguous immutable key-rotation certificate accepted by each peer. A successful
     /// ACK for epoch k implies that peer could verify the predecessor chain through k.
     rotation_certificate_delivered_through: BTreeMap<PartyId, u64>,
+    /// Freshest passively observed certified source which arrived while an older local signer
+    /// authority was still active or staged. This is deliberately a single bounded candidate;
+    /// intermediate continuity comes from authenticated epoch history, not an unbounded queue.
+    deferred_observer: Option<DeferredObserverRefreshSchedule>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1429,6 +1817,195 @@ impl PendingPeerMessage {
     }
 }
 
+#[derive(Clone, Copy)]
+enum PendingPeerMessageRef<'a> {
+    Avss { transition: &'a AvssTransition, wire: &'a AvssWire },
+    Qual { transition: &'a AvssTransition, wire: &'a QualWire },
+    ActivationAck { transition: &'a AvssTransition, acknowledgement: &'a SignedEnvelope },
+}
+
+impl PendingPeerMessageRef<'_> {
+    fn into_owned(self, id: PeerMessageId) -> PendingPeerMessage {
+        match self {
+            Self::Avss { transition, wire } => PendingPeerMessage::Avss {
+                id,
+                request: AvssDeliverRequest { transition: transition.clone(), wire: wire.clone() },
+            },
+            Self::Qual { transition, wire } => PendingPeerMessage::Qual {
+                id,
+                request: QualDeliverRequest { transition: transition.clone(), wire: wire.clone() },
+            },
+            Self::ActivationAck { transition, acknowledgement } => {
+                PendingPeerMessage::ActivationAck {
+                    id,
+                    request: ActivationAckDeliverRequest {
+                        transition: transition.clone(),
+                        acknowledgement: acknowledgement.clone(),
+                    },
+                }
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PeerOutboxLane {
+    Protocol,
+    ActivationAck,
+}
+
+impl PeerOutboxLane {
+    const fn other(self) -> Self {
+        match self {
+            Self::Protocol => Self::ActivationAck,
+            Self::ActivationAck => Self::Protocol,
+        }
+    }
+}
+
+/// Volatile, stable-successor state for the durable protocol outbox.
+///
+/// AVSS/QUAL traffic and activation acknowledgements have independent cursors because the latter
+/// are not causally fenced by the former. Alternating the two semantic lanes guarantees that
+/// continual AVSS/QUAL churn cannot keep an activation acknowledgement outside every bounded
+/// transport snapshot. The identifiers themselves are durable and stable; removing an
+/// acknowledged item therefore advances to the next greater live identifier instead of
+/// reinterpreting a numeric offset into a changing collection.
+#[derive(Debug)]
+struct PeerOutboxCursor {
+    protocol: Option<PeerMessageId>,
+    activation_ack: Option<PeerMessageId>,
+    preferred: PeerOutboxLane,
+}
+
+impl Default for PeerOutboxCursor {
+    fn default() -> Self {
+        // Activation acknowledgements can form the certificate which unlocks all later progress,
+        // so give that independent lane the first slot after startup.
+        Self { protocol: None, activation_ack: None, preferred: PeerOutboxLane::ActivationAck }
+    }
+}
+
+fn stable_peer_message_ids_after(
+    ids: &BTreeSet<PeerMessageId>,
+    cursor: Option<PeerMessageId>,
+) -> VecDeque<PeerMessageId> {
+    let mut ordered = ids.iter().copied().collect::<Vec<_>>();
+    if let Some(cursor) = cursor {
+        let start = ordered.partition_point(|id| *id <= cursor);
+        ordered.rotate_left(start);
+    }
+    ordered.into()
+}
+
+fn select_bounded_peer_message_ids(
+    protocol: &BTreeSet<PeerMessageId>,
+    activation_ack: &BTreeSet<PeerMessageId>,
+    cursor: &mut PeerOutboxCursor,
+    limit: usize,
+) -> Vec<PeerMessageId> {
+    let take = limit.min(protocol.len().saturating_add(activation_ack.len()));
+    let mut protocol = stable_peer_message_ids_after(protocol, cursor.protocol);
+    let mut activation_ack = stable_peer_message_ids_after(activation_ack, cursor.activation_ack);
+    let mut selected = Vec::with_capacity(take);
+
+    while selected.len() < take {
+        let preferred = cursor.preferred;
+        let (lane, id) = match preferred {
+            PeerOutboxLane::Protocol => {
+                protocol.pop_front().map(|id| (PeerOutboxLane::Protocol, id)).or_else(|| {
+                    activation_ack.pop_front().map(|id| (PeerOutboxLane::ActivationAck, id))
+                })
+            }
+            PeerOutboxLane::ActivationAck => activation_ack
+                .pop_front()
+                .map(|id| (PeerOutboxLane::ActivationAck, id))
+                .or_else(|| protocol.pop_front().map(|id| (PeerOutboxLane::Protocol, id))),
+        }
+        .expect("bounded peer-outbox selection counted a missing item");
+
+        match lane {
+            PeerOutboxLane::Protocol => cursor.protocol = Some(id),
+            PeerOutboxLane::ActivationAck => cursor.activation_ack = Some(id),
+        }
+        cursor.preferred = lane.other();
+        selected.push(id);
+    }
+    selected
+}
+
+/// Compact verifier for the exact typed acknowledgement expected from one authenticated peer.
+///
+/// Preparing this expectation validates the complete request once. Relay retries retain only the
+/// authenticated route, exact delivery identifier, and trusted committee needed to reject a
+/// generic success response or an ACK replayed across routes or deliveries.
+#[derive(Clone, Debug)]
+pub(crate) struct ByzantineConsolidationAckExpectation {
+    authenticated_recipient: PartyId,
+    expected: ByzantineDeliveryId,
+    committee: Committee,
+}
+
+impl ByzantineConsolidationAckExpectation {
+    pub(crate) fn validate_response(&self, response_body: &[u8]) -> anyhow::Result<()> {
+        let acknowledgement = ByzantineConsolidationWireMessage::decode(response_body)?;
+        acknowledgement.validate_authenticated_route_in_committee(
+            self.authenticated_recipient,
+            self.expected.relay(),
+            &self.committee,
+        )?;
+        let ByzantineConsolidationWireMessage::Ack(acknowledgement) = acknowledgement else {
+            anyhow::bail!("Byzantine consolidation success omitted its typed ACK")
+        };
+        acknowledgement.verify_expected(&self.committee, self.expected)?;
+        Ok(())
+    }
+}
+
+/// Small runtime-owned selector for the one wallet-scoped certified transfer lane.
+///
+/// It carries no committee, certificate, registry, or process-local verification token. Every
+/// typed host facade below reconstructs those authorities from authenticated epoch history and
+/// the stage's exact durable evidence immediately before the local storage operation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct CertifiedDepositStateTransferWorkContext {
+    context: DepositStateTransferContext,
+}
+
+impl CertifiedDepositStateTransferWorkContext {
+    #[must_use]
+    pub(crate) const fn context(self) -> DepositStateTransferContext {
+        self.context
+    }
+}
+
+/// Complete authenticated current-target StateImported transport census.
+///
+/// The target epoch remains present when the journal is empty so restart reconciliation can
+/// retire a stale certificate-delivery intent without waiting for another epoch transition.
+pub(crate) struct DepositStateImportWorkCensus {
+    target_epoch: Option<u64>,
+    finalized: bool,
+    pending: Vec<DepositStateImportWorkLocator>,
+}
+
+impl DepositStateImportWorkCensus {
+    #[must_use]
+    pub(crate) const fn finalized(&self) -> bool {
+        self.finalized
+    }
+
+    #[must_use]
+    pub(crate) const fn target_epoch(&self) -> Option<u64> {
+        self.target_epoch
+    }
+
+    #[must_use]
+    pub(crate) fn into_pending(self) -> Vec<DepositStateImportWorkLocator> {
+        self.pending
+    }
+}
+
 pub struct PartyServer {
     party: PartyId,
     scenario: Scenario,
@@ -1436,7 +2013,7 @@ pub struct PartyServer {
     /// retained by the server rather than merely fencing construction: independent servers
     /// writing the same authenticated CAS namespaces would otherwise both believe they own the
     /// next revision.
-    _state_lease: PartyStateLease,
+    _state_lease: Arc<PartyStateLease>,
     /// Stable Ed25519 identity plus the exact epoch X25519 key. Dynamic entries are inserted only
     /// after their secret has reached authenticated storage (and, once decided, after promotion
     /// against the locally durable key-rotation certificate).
@@ -1454,21 +2031,62 @@ pub struct PartyServer {
     authenticated_quic_ingress: AtomicU64,
     authenticated_quic_responses: AtomicU64,
     store: ShareStore,
-    protocol_store: ProtocolStore,
+    protocol_store: Arc<ProtocolStore>,
     epoch_history_snapshots: WalletSnapshotStore,
     epoch_history_artifacts: WalletArtifactStore,
     epoch_history_wallet: WalletId,
     epoch_history: RwLock<EpochHistoryState>,
+    /// Sparse authenticated set of every configured/bootstrap and certified receiver key.
+    ///
+    /// The store is reconstructed from authenticated epoch artifacts on cold startup. Only its
+    /// constant-size commitment enters rotation policy/certificates.
+    receiver_keys: Arc<StdRwLock<ReceiverKeyAccumulatorStore>>,
+    /// Non-authoritative, restartable compact-deposit downloads. Its artifact kind and protocol
+    /// record are disjoint from every live wallet authority.
+    deposit_sync_spools: DepositSyncSpoolManager,
     /// Locally durable, fully verified dynamic committee chain keyed by target epoch.
     certified_key_rotations: StdRwLock<BTreeMap<u64, CertifiedKeyRotation>>,
+    #[cfg(test)]
+    certified_key_rotation_registration_verifications: AtomicU64,
     /// At most one source-to-successor key-rotation reducer may be live. Its revision is the exact
     /// monotonic ProtocolStore CAS position and includes the retry outbox.
     key_rotation: Mutex<Option<LiveKeyRotation>>,
+    /// Serializes the check/create/read-back publication of the one live rotation. QUIC ingress
+    /// and the local pacemaker can cross the fixed deadline concurrently.
+    key_rotation_start_mutation: Mutex<()>,
+    /// Linearizes every mutation derived from one live key-rotation revision through its durable
+    /// CAS and volatile publication. Without this fence, honest ingress, delivery ACK cleanup,
+    /// fallback, and view-change work can all derive different revision N+1 snapshots from N and
+    /// livelock while the store correctly rejects the losing forks.
+    key_rotation_mutation: Arc<Mutex<()>>,
+    /// Deterministic unit-test cut after a view-change CAS but before volatile publication.
+    #[cfg(test)]
+    key_rotation_view_publication_gate: Mutex<Option<KeyRotationViewPublicationGate>>,
+    /// Bounds authenticated peer work which clones/reduces the multi-megabyte durable rotation
+    /// state or verifies its accumulator proof on Tokio's blocking pool.
+    key_rotation_blocking_permits: Arc<Semaphore>,
     /// A target-only joining member has no source-consensus reducer. Its independently signed
     /// advertisement fanout is regenerated from the durable candidate after restart and retained
     /// until a source certificate arrives.
     joining_key_rotation: Mutex<Option<JoiningKeyRotation>>,
     deposit: Option<Arc<DepositService>>,
+    /// Bounds cancellation-safe HTTP allocation mutations. The durable reducer is serialized
+    /// already; allowing timed-out clients to detach an unbounded FIFO of equivalent work only
+    /// delays authenticated peer consensus and creates an avoidable availability attack.
+    deposit_allocation_admission_permits: Arc<Semaphore>,
+    /// Bounds authenticated, certificate-verifying deposit reads before they can fan out daemon
+    /// RPC, route-database blocking work, or encrypted artifact reads. Both read-only status
+    /// endpoints share this non-queuing admission boundary.
+    deposit_read_admission_permits: Arc<Semaphore>,
+    /// Serializes only the chain-independent publication of a prepared deposit genesis with the
+    /// certified epoch activation linearization point. Monero RPC always runs before this lock.
+    deposit_genesis_publication: Mutex<()>,
+    /// Volatile optimistic-CAS revision reconstructed from the active certified epoch on restart.
+    /// A genesis preparation that crossed an activation boundary may never publish.
+    deposit_activation_revision: AtomicU64,
+    /// Production uses wall-clock time. Only the explicitly configured private-Regtest deposit
+    /// TTL acceptance uses the authenticated, monotonic file-backed clock.
+    deposit_clock: Arc<DepositClock>,
     deposit_chain_readiness: Option<DepositChainReadiness>,
     /// Public epochs learned from validated, durable activation certificates, including epochs
     /// for which this party never held a signing share. Deposit handoff replay needs this on
@@ -1478,6 +2096,10 @@ pub struct PartyServer {
     /// authorized each deposit target. Compact-registry capabilities are never reconstructed from
     /// `EpochPublic` alone.
     deposit_target_roots: RwLock<BTreeMap<u64, [u8; 32]>>,
+    /// Single-flight cache for source-pin reclamation and requester release reconciliation.
+    /// Restart begins empty; a new certified target has a distinct binding and therefore cannot
+    /// reuse the predecessor's successful result.
+    deposit_sync_lifetime_reconciliation: Mutex<Option<[u8; 32]>>,
     deposit_recovered_epochs: Mutex<BTreeSet<u64>>,
     epochs: RwLock<BTreeMap<u64, EpochShare>>,
     active_epoch: RwLock<Option<u64>>,
@@ -1486,9 +2108,13 @@ pub struct PartyServer {
     /// Witness-independent certified epoch links. This synchronous map lets untrusted AVSS/QUAL
     /// bodies be rejected for a wrong history parent before allocating reducer state.
     history_links: StdRwLock<BTreeMap<u64, EpochHistoryLink>>,
-    proactive_refresh_schedule: Mutex<Option<ProactiveRefreshSchedule>>,
+    proactive_refresh_schedule: Arc<Mutex<Option<ProactiveRefreshSchedule>>>,
     /// Serializes every schedule read-modify-write across encrypted storage and RAM publication.
     proactive_refresh_schedule_mutation: Mutex<()>,
+    /// Deterministic unit-test cut after schedule durability but before volatile publication.
+    #[cfg(test)]
+    proactive_refresh_schedule_publication_gate:
+        Arc<Mutex<Option<ProactiveRefreshSchedulePublicationGate>>>,
     /// Demo-Regtest-only acceptance hold. Each newly activated epoch persists the reserved
     /// `u64::MAX` deadline until an authenticated exact-source release re-arms the ordinary fixed
     /// interval. The default/production path is always autonomous.
@@ -1504,14 +2130,21 @@ pub struct PartyServer {
     /// Certified runs may retain peer-directed catch-up messages for an offline honest target,
     /// but they no longer consume the bounded live-reducer budget or pacemaker work.
     certified_avss_sessions: RwLock<BTreeMap<SessionId, [u8; 32]>>,
+    /// Fully verified hot activation certificates used to construct immutable epoch gossip.
+    ///
+    /// Re-reading and re-authenticating every certificate from disk on every relay poll makes
+    /// unrelated fsync pressure block AVSS/QUAL delivery. This bounded cache is populated only
+    /// from the durable certificate/history audit at startup or immediately after the exact
+    /// certificate reaches stable storage. Cold-history pruning removes the matching entry.
+    activation_gossip_records: RwLock<BTreeMap<(u64, [u8; 32]), ActivationCertificateRecord>>,
     avss: Mutex<BTreeMap<SessionId, AvssRun>>,
-    peer_outbox_cursor: Mutex<usize>,
+    peer_outbox_cursor: Mutex<PeerOutboxCursor>,
     /// Non-serializable FROST machines for live consolidation attempts. Durable service records
     /// own every wire response and recovery decision; restart burns these machines and continues
     /// only through a new attempt/session.
     consolidation_signing: Mutex<HashMap<SessionId, ConsolidationSigningRuntime>>,
     /// Serialize scanner rollback/quarantine with volatile consolidation state transitions.
-    consolidation_transition: Mutex<()>,
+    consolidation_transition: Arc<Mutex<()>>,
     /// Set only after every attempt restored from the service snapshot has an authenticated
     /// ProtocolStore closure. This prevents restart from recreating a nonce for a Released record.
     consolidation_closures_restored: Mutex<bool>,
@@ -1533,6 +2166,31 @@ pub struct PartyServer {
 impl std::fmt::Debug for PartyServer {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PartyServer").field("party", &self.party).finish_non_exhaustive()
+    }
+}
+
+/// Host-side half of one scanner-owned index publication.
+///
+/// The service owns the exact durable snapshot transaction while the party host owns volatile
+/// FROSTLASS machines. `SnapshotDepositOutputIndexBackend` invokes this adapter only after dropping
+/// all service runtime/index guards, but before releasing the shared consolidation transition
+/// fence, so closure reconstruction can safely re-enter the service and prune stale machines.
+struct PartyDepositWorkerMutationHost<'a> {
+    server: &'a PartyServer,
+    deposit: &'a DepositService,
+}
+
+impl DepositWorkerMutationHost for PartyDepositWorkerMutationHost<'_> {
+    fn reconcile<'a>(
+        &'a self,
+        transition: &'a tokio::sync::MutexGuard<'_, ()>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + 'a>> {
+        Box::pin(async move {
+            self.server
+                .finish_deposit_runtime_mutation(transition, self.deposit, Ok(()))
+                .await
+                .map_err(|error| format!("{error:#}"))
+        })
     }
 }
 
@@ -1562,6 +2220,19 @@ fn live_predecessor_epochs(epochs: impl IntoIterator<Item = u64>, old_epoch: u64
 
 fn acceptance_consolidation_gate_allowed(scenario: &Scenario, explicitly_enabled: bool) -> bool {
     explicitly_enabled && scenario.demo_only && scenario.network == NetworkKind::Regtest
+}
+
+fn acceptance_control_storage_keys(
+    network: [u8; 32],
+    party: PartyId,
+) -> anyhow::Result<[(SessionId, [u8; 32]); 5]> {
+    Ok([
+        acceptance_consolidation_gate_storage_key(network, party)?,
+        acceptance_consolidation_bootstrap_gate_storage_key(network, party)?,
+        acceptance_protocol_fault_gate_storage_key(network, party)?,
+        acceptance_driver_latch_storage_key(network, party)?,
+        acceptance_deposit_checkpoint_gate_storage_key(network, party)?,
+    ])
 }
 
 fn acceptance_protocol_fault_gate_storage_key(
@@ -1737,6 +2408,27 @@ async fn restore_acceptance_consolidation_bootstrap_gate(
     Ok(gate)
 }
 
+fn plan_consolidation_session_closures(
+    closures: &[ConsolidationSessionClosure],
+    first_process_recovery: bool,
+) -> anyhow::Result<(Vec<&ConsolidationSessionClosure>, BTreeMap<SessionId, &[u8]>)> {
+    let mut seen = BTreeSet::new();
+    let mut closures_to_persist = Vec::new();
+    let mut live_sessions = BTreeMap::new();
+    for closure in closures {
+        anyhow::ensure!(
+            seen.insert(closure.session),
+            "duplicate durable consolidation session closure"
+        );
+        if first_process_recovery || !closure.currently_signing_released {
+            closures_to_persist.push(closure);
+        } else {
+            live_sessions.insert(closure.session, closure.purpose.as_slice());
+        }
+    }
+    Ok((closures_to_persist, live_sessions))
+}
+
 impl PartyServer {
     /// Acquire a consolidation-only lease for the deposit registry's still-authoritative epoch.
     /// During threshold activation the global signing epoch may advance before the old-quorum
@@ -1783,12 +2475,13 @@ impl PartyServer {
     /// Destroy every volatile signing machine which can still contain a clone of `epoch`'s
     /// threshold scalar before the corresponding `EpochShare` is removed from RAM or disk.
     ///
-    /// Callers must first certify the portable deposit handoff, then hold the consolidation and
-    /// epoch transition locks in that order. The handoff proves that old-epoch obligations no
-    /// longer need a local linear signer; the exact service closure plus authenticated
-    /// ProtocolStore tombstone proves that dropping each nonce machine cannot make its session
-    /// reusable. Generic demo signers do not retain an epoch tag, so every such machine is
-    /// conservatively destroyed at any retirement boundary.
+    /// Callers must first certify the portable deposit handoff, or prove under the publication
+    /// fence that no deposit snapshot ever existed, then hold the consolidation and epoch
+    /// transition locks in that order. The gate proves that old-epoch obligations do not need a
+    /// local linear signer; the exact service closure plus authenticated ProtocolStore tombstone
+    /// proves that dropping each nonce machine cannot make its session reusable. Generic demo
+    /// signers do not retain an epoch tag, so every such machine is conservatively destroyed at any
+    /// retirement boundary.
     async fn drain_retiring_epoch_signers(
         &self,
         _consolidation_transition: &tokio::sync::MutexGuard<'_, ()>,
@@ -1863,12 +2556,12 @@ impl PartyServer {
         Ok(retired_count)
     }
 
-    pub async fn new(
+    pub async fn new<'a>(
         party: PartyId,
         scenario: Scenario,
         state_directory: impl Into<std::path::PathBuf>,
         signing_seed: &[u8; 32],
-        bootstrap_x25519_secret: &[u8; 32],
+        bootstrap_x25519_secret: impl Into<Option<&'a [u8; 32]>>,
     ) -> anyhow::Result<Arc<Self>> {
         let acceptance_gate_requested =
             std::env::var(ACCEPTANCE_CONSOLIDATION_GATE_ENV).as_deref() == Ok("1");
@@ -1883,7 +2576,7 @@ impl PartyServer {
             scenario,
             state_directory.into(),
             signing_seed,
-            bootstrap_x25519_secret,
+            bootstrap_x25519_secret.into(),
             None,
             acceptance_gate_requested,
             acceptance_bootstrap_gate_requested,
@@ -1894,12 +2587,12 @@ impl PartyServer {
     }
 
     /// Construct a party with the durable deposit-address state machine enabled.
-    pub async fn new_with_deposits(
+    pub async fn new_with_deposits<'a>(
         party: PartyId,
         scenario: Scenario,
         state_directory: impl Into<std::path::PathBuf>,
         signing_seed: &[u8; 32],
-        bootstrap_x25519_secret: &[u8; 32],
+        bootstrap_x25519_secret: impl Into<Option<&'a [u8; 32]>>,
         deposit: PartyDepositConfig,
     ) -> anyhow::Result<Arc<Self>> {
         let acceptance_gate_requested =
@@ -1915,7 +2608,7 @@ impl PartyServer {
             scenario,
             state_directory.into(),
             signing_seed,
-            bootstrap_x25519_secret,
+            bootstrap_x25519_secret.into(),
             Some(deposit),
             acceptance_gate_requested,
             acceptance_bootstrap_gate_requested,
@@ -1930,7 +2623,7 @@ impl PartyServer {
         scenario: Scenario,
         state_directory: std::path::PathBuf,
         signing_seed: &[u8; 32],
-        bootstrap_x25519_secret: &[u8; 32],
+        bootstrap_x25519_secret: Option<&[u8; 32]>,
         deposit_config: Option<PartyDepositConfig>,
         acceptance_gate_requested: bool,
         acceptance_bootstrap_gate_requested: bool,
@@ -1938,18 +2631,40 @@ impl PartyServer {
         acceptance_proactive_refresh_hold_requested: bool,
     ) -> anyhow::Result<Arc<Self>> {
         scenario.validate()?;
+        // Validate the private-Regtest-only clock gate before acquiring the state-directory lease
+        // or opening any mutable store. A configured clock must fail closed when deposits are
+        // disabled or when the scenario is not demo-only Regtest.
+        let deposit_clock =
+            Arc::new(DepositClock::from_scenario_env(&scenario, deposit_config.is_some())?);
         let configured = scenario.party(party)?;
         anyhow::ensure!(
             Identity::signing_public_key_from_seed(signing_seed)? == configured.signing_key.0,
             "signing seed does not match the configured stable Ed25519 key"
         );
-        let configured_bootstrap = EpochEncryptionSecret::from_decrypted(
-            party,
-            0,
-            configured.bootstrap_encryption_key.0,
-            Zeroizing::new(*bootstrap_x25519_secret),
-        )
-        .context("bootstrap X25519 secret does not match the configured public key")?;
+        let genesis = scenario.genesis_committee()?;
+        let configured_bootstrap = match genesis.member(party) {
+            Ok(_) => {
+                let secret = bootstrap_x25519_secret
+                    .context("genesis member requires an epoch-zero X25519 secret")?;
+                Some(
+                    EpochEncryptionSecret::from_decrypted(
+                        party,
+                        0,
+                        configured.bootstrap_encryption_key.0,
+                        Zeroizing::new(*secret),
+                    )
+                    .context("bootstrap X25519 secret does not match the configured public key")?,
+                )
+            }
+            Err(CommitteeError::UnknownParty(_)) => {
+                anyhow::ensure!(
+                    bootstrap_x25519_secret.is_none(),
+                    "non-genesis party must not receive an epoch-zero X25519 secret"
+                );
+                None
+            }
+            Err(error) => return Err(error.into()),
+        };
         // Acquire the exclusive writer lease after all pure configuration checks and before
         // opening or probing any mutable store. `PartyServer` retains it for the lifetime of the
         // final Arc, so cloned request handlers cannot accidentally release the fence early.
@@ -1960,9 +2675,40 @@ impl PartyServer {
             WalletSnapshotStore::new(&state_directory, party, signing_seed)?;
         let epoch_history_artifacts =
             WalletArtifactStore::new(&state_directory, party, signing_seed)?;
+        let deposit_sync_spools = DepositSyncSpoolManager::new(
+            &state_directory,
+            party,
+            signing_seed,
+            scenario.quic_network_id()?,
+        )?;
         let (history_key_id, _) = canonical_dkg_identity(&scenario)?;
-        let epoch_history_wallet =
-            epoch_history_wallet_id(scenario.quic_network_id()?, history_key_id);
+        let network_id = scenario.quic_network_id()?;
+        let bootstrap_receiver_keys = scenario
+            .parties
+            .iter()
+            .map(|configured| (configured.id, configured.bootstrap_encryption_key.0))
+            .collect::<Vec<_>>();
+        let mut receiver_key_authentication_context =
+            Vec::with_capacity(64 + std::mem::size_of::<u16>());
+        receiver_key_authentication_context
+            .extend_from_slice(b"threshold-monero/receiver-key-accumulator/server-auth/v1");
+        receiver_key_authentication_context.extend_from_slice(&network_id);
+        receiver_key_authentication_context.extend_from_slice(&party.0.to_le_bytes());
+        let receiver_key_authentication_key = Zeroizing::new(
+            *blake3::keyed_hash(signing_seed, &receiver_key_authentication_context).as_bytes(),
+        );
+        let receiver_key_accumulator_path = state_directory.join(RECEIVER_KEY_ACCUMULATOR_FILE);
+        let receiver_keys = tokio::task::spawn_blocking(move || {
+            ReceiverKeyAccumulatorStore::open(
+                receiver_key_accumulator_path,
+                network_id,
+                &bootstrap_receiver_keys,
+                &receiver_key_authentication_key,
+            )
+        })
+        .await
+        .context("receiver-key accumulator startup task failed")??;
+        let epoch_history_wallet = epoch_history_wallet_id(network_id, history_key_id);
         let epoch_history = if tokio::fs::try_exists(
             epoch_history_snapshots.wallet_snapshot_path(epoch_history_wallet),
         )
@@ -1994,8 +2740,8 @@ impl PartyServer {
             state
         };
         let mut identities = BTreeMap::new();
-        let genesis = scenario.genesis_committee()?;
-        if let Ok(genesis_member) = genesis.member(party)
+        if let (Ok(genesis_member), Some(configured_bootstrap)) =
+            (genesis.member(party), configured_bootstrap.as_ref())
             && protocol_store
                 .load_epoch_identity_retirement(0, genesis_member.encryption_key)
                 .await?
@@ -2003,7 +2749,7 @@ impl PartyServer {
         {
             let capability = protocol_store
                 .persist_epoch_advertisement_identity(
-                    &configured_bootstrap,
+                    configured_bootstrap,
                     signing_seed,
                     genesis_member.signing_key,
                     genesis_member.encryption_key,
@@ -2015,28 +2761,19 @@ impl PartyServer {
         let deposit_chain_readiness =
             deposit_config.as_ref().map(|config| config.chain_readiness.clone());
         let deposit = deposit_config
-            .map(|config| match config.birth_anchor {
-                Some(anchor) => DepositService::new_with_birth_anchor_and_consolidation_backend(
+            .map(|config| {
+                DepositService::new_for_party_server(
                     party,
                     scenario.clone(),
                     state_directory.clone(),
                     signing_seed,
                     config.private_view_scalar,
-                    anchor,
+                    config.birth_anchor,
                     config.worker,
                     config.chain_source,
                     config.consolidation_backend,
-                ),
-                None => DepositService::new_with_consolidation_backend(
-                    party,
-                    scenario.clone(),
-                    state_directory.clone(),
-                    signing_seed,
-                    config.private_view_scalar,
-                    config.worker,
-                    config.chain_source,
-                    config.consolidation_backend,
-                ),
+                    Arc::clone(&deposit_clock),
+                )
             })
             .transpose()?;
         let acceptance_consolidation_gate_enabled =
@@ -2119,7 +2856,7 @@ impl PartyServer {
         let server = Arc::new(Self {
             party,
             scenario,
-            _state_lease: state_lease,
+            _state_lease: Arc::new(state_lease),
             identities: StdRwLock::new(
                 identities
                     .into_iter()
@@ -2133,35 +2870,59 @@ impl PartyServer {
             authenticated_quic_ingress: AtomicU64::new(0),
             authenticated_quic_responses: AtomicU64::new(0),
             store,
-            protocol_store,
+            protocol_store: Arc::new(protocol_store),
             epoch_history_snapshots,
             epoch_history_artifacts,
             epoch_history_wallet,
             epoch_history: RwLock::new(epoch_history),
+            receiver_keys: Arc::new(StdRwLock::new(receiver_keys)),
+            deposit_sync_spools,
             certified_key_rotations: StdRwLock::new(BTreeMap::new()),
+            #[cfg(test)]
+            certified_key_rotation_registration_verifications: AtomicU64::new(0),
             key_rotation: Mutex::new(None),
+            key_rotation_start_mutation: Mutex::new(()),
+            key_rotation_mutation: Arc::new(Mutex::new(())),
+            #[cfg(test)]
+            key_rotation_view_publication_gate: Mutex::new(None),
+            key_rotation_blocking_permits: Arc::new(Semaphore::new(
+                MAX_CONCURRENT_KEY_ROTATION_BLOCKING_TASKS,
+            )),
             joining_key_rotation: Mutex::new(None),
             deposit,
+            deposit_allocation_admission_permits: Arc::new(Semaphore::new(
+                MAX_CONCURRENT_DEPOSIT_ALLOCATION_ADMISSIONS,
+            )),
+            deposit_read_admission_permits: Arc::new(Semaphore::new(
+                MAX_CONCURRENT_DEPOSIT_READ_ADMISSIONS,
+            )),
+            deposit_genesis_publication: Mutex::new(()),
+            deposit_activation_revision: AtomicU64::new(0),
+            deposit_clock,
             deposit_chain_readiness,
             deposit_targets: RwLock::new(BTreeMap::new()),
             deposit_target_roots: RwLock::new(BTreeMap::new()),
+            deposit_sync_lifetime_reconciliation: Mutex::new(None),
             deposit_recovered_epochs: Mutex::new(BTreeSet::new()),
             epochs: RwLock::new(BTreeMap::new()),
             active_epoch: RwLock::new(None),
             staged: RwLock::new(BTreeMap::new()),
             activations: RwLock::new(BTreeMap::new()),
             history_links: StdRwLock::new(BTreeMap::new()),
-            proactive_refresh_schedule: Mutex::new(None),
+            proactive_refresh_schedule: Arc::new(Mutex::new(None)),
             proactive_refresh_schedule_mutation: Mutex::new(()),
+            #[cfg(test)]
+            proactive_refresh_schedule_publication_gate: Arc::new(Mutex::new(None)),
             acceptance_proactive_refresh_hold_enabled,
             acceptance_driver_latch: Mutex::new(acceptance_driver_latch),
             acceptance_deposit_checkpoint_gate: Mutex::new(acceptance_deposit_checkpoint_gate),
             epoch_transition: Mutex::new(()),
             certified_avss_sessions: RwLock::new(BTreeMap::new()),
+            activation_gossip_records: RwLock::new(BTreeMap::new()),
             avss: Mutex::new(BTreeMap::new()),
-            peer_outbox_cursor: Mutex::new(0),
+            peer_outbox_cursor: Mutex::new(PeerOutboxCursor::default()),
             consolidation_signing: Mutex::new(HashMap::new()),
-            consolidation_transition: Mutex::new(()),
+            consolidation_transition: Arc::new(Mutex::new(())),
             consolidation_closures_restored: Mutex::new(false),
             acceptance_consolidation_gate_enabled,
             acceptance_consolidation_gate: Mutex::new(acceptance_consolidation_gate),
@@ -2190,6 +2951,14 @@ impl PartyServer {
     #[must_use]
     pub fn scenario(&self) -> &Scenario {
         &self.scenario
+    }
+
+    pub(crate) fn deposit_clock_sample(&self) -> anyhow::Result<DepositClockSample> {
+        Ok(self.deposit_clock.sample()?)
+    }
+
+    pub(crate) fn deposit_sync_spools(&self) -> &DepositSyncSpoolManager {
+        &self.deposit_sync_spools
     }
 
     /// Mark that the authenticated QUIC runtime has been constructed around this exact restored
@@ -2259,48 +3028,47 @@ impl PartyServer {
         );
         anyhow::ensure!(request.binding != [0; 32], "acceptance driver binding is invalid");
         let mut latch = self.acceptance_driver_latch.lock().await;
-        latch.validate()?;
-        if latch.state == AcceptanceConsolidationGateState::Held
-            || latch.state == AcceptanceConsolidationGateState::Released
-        {
-            anyhow::ensure!(
-                latch.kind == Some(request.kind) && latch.binding == Some(request.binding),
-                "acceptance driver request differs from the durable latch"
-            );
-        }
-        let candidate = match request.action {
-            AcceptanceConsolidationGateAction::Status => None,
-            AcceptanceConsolidationGateAction::Arm => {
-                if latch.state == AcceptanceConsolidationGateState::Held {
-                    None
-                } else {
-                    Some(AcceptanceDriverLatch {
-                        version: ACCEPTANCE_DRIVER_LATCH_VERSION,
-                        state: AcceptanceConsolidationGateState::Held,
-                        kind: Some(request.kind),
-                        binding: Some(request.binding),
-                    })
-                }
-            }
-            AcceptanceConsolidationGateAction::Release => {
-                anyhow::ensure!(
-                    latch.state == AcceptanceConsolidationGateState::Held
-                        || latch.state == AcceptanceConsolidationGateState::Released,
-                    "acceptance driver latch cannot release before it is held"
-                );
-                (latch.state != AcceptanceConsolidationGateState::Released).then(|| {
-                    AcceptanceDriverLatch {
-                        state: AcceptanceConsolidationGateState::Released,
-                        ..latch.clone()
-                    }
-                })
-            }
-        };
+        let candidate = latch.transition(request)?;
         if let Some(candidate) = candidate {
             self.persist_acceptance_driver_latch(&candidate).await?;
             *latch = candidate;
         }
         Ok(latch.response(self.party))
+    }
+
+    async fn record_acceptance_proactive_deadline_event(
+        &self,
+        source_epoch: u64,
+        target_epoch: u64,
+        due_unix_ms: u64,
+        event_unix_ms: u64,
+    ) -> anyhow::Result<()> {
+        if !self.acceptance_proactive_refresh_hold_enabled {
+            return Ok(());
+        }
+        let interval_ms = self
+            .scenario
+            .proactive_refresh_interval_seconds
+            .checked_mul(1_000)
+            .context("proactive refresh interval overflow")?;
+        let mut material = Vec::with_capacity(32);
+        material.extend_from_slice(&source_epoch.to_le_bytes());
+        material.extend_from_slice(&target_epoch.to_le_bytes());
+        material.extend_from_slice(&due_unix_ms.to_le_bytes());
+        material.extend_from_slice(&interval_ms.to_le_bytes());
+        let binding =
+            acceptance_driver_binding(AcceptanceDriverLatchKind::ProactiveDeadline, &material);
+        let mut latch = self.acceptance_driver_latch.lock().await;
+        if let Some(candidate) =
+            latch.record_proactive_deadline_event(binding, due_unix_ms, event_unix_ms)?
+        {
+            // Write this exact due-time event before the receiver-key reducer or AVSS dealer can
+            // become live. A crash can therefore only retain the event without protocol progress,
+            // never protocol progress without its authenticated timing evidence.
+            self.persist_acceptance_driver_latch(&candidate).await?;
+            *latch = candidate;
+        }
+        Ok(())
     }
 
     async fn persist_acceptance_deposit_checkpoint_gate(
@@ -2334,70 +3102,23 @@ impl PartyServer {
             self.acceptance_proactive_refresh_hold_enabled,
             "acceptance deposit checkpoint gate is disabled"
         );
-        anyhow::ensure!(
-            request.output.transaction != [0; 32],
-            "acceptance deposit checkpoint output is invalid"
-        );
-        let deposit = self.deposit.as_ref().context("deposit wallet service is not enabled")?;
         let mut gate = self.acceptance_deposit_checkpoint_gate.lock().await;
         gate.validate()?;
-        if gate.state == AcceptanceConsolidationGateState::Held
-            || gate.state == AcceptanceConsolidationGateState::Released
+        let authenticated_arm_evidence = if request.action == AcceptanceConsolidationGateAction::Arm
+            && gate.state == AcceptanceConsolidationGateState::Disarmed
         {
-            anyhow::ensure!(
-                gate.output == Some(request.output),
-                "acceptance deposit checkpoint request names another output"
-            );
-        }
-        let current = match request.action {
-            AcceptanceConsolidationGateAction::Arm | AcceptanceConsolidationGateAction::Release => {
-                Some(deposit.durable_deposit_observation_evidence(request.output).await?.context(
-                    "exact deposit output is not yet under an authenticated portable checkpoint",
-                )?)
-            }
-            AcceptanceConsolidationGateAction::Status
-                if gate.state == AcceptanceConsolidationGateState::Held =>
-            {
-                Some(deposit.durable_deposit_observation_evidence(request.output).await?.context(
-                    "held deposit output is no longer under an authenticated portable checkpoint",
-                )?)
-            }
-            AcceptanceConsolidationGateAction::Status => None,
+            let deposit = self.deposit.as_ref().context("deposit wallet service is not enabled")?;
+            Some(deposit.durable_deposit_observation_evidence(request.output).await?.context(
+                "exact deposit output is not yet under an authenticated portable checkpoint",
+            )?)
+        } else {
+            None
         };
-        if let (Some(stored), Some(current)) = (gate.evidence.as_ref(), current.as_ref()) {
-            anyhow::ensure!(
-                stored == current,
-                "current deposit checkpoint evidence differs from the durable crash barrier"
-            );
-        }
-        let candidate = match request.action {
-            AcceptanceConsolidationGateAction::Status => None,
-            AcceptanceConsolidationGateAction::Arm => {
-                if gate.state == AcceptanceConsolidationGateState::Held {
-                    None
-                } else {
-                    Some(AcceptanceDepositCheckpointGate {
-                        version: ACCEPTANCE_DEPOSIT_CHECKPOINT_GATE_VERSION,
-                        state: AcceptanceConsolidationGateState::Held,
-                        output: Some(request.output),
-                        evidence: current,
-                    })
-                }
-            }
-            AcceptanceConsolidationGateAction::Release => {
-                anyhow::ensure!(
-                    gate.state == AcceptanceConsolidationGateState::Held
-                        || gate.state == AcceptanceConsolidationGateState::Released,
-                    "acceptance deposit checkpoint gate cannot release before it is held"
-                );
-                (gate.state != AcceptanceConsolidationGateState::Released).then(|| {
-                    AcceptanceDepositCheckpointGate {
-                        state: AcceptanceConsolidationGateState::Released,
-                        ..gate.clone()
-                    }
-                })
-            }
-        };
+        // The first arm snapshots an already-authenticated portable checkpoint into the
+        // authenticated ProtocolStore. Later status, idempotent arm, and release operations use
+        // that immutable historical barrier: the live portable head is expected to keep moving
+        // and this acceptance-only record grants no wallet or protocol authority.
+        let candidate = gate.transition(request, authenticated_arm_evidence)?;
         if let Some(candidate) = candidate {
             self.persist_acceptance_deposit_checkpoint_gate(&candidate).await?;
             *gate = candidate;
@@ -2888,13 +3609,11 @@ impl PartyServer {
 
     /// Validate the exact typed acknowledgement returned on an authenticated QUIC response.
     /// Generic success bytes can never retire Byzantine consolidation evidence.
-    pub(crate) fn validate_byzantine_consolidation_ack(
+    pub(crate) fn prepare_byzantine_consolidation_ack_expectation(
         &self,
         authenticated_recipient: PartyId,
-        request_body: &[u8],
-        response_body: &[u8],
-    ) -> anyhow::Result<()> {
-        let request = ByzantineConsolidationWireMessage::decode(request_body)?;
+        request: &ByzantineConsolidationWireMessage,
+    ) -> anyhow::Result<ByzantineConsolidationAckExpectation> {
         anyhow::ensure!(
             !matches!(request, ByzantineConsolidationWireMessage::Ack(_)),
             "a Byzantine consolidation ACK cannot be sent as durable request work"
@@ -2905,7 +3624,7 @@ impl PartyServer {
             expected.relay() == self.party && expected.recipient() == authenticated_recipient,
             "Byzantine consolidation delivery ID differs from its QUIC route"
         );
-        let epoch = match &request {
+        let epoch = match request {
             ByzantineConsolidationWireMessage::Consensus(message) => {
                 message.slot().committee().epoch
             }
@@ -2927,7 +3646,7 @@ impl PartyServer {
             ByzantineConsolidationWireMessage::Ack(_) => unreachable!("rejected above"),
         };
         let (committee, fault_bound) = self.trusted_committee_and_fault_bound(epoch)?;
-        if let ByzantineConsolidationWireMessage::Consensus(message) = &request {
+        if let ByzantineConsolidationWireMessage::Consensus(message) = request {
             anyhow::ensure!(message.slot().committee() == &committee);
             anyhow::ensure!(message.slot().fault_bound() == fault_bound);
             message.slot().verify_context(message.context())?;
@@ -2938,17 +3657,7 @@ impl PartyServer {
                 anyhow::ensure!(binding.attempt().threshold() == committee.threshold);
             }
         }
-        let acknowledgement = ByzantineConsolidationWireMessage::decode(response_body)?;
-        acknowledgement.validate_authenticated_route_in_committee(
-            authenticated_recipient,
-            self.party,
-            &committee,
-        )?;
-        let ByzantineConsolidationWireMessage::Ack(acknowledgement) = acknowledgement else {
-            anyhow::bail!("Byzantine consolidation success omitted its typed ACK")
-        };
-        acknowledgement.verify_expected(&committee, expected)?;
-        Ok(())
+        Ok(ByzantineConsolidationAckExpectation { authenticated_recipient, expected, committee })
     }
 
     /// Atomically checkpoint the reducer relay ACK and retire its exact generic outbox body.
@@ -2980,16 +3689,23 @@ impl PartyServer {
             .await
             .as_ref()
             .map_or_else(Vec::new, |runtime| runtime.round.pending_messages(limit));
-        let joining_pending =
-            self.joining_key_rotation.lock().await.as_ref().map_or_else(Vec::new, |joining| {
-                joining.pending_advertisements.values().take(limit).cloned().collect::<Vec<_>>()
-            });
+        let (joining_context, joining_pending) =
+            self.joining_key_rotation.lock().await.as_ref().map_or_else(
+                || (None, Vec::new()),
+                |joining| {
+                    (
+                        Some(joining.context.clone()),
+                        joining
+                            .pending_advertisements
+                            .values()
+                            .take(limit)
+                            .cloned()
+                            .collect::<Vec<_>>(),
+                    )
+                },
+            );
         let mut pending = Vec::new();
         let mut blocked_recipients = BTreeSet::new();
-        let rotations = match self.certified_key_rotations.read() {
-            Ok(rotations) => rotations.values().cloned().collect::<Vec<_>>(),
-            Err(_) => return pending,
-        };
         let delivered = self
             .proactive_refresh_schedule
             .lock()
@@ -2997,7 +3713,25 @@ impl PartyServer {
             .as_ref()
             .map(|schedule| schedule.rotation_certificate_delivered_through.clone())
             .unwrap_or_default();
-        for rotation in rotations {
+        let rotations = match self.certified_key_rotations.read() {
+            Ok(rotations) => rotations,
+            Err(_) => return pending,
+        };
+        // The immutable local certificate registry is terminal authority even if cancellation
+        // landed between its publication and volatile target-only advertiser cleanup. Suppress
+        // that exact stale outbox immediately; the due-tick and duplicate-certificate fast paths
+        // above also remove its in-memory marker.
+        let joining_pending = match joining_context {
+            Some(context)
+                if rotations
+                    .get(&context.target_epoch())
+                    .is_some_and(|rotation| rotation.context == context) =>
+            {
+                Vec::new()
+            }
+            _ => joining_pending,
+        };
+        for rotation in rotations.values() {
             for recipient in rotation.context.participants() {
                 if recipient == self.party
                     || blocked_recipients.contains(&recipient)
@@ -3007,11 +3741,7 @@ impl PartyServer {
                 {
                     continue;
                 }
-                let Ok(message) = pending_key_rotation_certificate(
-                    &rotation.context,
-                    &rotation.certificate,
-                    recipient,
-                ) else {
+                let Some(message) = rotation.pending_certificate_for(recipient) else {
                     continue;
                 };
                 if !pending.iter().any(|existing| existing.id == message.id) {
@@ -3042,7 +3772,7 @@ impl PartyServer {
     /// Durably remove exact key-rotation effects after successful QUIC delivery. A failed CAS
     /// leaves the in-memory image unchanged, deliberately causing replay on the next relay pass.
     pub async fn acknowledge_key_rotation_peer_messages(
-        &self,
+        self: &Arc<Self>,
         acknowledgements: &[KeyRotationMessageId],
     ) -> anyhow::Result<()> {
         if acknowledgements.is_empty() {
@@ -3055,9 +3785,10 @@ impl PartyServer {
                 joining.pending_advertisements.retain(|id, _| !acknowledged.contains(id));
             }
         }
-        {
-            let mut live = self.key_rotation.lock().await;
-            if let Some(runtime) = live.as_mut() {
+        let round_mutation = Arc::clone(&self.key_rotation_mutation).lock_owned().await;
+        let checkpoint = {
+            let live = self.key_rotation.lock().await;
+            if let Some(runtime) = live.as_ref() {
                 let mut next = runtime.round.clone();
                 let current = acknowledgements
                     .iter()
@@ -3071,38 +3802,75 @@ impl PartyServer {
                         .revision
                         .checked_add(1)
                         .context("key-rotation revision exhausted")?;
-                    self.protocol_store
-                        .save_key_rotation_round(next.context(), revision, &next, &mut OsRng)
-                        .await?;
+                    Some((runtime.round.context().clone(), runtime.revision, revision, next))
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        };
+        if let Some((context, base_revision, revision, next)) = checkpoint {
+            let server = Arc::clone(self);
+            tokio::spawn(async move {
+                let _round_mutation = round_mutation;
+                let metadata = server
+                    .protocol_store
+                    .save_key_rotation_round(&context, revision, &next, &mut OsRng)
+                    .await?;
+                anyhow::ensure!(
+                    metadata.revision == revision,
+                    "key-rotation ACK durable CAS returned another revision"
+                );
+                // The mutation guard belongs to this detached task, so caller cancellation cannot
+                // expose durable N+1 while another writer still observes volatile revision N.
+                let mut live = server.key_rotation.lock().await;
+                let runtime =
+                    live.as_mut().context("key rotation disappeared after ACK durable CAS")?;
+                anyhow::ensure!(
+                    runtime.round.context() == &context,
+                    "key-rotation context changed during ACK durable CAS"
+                );
+                if runtime.revision == base_revision {
                     runtime.round = next;
                     runtime.revision = revision;
+                } else {
+                    anyhow::ensure!(
+                        runtime.revision == revision && runtime.round == next,
+                        "key-rotation ACK raced another durable reducer transition"
+                    );
                 }
-            }
+                Ok::<_, anyhow::Error>(())
+            })
+            .await
+            .context("key-rotation ACK durable publication task failed")??;
+        } else {
+            drop(round_mutation);
         }
-        let rotations = self
-            .certified_key_rotations
-            .read()
-            .map_err(|_| anyhow::anyhow!("key-rotation registry lock is poisoned"))?
-            .values()
-            .cloned()
-            .map(|rotation| (rotation.context.digest(), rotation))
-            .collect::<BTreeMap<_, _>>();
-        let mut delivered_updates = BTreeMap::<PartyId, u64>::new();
-        for acknowledgement in acknowledgements {
-            if let Some(rotation) = rotations.get(&acknowledgement.context) {
-                let expected = pending_key_rotation_certificate(
-                    &rotation.context,
-                    &rotation.certificate,
-                    acknowledgement.recipient,
-                );
-                if expected.as_ref().is_ok_and(|message| message.id == *acknowledgement) {
+        let delivered_updates = {
+            let rotations = self
+                .certified_key_rotations
+                .read()
+                .map_err(|_| anyhow::anyhow!("key-rotation registry lock is poisoned"))?;
+            let rotations_by_context = rotations
+                .values()
+                .map(|rotation| (rotation.certificate_retry_id.context, rotation))
+                .collect::<BTreeMap<_, _>>();
+            let mut delivered_updates = BTreeMap::<PartyId, u64>::new();
+            for acknowledgement in acknowledgements {
+                if let Some(rotation) = rotations_by_context.get(&acknowledgement.context)
+                    && rotation
+                        .certificate_message_id_for(acknowledgement.recipient)
+                        .is_some_and(|expected| expected == *acknowledgement)
+                {
                     delivered_updates
                         .entry(acknowledgement.recipient)
                         .and_modify(|epoch| *epoch = (*epoch).max(rotation.context.target_epoch()))
                         .or_insert(rotation.context.target_epoch());
                 }
             }
-        }
+            delivered_updates
+        };
         if !delivered_updates.is_empty() {
             let _schedule_mutation = self.proactive_refresh_schedule_mutation.lock().await;
             let mut schedule = self
@@ -3137,23 +3905,83 @@ impl PartyServer {
         deposit: &DepositService,
     ) -> anyhow::Result<()> {
         let mut restored = self.consolidation_closures_restored.lock().await;
-        let closures = deposit.consolidation_session_closures().await?;
-        let closed_sessions =
-            closures.iter().map(|closure| closure.session).collect::<BTreeSet<_>>();
-        for closure in &closures {
+        let closures = match deposit.consolidation_session_closures().await {
+            Ok(closures) => closures,
+            Err(error) => {
+                // The runtime mutation which prompted this reconciliation may already be
+                // durable. If its closure set cannot be authenticated, no volatile nonce machine
+                // is safe to retain. Permanent ProtocolStore tombstones predate signer creation,
+                // so clearing RAM is fail-closed and cannot reauthorize a nonce.
+                self.consolidation_signing.lock().await.clear();
+                *restored = false;
+                return Err(error.into());
+            }
+        };
+        let first_process_recovery = !*restored;
+        let (closures_to_persist, live_sessions) =
+            match plan_consolidation_session_closures(&closures, first_process_recovery) {
+                Ok(plan) => plan,
+                Err(error) => {
+                    self.consolidation_signing.lock().await.clear();
+                    *restored = false;
+                    return Err(error);
+                }
+            };
+        // The first pass runs after process recovery, when no non-serializable signer may be
+        // reconstructed, and therefore closes every durable attempt. Later passes preserve only
+        // the exact current SigningReleased session with the same public tombstone purpose. This
+        // also protects the in-process gap between the release snapshot CAS and consumption of
+        // its one-use Release capability. Burned/completed sessions are still erased after every
+        // durable mutation, so this is deliberately not a one-shot reconciliation.
+        self.consolidation_signing.lock().await.retain(|session, runtime| {
+            live_sessions
+                .get(session)
+                .is_some_and(|purpose| *purpose == runtime.nonce_tombstone_purpose.as_slice())
+        });
+        // Prune first. A storage error must leave a completed, burned, or reorg-invalidated
+        // volatile signer unavailable even while its idempotent permanent closure is retried.
+        for closure in closures_to_persist {
             self.protocol_store
                 .save_session_tombstone(closure.session, &closure.purpose, &mut OsRng)
                 .await?;
         }
-        // Re-run this after every durable consensus mutation. Completion BA may atomically burn a
-        // newer attempt after startup, so a one-shot restore flag would leave its volatile signer
-        // alive. Only exact newly closed sessions are erased; unrelated live attempts continue.
-        self.consolidation_signing
-            .lock()
-            .await
-            .retain(|session, _| !closed_sessions.contains(session));
         *restored = true;
         Ok(())
+    }
+
+    /// Restore volatile nonce state after a deposit runtime mutation on both success and error.
+    ///
+    /// Initialization recovery, handoff reconciliation, and several reducers can replay pending
+    /// worker events before a later step fails. That replay may durably close or quarantine a
+    /// consolidation. The caller owns the host transition fence, so no signer mutation can
+    /// interleave with this fail-closed reconciliation. A genuinely absent runtime has no
+    /// consolidation authority and is the only normalized restoration result.
+    async fn finish_deposit_runtime_mutation<T>(
+        &self,
+        transition: &tokio::sync::MutexGuard<'_, ()>,
+        deposit: &DepositService,
+        mutation: anyhow::Result<T>,
+    ) -> anyhow::Result<T> {
+        let restoration =
+            match self.restore_consolidation_session_closures(transition, deposit).await {
+                Ok(()) => Ok(()),
+                Err(error)
+                    if error.downcast_ref::<DepositServiceError>().is_some_and(|error| {
+                        matches!(error, DepositServiceError::NotInitialized)
+                    }) =>
+                {
+                    Ok(())
+                }
+                Err(error) => Err(error)
+                    .context("deposit runtime could not restore consolidation session closures"),
+            };
+        match (mutation, restoration) {
+            (Ok(value), Ok(())) => Ok(value),
+            (Err(error), Ok(())) | (Ok(_), Err(error)) => Err(error),
+            (Err(mutation_error), Err(restoration_error)) => Err(mutation_error.context(format!(
+                "consolidation session restoration also failed: {restoration_error:#}"
+            ))),
+        }
     }
 
     /// Cross the permanent nonce boundary for one service-persisted consolidation release.
@@ -3311,70 +4139,1487 @@ impl PartyServer {
         let Some(deposit) = &self.deposit else {
             return Ok(false);
         };
-        Ok(deposit.deposit_sync_ready().await?)
+        if !deposit.deposit_sync_ready().await? {
+            return Ok(false);
+        }
+        let Some(certified_tip) = self.epoch_history.read().await.tip_epoch() else {
+            return Ok(false);
+        };
+        let registry = deposit.active_registry().await?;
+        if registry.active_epoch() != certified_tip {
+            return Ok(false);
+        }
+        let (public, root) = self.authenticated_deposit_target(certified_tip).await?;
+        let active = registry.active();
+        Ok(active.committee().digest() == public.committee.digest()
+            && active.key_id() == public.key_id
+            && active.group_key() == public.group_key_bytes()
+            && active.activation() == public.activation_digest()?
+            && active.certified_activation_root() == root)
+    }
+
+    fn ordinary_deposit_sync_gate_is_open(
+        runtime_ready: bool,
+        local_deposit_epoch: u64,
+        authenticated_history_tip: Option<u64>,
+        predecessor_handoff_is_pinned: bool,
+    ) -> bool {
+        runtime_ready
+            && (authenticated_history_tip == Some(local_deposit_epoch)
+                || (predecessor_handoff_is_pinned
+                    && local_deposit_epoch.checked_add(1) == authenticated_history_tip))
+    }
+
+    fn ordinary_deposit_sync_state_read_policy(
+        runtime_ready: bool,
+        local_deposit_epoch: u64,
+        authenticated_history_tip: Option<u64>,
+        predecessor_handoff_is_pinned: bool,
+        active_committee: &Committee,
+        local_party: PartyId,
+        authenticated_party: PartyId,
+    ) -> bool {
+        Self::ordinary_deposit_sync_gate_is_open(
+            runtime_ready,
+            local_deposit_epoch,
+            authenticated_history_tip,
+            predecessor_handoff_is_pinned,
+        ) && active_committee.member(local_party).is_ok()
+            && active_committee.member(authenticated_party).is_ok()
+    }
+
+    /// Prove the only lagging ordinary-sync exception from host-authenticated activation history
+    /// and the deposit service's exact durable handoff pin.
+    async fn authenticated_predecessor_deposit_sync_is_pinned(
+        &self,
+        deposit: &DepositService,
+        local_epoch: u64,
+        history_tip: Option<u64>,
+    ) -> anyhow::Result<bool> {
+        let Some(target_epoch) = history_tip else {
+            return Ok(false);
+        };
+        if local_epoch.checked_add(1) != Some(target_epoch) {
+            return Ok(false);
+        }
+        let (source, _) = self.authenticated_deposit_target(local_epoch).await?;
+        let (target, certified_root) = self.authenticated_deposit_target(target_epoch).await?;
+        Ok(deposit.predecessor_sync_handoff_is_pinned(&source, &target, certified_root).await?)
+    }
+
+    /// Return the one epoch at which ordinary moving-tip synchronization may run.
+    ///
+    /// Certified state transfer clears `local_runtime_ready` before exposing its cold-import
+    /// marker. The authenticated history may also advance one epoch before a source replica has
+    /// imported terminal evidence for an already-released consolidation. That source-only race is
+    /// admitted exclusively under an exact durable pre-terminal handoff pin; every other epoch
+    /// mismatch remains owned by the distinct old-to-target export protocol.
+    async fn ordinary_deposit_sync_ready_epoch(&self) -> anyhow::Result<Option<u64>> {
+        let Some(deposit) = &self.deposit else {
+            return Ok(None);
+        };
+        if !deposit.local_runtime_ready() {
+            return Ok(None);
+        }
+        let local_epoch = deposit.active_epoch().await?;
+        let history_tip = self.epoch_history.read().await.tip_epoch();
+        let predecessor_handoff_is_pinned = self
+            .authenticated_predecessor_deposit_sync_is_pinned(deposit, local_epoch, history_tip)
+            .await?;
+        if !Self::ordinary_deposit_sync_gate_is_open(
+            deposit.local_runtime_ready(),
+            local_epoch,
+            history_tip,
+            predecessor_handoff_is_pinned,
+        ) {
+            return Ok(None);
+        }
+
+        // Repeat the three-way observation after every await above. This is not transition
+        // authority (the DepositService repeats its locked marker check before mutation), but it
+        // prevents a caller which raced publication of a certified transfer gate from beginning
+        // more ordinary network or staging work.
+        let repeated_history_tip = self.epoch_history.read().await.tip_epoch();
+        let repeated_predecessor_handoff_is_pinned = self
+            .authenticated_predecessor_deposit_sync_is_pinned(
+                deposit,
+                local_epoch,
+                repeated_history_tip,
+            )
+            .await?;
+        if deposit.active_epoch().await? != local_epoch
+            || !Self::ordinary_deposit_sync_gate_is_open(
+                deposit.local_runtime_ready(),
+                local_epoch,
+                repeated_history_tip,
+                repeated_predecessor_handoff_is_pinned,
+            )
+        {
+            return Ok(None);
+        }
+        Ok(Some(local_epoch))
+    }
+
+    async fn require_ordinary_deposit_sync_ready_epoch(&self) -> anyhow::Result<u64> {
+        self.ordinary_deposit_sync_ready_epoch()
+            .await?
+            .context("ordinary deposit synchronization is closed by certified state transfer")
+    }
+
+    async fn require_ordinary_deposit_sync_epoch(&self, expected: u64) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.ordinary_deposit_sync_ready_epoch().await? == Some(expected),
+            "ordinary deposit synchronization authority changed"
+        );
+        Ok(())
+    }
+
+    fn deposit_state_transfer_route_authorized(
+        local_party: PartyId,
+        authenticated_party: PartyId,
+        operation: DepositOperation,
+        source: &Committee,
+        target: &Committee,
+    ) -> bool {
+        let local_source = source.member(local_party).is_ok();
+        let peer_source = source.member(authenticated_party).is_ok();
+        let local_target = target.member(local_party).is_ok();
+        let peer_target = target.member(authenticated_party).is_ok();
+        match operation {
+            DepositOperation::PostHandoffExportSealRequest
+            | DepositOperation::PostHandoffExportSealVote => local_source && peer_source,
+            DepositOperation::PostHandoffExportSealCertificate => {
+                (local_source || local_target) && peer_source
+            }
+            DepositOperation::ExportHead | DepositOperation::ExportObjects => {
+                local_source && peer_target
+            }
+            DepositOperation::StateImportedAck => local_target && peer_target,
+            DepositOperation::StateImportedCertificate => {
+                (local_source || local_target) && peer_target
+            }
+            // Membership is intentionally not lease authority. An exact storage-only MAC remains
+            // sufficient after either endpoint leaves both committees.
+            DepositOperation::ExportRelease => true,
+            DepositOperation::Attest
+            | DepositOperation::Certificate
+            | DepositOperation::IndexCheckpointAttest
+            | DepositOperation::IndexCheckpointCertificate
+            | DepositOperation::DepositObservation
+            | DepositOperation::DepositObservationAttest
+            | DepositOperation::DepositObservationCertificate
+            | DepositOperation::DepositObservationIndexCheckpointAttest
+            | DepositOperation::DepositObservationIndexCheckpointCertificate
+            | DepositOperation::SyncHead
+            | DepositOperation::SyncObjects
+            | DepositOperation::SyncRelease
+            | DepositOperation::PrefixSupportStart
+            | DepositOperation::PrefixSupportContinue
+            | DepositOperation::Consolidation
+            | DepositOperation::ClientRequest
+            | DepositOperation::ConsolidationAbandonment
+            | DepositOperation::ConsensusProposal
+            | DepositOperation::ConsensusMessage
+            | DepositOperation::ConsensusCertificate => false,
+        }
+    }
+
+    /// Reconstruct the exact certified transition owned by the current deposit-registry head.
+    ///
+    /// This helper accepts no committee, epoch, or registry bytes from the peer. The target
+    /// capability comes from permanent activation history and the service then reloads the
+    /// predecessor registry plus handoff witness from its compact-registry store. Callers must
+    /// still apply the operation-specific source/target role policy before entering a reducer.
+    async fn authenticated_current_deposit_state_transfer(
+        &self,
+    ) -> anyhow::Result<AuthenticatedDepositStateTransfer> {
+        let deposit = self.deposit.as_ref().context("deposit wallet service is not enabled")?;
+        let target_epoch = deposit.active_epoch().await?;
+        let (_, target) = self.verified_current_deposit_registry_target(target_epoch).await?;
+        Ok(deposit.authenticate_state_transfer_transition(&target).await?)
+    }
+
+    /// Reconstruct one exact installed transition retained behind the local deposit head.
+    ///
+    /// Both endpoint activations come from authenticated permanent history; the service then
+    /// binds them to the target witness and successor-derived index root in compact history.
+    async fn authenticated_historical_deposit_state_transfer(
+        &self,
+        target_epoch: u64,
+    ) -> anyhow::Result<AuthenticatedHistoricalDepositStateTransfer> {
+        let deposit = self.deposit.as_ref().context("deposit wallet service is not enabled")?;
+        anyhow::ensure!(target_epoch != 0, "deposit genesis has no state import");
+        anyhow::ensure!(
+            target_epoch < deposit.active_epoch().await?,
+            "historical deposit state import must be behind the active registry"
+        );
+        let epochs = self.authenticated_pre_import_deposit_epochs(target_epoch).await?;
+        Ok(deposit.authenticate_historical_state_transfer_transition(&epochs).await?)
+    }
+
+    /// Authenticate the two adjacent activation-history epochs needed for a target which has not
+    /// installed a wallet runtime yet. This deliberately creates only bounded export-read
+    /// authority; the downloaded compact-registry graph and handoff still require full
+    /// verification before import.
+    async fn authenticated_pre_import_deposit_epochs(
+        &self,
+        target_epoch: u64,
+    ) -> anyhow::Result<AuthenticatedPreImportDepositEpochs> {
+        let deposit = self.deposit.as_ref().context("deposit wallet service is not enabled")?;
+        let source_epoch =
+            target_epoch.checked_sub(1).context("deposit state transfer has no predecessor")?;
+        let (source, source_root) = self.authenticated_deposit_target(source_epoch).await?;
+        let (target, target_root) = self.authenticated_deposit_target(target_epoch).await?;
+        let (source_committee, source_fault_bound) =
+            self.trusted_committee_and_fault_bound(source_epoch)?;
+        let (target_committee, target_fault_bound) =
+            self.trusted_committee_and_fault_bound(target_epoch)?;
+        anyhow::ensure!(
+            source.committee == source_committee && target.committee == target_committee,
+            "deposit state-transfer epochs differ from certified committee governance"
+        );
+        Ok(deposit.authenticate_preimport_deposit_epochs(
+            &source,
+            source_fault_bound,
+            source_root,
+            &target,
+            target_fault_bound,
+            target_root,
+        )?)
+    }
+
+    fn require_deposit_state_transfer_route(
+        &self,
+        authenticated_party: PartyId,
+        operation: DepositOperation,
+        transfer: &AuthenticatedDepositStateTransfer,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            Self::deposit_state_transfer_route_authorized(
+                self.party,
+                authenticated_party,
+                operation,
+                transfer.source().active().committee(),
+                transfer.target().committee(),
+            ),
+            "authenticated peer is not authorized for this deposit state-transfer route"
+        );
+        Ok(())
+    }
+
+    fn require_historical_deposit_state_transfer_route(
+        &self,
+        authenticated_party: PartyId,
+        operation: DepositOperation,
+        transfer: &AuthenticatedHistoricalDepositStateTransfer,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            Self::deposit_state_transfer_route_authorized(
+                self.party,
+                authenticated_party,
+                operation,
+                transfer.source().active().committee(),
+                transfer.target().committee(),
+            ),
+            "authenticated peer is not authorized for this historical deposit state-transfer route"
+        );
+        Ok(())
     }
 
     /// Build one fresh compact-state pull request and its authenticated source set.
     ///
     /// A source response is never trusted by identity alone: candidate adoption re-verifies the
     /// advertised registry, index checkpoint, and ledger certificate before one snapshot CAS.
-    pub async fn deposit_sync_head_request(
+    pub async fn deposit_sync_sources(
         &self,
-    ) -> anyhow::Result<Option<(Vec<PartyId>, DepositSyncHeadRequest)>> {
+    ) -> anyhow::Result<Option<(Vec<PartyId>, DepositSyncContext)>> {
         let Some(deposit) = &self.deposit else {
             return Ok(None);
         };
-        Box::pin(self.ensure_deposit_initialized()).await?;
-        // Scanner readiness alone must not close import-sync for a replica whose compact archive is
-        // still at the empty genesis base. Such a replica can trail the committee-certified archive
-        // tip even when its blockchain scanner is fully caught up, because committee-certified
-        // observations (allocations, confirmed-output observations) are not locally scannable — the
-        // only way it can reach the certified tip is by importing it over QUIC. A replica that has
-        // any real compact state cannot be advanced by `adopt_deposit_sync_candidate` anyway, so for
-        // it scanner readiness remains the correct condition to stop probing.
-        if Box::pin(deposit.deposit_sync_ready()).await?
-            && !Box::pin(deposit.deposit_archive_at_empty_base()).await?
-        {
+        // Ordinary moving-tip synchronization is not a wallet initializer. In particular, an
+        // authenticated peer must not be able to make this pacemaker race the scanner through
+        // genesis construction. The one local recovery admitted here can only finish an already
+        // durable ordinary import; a certified import/export fence remains closed.
+        if !deposit.local_runtime_ready() {
+            let transition = self.consolidation_transition.lock().await;
+            let recovery = deposit
+                .reconcile_live_deposit_sync_import(&self.deposit_sync_spools)
+                .await
+                .map_err(anyhow::Error::from);
+            self.finish_deposit_runtime_mutation(&transition, deposit, recovery).await?;
+            if !deposit.local_runtime_ready() {
+                return Ok(None);
+            }
+        }
+        let Some(ordinary_epoch) = self.ordinary_deposit_sync_ready_epoch().await? else {
+            return Ok(None);
+        };
+        self.reconcile_active_deposit_sync_lifetimes().await?;
+        // A scanner-ready replica can still trail observation-only checkpoint ordinals while its
+        // ledger sequence remains unchanged. Keep probing authenticated peers; the sync planner is
+        // cheap for an equal/stale advertisement and only downloads a strict archive successor.
+        let (active, _) = self.authenticated_deposit_target(ordinary_epoch).await?;
+        let (trusted_committee, _) = self.trusted_committee_and_fault_bound(ordinary_epoch)?;
+        if active.committee != trusted_committee || active.committee.member(self.party).is_err() {
             return Ok(None);
         }
-        let active = Box::pin(self.active_epoch_public()).await?;
         let sources = active
             .committee
             .members
             .iter()
             .filter_map(|member| (member.id != self.party).then_some(member.id))
             .collect::<Vec<_>>();
-        anyhow::ensure!(!sources.is_empty(), "no remote deposit sync source is configured");
-        let request = DepositSyncHeadRequest::new(Box::pin(deposit.deposit_sync_context()).await?)?;
-        Ok(Some((sources, request)))
+        if sources.is_empty() {
+            return Ok(None);
+        }
+        let context = Box::pin(deposit.deposit_sync_context()).await?;
+        if self.ordinary_deposit_sync_ready_epoch().await? != Some(ordinary_epoch) {
+            return Ok(None);
+        }
+        Ok(Some((sources, context)))
     }
 
-    /// Ask the deposit service whether the advertised candidate can advance this replica and, if
-    /// so, return its first finite root-connected object manifest.
-    pub async fn deposit_sync_plan(
+    /// Authorize current-state sync before QUIC admits a request body. Historical pin release is
+    /// deliberately not covered by this gate: any still-configured authenticated party must be
+    /// able to retire its exact lease after committee removal.
+    pub async fn deposit_sync_state_read_authorized(
+        &self,
+        authenticated_party: PartyId,
+    ) -> anyhow::Result<bool> {
+        let Some(deposit) = &self.deposit else {
+            return Ok(false);
+        };
+        // This method runs before a potentially large request body is admitted. Keep it a cheap
+        // availability gate: network input must never trigger genesis construction or full-store
+        // recovery. A local pacemaker performs any interrupted-import reconciliation.
+        if !deposit.local_runtime_ready() {
+            return Ok(false);
+        }
+        let Some(ordinary_epoch) = self.ordinary_deposit_sync_ready_epoch().await? else {
+            return Ok(false);
+        };
+        self.reconcile_active_deposit_sync_lifetimes().await?;
+        if self.ordinary_deposit_sync_ready_epoch().await? != Some(ordinary_epoch) {
+            return Ok(false);
+        }
+        let registry = deposit.active_registry().await?;
+        let committee = registry.active().committee();
+        let history_tip = self.epoch_history.read().await.tip_epoch();
+        let predecessor_handoff_is_pinned = self
+            .authenticated_predecessor_deposit_sync_is_pinned(deposit, ordinary_epoch, history_tip)
+            .await?;
+        if !Self::ordinary_deposit_sync_state_read_policy(
+            deposit.local_runtime_ready(),
+            registry.active_epoch(),
+            history_tip,
+            predecessor_handoff_is_pinned,
+            committee,
+            self.party,
+            authenticated_party,
+        ) {
+            return Ok(false);
+        }
+        Ok(self.ordinary_deposit_sync_ready_epoch().await? == Some(ordinary_epoch))
+    }
+
+    /// Reject large post-handoff request bodies from identities outside this deployment.
+    ///
+    /// No request field participates in this prelude. Restricting it to the current history tip
+    /// would strand an earlier durable transfer as soon as the fixed refresh pacemaker advances
+    /// history again. Mutual TLS already maps the connection to one configured party, every body
+    /// has a route-specific cap, and the runtime enforces global/per-peer body budgets. Exact typed
+    /// reducers therefore authenticate the body-selected historical transition and endpoint roles
+    /// after bounded decoding. `ExportRelease` remains universally routable because its exact
+    /// lease MAC is storage-only authority and remains valid after committee removal.
+    pub async fn deposit_state_transfer_peer_authorized(
+        &self,
+        authenticated_party: PartyId,
+        operation: DepositOperation,
+    ) -> anyhow::Result<bool> {
+        if operation == DepositOperation::ExportRelease {
+            return Ok(true);
+        }
+        if self.deposit.is_none()
+            || !matches!(
+                operation,
+                DepositOperation::PostHandoffExportSealRequest
+                    | DepositOperation::PostHandoffExportSealVote
+                    | DepositOperation::PostHandoffExportSealCertificate
+                    | DepositOperation::ExportHead
+                    | DepositOperation::ExportObjects
+                    | DepositOperation::StateImportedAck
+                    | DepositOperation::StateImportedCertificate
+            )
+        {
+            return Ok(false);
+        }
+        Ok(self.scenario.party(authenticated_party).is_ok())
+    }
+
+    /// Reconcile both halves of historical compact-sync leases against the exact locally
+    /// authenticated active committee. This runs before fresh Head authorization, so a crash
+    /// immediately after the handoff snapshot CAS cannot expose new reads ahead of durable pin
+    /// reclamation.
+    async fn reconcile_active_deposit_sync_lifetimes(&self) -> anyhow::Result<()> {
+        let Some(deposit) = &self.deposit else {
+            return Ok(());
+        };
+        let registry = deposit.active_registry().await?;
+        let active = registry.active();
+        let epoch = active.committee().epoch;
+        let (target, certified_root) = self.authenticated_deposit_target(epoch).await?;
+        let source = match (active.start_sequence(), epoch.checked_sub(1)) {
+            (1, _) => None,
+            (_, Some(previous)) => Some(self.authenticated_deposit_target(previous).await?.0),
+            (_, None) => {
+                anyhow::bail!("non-genesis deposit issuer has no predecessor epoch")
+            }
+        };
+        let mut binding_hasher = blake3::Hasher::new_derive_key(
+            "threshold-monero/deposit-sync-lifetime-reconciliation/v1",
+        );
+        binding_hasher.update(&epoch.to_le_bytes());
+        binding_hasher.update(&target.committee.digest());
+        binding_hasher.update(&target.key_id);
+        binding_hasher.update(&target.group_key_bytes());
+        binding_hasher.update(&target.activation_digest()?);
+        binding_hasher.update(&certified_root);
+        let binding = *binding_hasher.finalize().as_bytes();
+        let mut reconciled = self.deposit_sync_lifetime_reconciliation.lock().await;
+        if reconciled.as_ref() == Some(&binding) {
+            return Ok(());
+        }
+        let verified = deposit
+            .verify_registry_handoff_target(
+                source.as_ref(),
+                &target,
+                active.fault_bound(),
+                certified_root,
+            )
+            .await?;
+        deposit.reconcile_deposit_sync_source_pins(&verified).await?;
+        let context = deposit.deposit_sync_context().await?;
+        self.deposit_sync_spools.reconcile_pending_releases(context, &verified).await?;
+        *reconciled = Some(binding);
+        Ok(())
+    }
+
+    /// Re-run target reconciliation after a stage mutation created release intents which were not
+    /// present when the active-target cache was filled. Ordinary Head/Object authorization keeps
+    /// the O(1) cached path.
+    pub async fn reconcile_deposit_sync_lifetimes_after_stage_mutation(
+        &self,
+    ) -> anyhow::Result<()> {
+        *self.deposit_sync_lifetime_reconciliation.lock().await = None;
+        self.reconcile_active_deposit_sync_lifetimes().await
+    }
+
+    /// Load the one authenticated, network-bound QUIC state-transfer intent snapshot.
+    ///
+    /// The QUIC runtime owns the current-format intent encoding and semantic validation. This
+    /// facade keeps the protocol storage key and stable identity seed encapsulated by the party.
+    pub(crate) async fn load_deposit_state_transfer_intents(
+        &self,
+    ) -> anyhow::Result<Option<DepositStateTransferIntentsBlob>> {
+        Ok(self
+            .protocol_store
+            .load_deposit_state_transfer_intents(self.scenario.quic_network_id()?)
+            .await?)
+    }
+
+    /// Persist and read back the immediate successor of the QUIC transfer-intent snapshot.
+    pub(crate) async fn save_deposit_state_transfer_intents(
+        &self,
+        expected: Option<DepositStateTransferIntentsMetadata>,
+        state: &[u8],
+    ) -> anyhow::Result<DepositStateTransferIntentsMetadata> {
+        Ok(self
+            .protocol_store
+            .save_deposit_state_transfer_intents(
+                self.scenario.quic_network_id()?,
+                expected,
+                state,
+                &mut OsRng,
+            )
+            .await?)
+    }
+
+    /// Select the wallet-scoped certified-transfer lane without initializing or trusting a wallet
+    /// runtime. Historical transitions use the same network/wallet context, while their exact
+    /// adjacent epochs are selected later from each retained certificate.
+    pub(crate) async fn certified_deposit_state_transfer_work_context(
+        &self,
+    ) -> anyhow::Result<Option<CertifiedDepositStateTransferWorkContext>> {
+        if self.deposit.is_none() {
+            return Ok(None);
+        }
+        let Some(target_epoch) = self.epoch_history.read().await.tip_epoch() else {
+            return Ok(None);
+        };
+        if target_epoch == 0 {
+            return Ok(None);
+        }
+        let epochs = self.authenticated_pre_import_deposit_epochs(target_epoch).await?;
+        Ok(Some(CertifiedDepositStateTransferWorkContext { context: epochs.context() }))
+    }
+
+    async fn require_certified_deposit_state_transfer_work_context(
+        &self,
+        work: CertifiedDepositStateTransferWorkContext,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            work.context.network() == self.scenario.quic_network_id()?,
+            "certified deposit state-transfer work belongs to another network"
+        );
+        let current = self
+            .certified_deposit_state_transfer_work_context()
+            .await?
+            .context("certified deposit state-transfer history has no adjacent epochs")?;
+        anyhow::ensure!(
+            current.context == work.context,
+            "certified deposit state-transfer wallet context changed"
+        );
+        Ok(())
+    }
+
+    async fn authenticate_pre_import_export_certificate(
+        &self,
+        work: CertifiedDepositStateTransferWorkContext,
+        certificate: &DepositPostHandoffExportSealCertificate,
+    ) -> anyhow::Result<(
+        AuthenticatedPreImportDepositEpochs,
+        VerifiedPreImportDepositStateExportSeal,
+    )> {
+        self.require_certified_deposit_state_transfer_work_context(work).await?;
+        let deposit = self.deposit.as_ref().context("deposit wallet service is not enabled")?;
+        let target_epoch = certificate.statement().target_epoch();
+        let epochs = self.authenticated_pre_import_deposit_epochs(target_epoch).await?;
+        anyhow::ensure!(
+            epochs.context() == work.context,
+            "certified export certificate belongs to another deposit wallet"
+        );
+        epochs.target_capability().committee().member(self.party)?;
+        let seal =
+            deposit.authenticate_preimport_deposit_state_export_seal(&epochs, certificate)?;
+        Ok((epochs, seal))
+    }
+
+    async fn authenticate_active_pre_import_export(
+        &self,
+        work: CertifiedDepositStateTransferWorkContext,
+    ) -> anyhow::Result<
+        Option<(
+            PreImportCertifiedExportRecoveryEvidence,
+            AuthenticatedPreImportDepositEpochs,
+            VerifiedPreImportDepositStateExportSeal,
+        )>,
+    > {
+        self.require_certified_deposit_state_transfer_work_context(work).await?;
+        let Some(evidence) = self
+            .deposit_sync_spools
+            .active_pre_import_certified_export_recovery_evidence(work.context)
+            .await?
+        else {
+            return Ok(None);
+        };
+        let certificate = DepositPostHandoffExportSealCertificate::from_bytes(
+            evidence.canonical_seal_certificate_bytes(),
+        )?;
+        let (epochs, seal) =
+            self.authenticate_pre_import_export_certificate(work, &certificate).await?;
+        anyhow::ensure!(
+            evidence.context() == work.context
+                && evidence.requester() == self.party
+                && evidence.source() == seal.statement().source_party()
+                && evidence.semantic_transition_digest()
+                    == seal.statement().semantic_transition_digest()
+                && evidence.seal_statement_digest() == seal.statement_digest()
+                && evidence.seal_certificate_digest() == seal.certificate_digest()
+                && evidence.canonical_seal_certificate_bytes()
+                    == seal.canonical_certificate_bytes()
+                && evidence.head_request().context() == work.context
+                && evidence.head_request().source() == evidence.source()
+                && evidence.head_request().requester() == self.party
+                && evidence.binds_target(epochs.target_capability()),
+            "durable certified export recovery evidence changed authority"
+        );
+        if let Some(response) = evidence.head_response() {
+            response.validate_pre_import_verified_seal(evidence.head_request(), &seal)?;
+        }
+        Ok(Some((evidence, epochs, seal)))
+    }
+
+    async fn reopen_active_pre_import_export_spool(
+        &self,
+        work: CertifiedDepositStateTransferWorkContext,
+    ) -> anyhow::Result<
+        Option<(
+            PreImportCertifiedExportRecoveryEvidence,
+            AuthenticatedPreImportDepositEpochs,
+            VerifiedPreImportDepositStateExportSeal,
+            PreImportDepositStateExportSpool,
+        )>,
+    > {
+        let Some((evidence, epochs, seal)) =
+            self.authenticate_active_pre_import_export(work).await?
+        else {
+            return Ok(None);
+        };
+        if evidence.head_response().is_none() {
+            return Ok(None);
+        }
+        let spool = self
+            .deposit_sync_spools
+            .reopen_active_pre_import_certified_export(
+                work.context,
+                &seal,
+                epochs.target_capability(),
+            )
+            .await?
+            .context("active certified export head could not be reopened")?;
+        Ok(Some((evidence, epochs, seal, spool)))
+    }
+
+    /// Enumerate exact source-specific Head requests. An `Installing` crash cut returns only its
+    /// selected retry; otherwise every retained competitor remains eligible.
+    pub(crate) async fn pending_deposit_state_export_heads(
+        &self,
+        work: CertifiedDepositStateTransferWorkContext,
+    ) -> anyhow::Result<Vec<DepositStateExportHeadRequest>> {
+        self.require_certified_deposit_state_transfer_work_context(work).await?;
+        Ok(self.deposit_sync_spools.pending_certified_export_heads(work.context).await?)
+    }
+
+    /// Authenticate a typed Head response from archived adjacent activations and durably admit it
+    /// only to the fetch-restricted pre-import wrapper.
+    pub(crate) async fn accept_deposit_state_export_head(
+        &self,
+        work: CertifiedDepositStateTransferWorkContext,
+        request: DepositStateExportHeadRequest,
+        response: &DepositStateExportHeadResponse,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            request.context() == work.context
+                && request.requester() == self.party
+                && request.source() == response.source(),
+            "certified export Head response has the wrong route"
+        );
+        let (epochs, seal) =
+            self.authenticate_pre_import_export_certificate(work, response.certificate()).await?;
+        response.validate_pre_import_verified_seal(request, &seal)?;
+        let _ = self
+            .deposit_sync_spools
+            .open_or_create_pre_import_certified_export(
+                request,
+                response,
+                &seal,
+                epochs.target_capability(),
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// Return the one bounded capability-authenticated object request, or `None` when there is no
+    /// active head or its terminal frontier is already durable.
+    pub(crate) async fn pending_deposit_state_export_objects(
+        &self,
+        work: CertifiedDepositStateTransferWorkContext,
+    ) -> anyhow::Result<Option<DepositStateExportObjectsRequest>> {
+        let Some((_evidence, _epochs, _seal, spool)) =
+            self.reopen_active_pre_import_export_spool(work).await?
+        else {
+            return Ok(None);
+        };
+        Ok(spool.export_download_frontier().await?.request()?)
+    }
+
+    /// Reopen authority after the network response, replay the exact durable frontier, and merge
+    /// one page by its optimistic spool checkpoint.
+    pub(crate) async fn merge_deposit_state_export_objects(
+        &self,
+        work: CertifiedDepositStateTransferWorkContext,
+        request: &DepositStateExportObjectsRequest,
+        response: &DepositStateExportObjectsResponse,
+    ) -> anyhow::Result<DepositSyncSpoolStats> {
+        anyhow::ensure!(
+            request.context() == work.context && request.requester() == self.party,
+            "certified export object response has the wrong route"
+        );
+        let Some((_evidence, _epochs, _seal, spool)) =
+            self.reopen_active_pre_import_export_spool(work).await?
+        else {
+            anyhow::bail!("certified export object response has no active durable head")
+        };
+        let mut next = spool.export_download_frontier().await?;
+        anyhow::ensure!(
+            next.request()?.as_ref() == Some(request),
+            "certified export object response raced another durable frontier"
+        );
+        next.apply_response(request, response)?;
+        Ok(spool.merge_export_page(request, response, &next).await?)
+    }
+
+    /// Return the exact active object checkpoint used to fence source failover.
+    pub(crate) async fn deposit_state_export_download_checkpoint(
+        &self,
+        work: CertifiedDepositStateTransferWorkContext,
+    ) -> anyhow::Result<Option<DepositSyncSpoolCheckpoint>> {
+        let Some((_evidence, _epochs, _seal, spool)) =
+            self.reopen_active_pre_import_export_spool(work).await?
+        else {
+            return Ok(None);
+        };
+        Ok(Some(spool.checkpoint().await?))
+    }
+
+    /// Return the ABA-safe selected-source fence for the journal-before-head `Installing` cut.
+    pub(crate) async fn deposit_state_export_installing_checkpoint(
+        &self,
+        work: CertifiedDepositStateTransferWorkContext,
+    ) -> anyhow::Result<Option<InstallingCertifiedExportCheckpoint>> {
+        self.require_certified_deposit_state_transfer_work_context(work).await?;
+        Ok(self.deposit_sync_spools.installing_certified_export_checkpoint(work.context).await?)
+    }
+
+    /// Fail an active source only at the caller's exact authenticated spool position.
+    pub(crate) async fn fail_active_deposit_state_export_source(
+        &self,
+        work: CertifiedDepositStateTransferWorkContext,
+        checkpoint: &DepositSyncSpoolCheckpoint,
+    ) -> anyhow::Result<()> {
+        let (evidence, _epochs, _seal) = self
+            .authenticate_active_pre_import_export(work)
+            .await?
+            .context("certified export source failure has no active lane")?;
+        self.deposit_sync_spools
+            .fail_certified_export_source(
+                work.context,
+                evidence.source(),
+                checkpoint.revision(),
+                checkpoint.digest()?,
+            )
+            .await?;
+        Ok(())
+    }
+
+    pub(crate) async fn fail_installing_deposit_state_export_source(
+        &self,
+        work: CertifiedDepositStateTransferWorkContext,
+        checkpoint: InstallingCertifiedExportCheckpoint,
+    ) -> anyhow::Result<()> {
+        self.require_certified_deposit_state_transfer_work_context(work).await?;
+        anyhow::ensure!(
+            checkpoint.context() == work.context,
+            "certified export Installing checkpoint belongs to another wallet"
+        );
+        self.deposit_sync_spools.fail_installing_certified_export_source(checkpoint).await?;
+        Ok(())
+    }
+
+    pub(crate) async fn pending_deposit_state_export_releases(
+        &self,
+        work: CertifiedDepositStateTransferWorkContext,
+    ) -> anyhow::Result<Vec<DepositStateExportReleaseRequest>> {
+        self.require_certified_deposit_state_transfer_work_context(work).await?;
+        Ok(self.deposit_sync_spools.pending_export_releases(work.context).await?)
+    }
+
+    pub(crate) async fn acknowledge_deposit_state_export_release(
+        &self,
+        work: CertifiedDepositStateTransferWorkContext,
+        request: DepositStateExportReleaseRequest,
+        acknowledgement: DepositStateExportReleaseAck,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            request.lease().context() == work.context && request.lease().requester() == self.party,
+            "certified export release belongs to another requester"
+        );
+        self.require_certified_deposit_state_transfer_work_context(work).await?;
+        self.deposit_sync_spools.acknowledge_export_release(request, acknowledgement).await?;
+        Ok(())
+    }
+
+    fn authenticate_downloaded_deposit_state_transfer(
+        artifacts: &CompletedPreImportDepositStateExportArtifacts,
+        epochs: &AuthenticatedPreImportDepositEpochs,
+        pre_import_seal: &VerifiedPreImportDepositStateExportSeal,
+    ) -> anyhow::Result<(
+        CompactEpochRegistry,
+        RegistryHandoffCertificate,
+        VerifiedDepositPostHandoffExportSeal,
+    )> {
+        let advertisement = artifacts.advertisement();
+        let registry_archive = artifacts.registry_archive();
+        let target_epoch = pre_import_seal.statement().target_epoch();
+        anyhow::ensure!(
+            advertisement.context().network() == epochs.context().network()
+                && advertisement.context().wallet() == epochs.context().wallet()
+                && registry_archive
+                    == pre_import_seal.statement().final_export().target_registry_archive()
+                && registry_archive.registry().active_epoch() == target_epoch
+                && artifacts.portable_index()
+                    == pre_import_seal.statement().final_export().resulting_portable_head(),
+            "downloaded certified export roots differ from the authenticated seal"
+        );
+        artifacts
+            .head_response()
+            .validate_pre_import_verified_seal(artifacts.head_request(), pre_import_seal)?;
+        registry_archive.verify_bounded(artifacts.object_reader())?;
+
+        let source_epoch =
+            target_epoch.checked_sub(1).context("certified export target has no predecessor")?;
+        let source_record = lookup_compact_registry_epoch(
+            registry_archive,
+            source_epoch,
+            artifacts.object_reader(),
+        )?;
+        let target_record = lookup_compact_registry_epoch(
+            registry_archive,
+            target_epoch,
+            artifacts.object_reader(),
+        )?;
+        anyhow::ensure!(
+            source_record.link().epoch() == source_epoch
+                && target_record.link().epoch() == target_epoch
+                && target_record.link_reference() == registry_archive.active_link_reference()
+                && target_record.witness_reference() == registry_archive.active_witness_reference(),
+            "downloaded compact-registry transition is not the advertised active edge"
+        );
+        let source = CompactEpochRegistry::from_link(
+            source_record.link(),
+            target_record.link().parent_index_root(),
+        )?;
+        let source_public = epochs.source();
+        let source_active = source.active();
+        anyhow::ensure!(
+            source.id() == pre_import_seal.statement().source()
+                && source.active_epoch() == source_public.committee.epoch
+                && source_active.committee() == &source_public.committee
+                && source_active.fault_bound() == epochs.source_fault_bound()
+                && source_active.key_id() == source_public.key_id
+                && source_active.group_key() == source_public.group_key_bytes()
+                && source_active.activation() == source_public.activation_digest()?
+                && source_active.certified_activation_root()
+                    == epochs.source_certified_activation_root(),
+            "downloaded predecessor registry differs from authenticated activation history"
+        );
+        registry_archive.registry().verify_active_target(epochs.target_capability())?;
+        let handoff = target_record
+            .witness()
+            .cloned()
+            .context("downloaded target registry omitted its old-quorum handoff")?;
+        handoff.verify(&source)?;
+        let expected_target =
+            RegistryLink::successor(&source, epochs.target_capability(), &handoff)?;
+        anyhow::ensure!(
+            target_record.link() == &expected_target,
+            "downloaded target registry is not the certified predecessor successor"
+        );
+
+        let seal = pre_import_seal.certificate().clone().verify(&source, &handoff)?;
+        seal.validate_target(epochs.target_capability())?;
+        seal.statement().final_export().validate_advertisement(advertisement)?;
+        anyhow::ensure!(
+            seal.statement_digest() == pre_import_seal.statement_digest()
+                && seal.certificate_digest() == pre_import_seal.certificate_digest()
+                && seal.canonical_certificate_bytes()
+                    == pre_import_seal.canonical_certificate_bytes(),
+            "full export-seal verification changed the pre-import certificate"
+        );
+        Ok((source, handoff, seal))
+    }
+
+    /// Promote only a terminal pre-import graph. Wallet initialization is allowed to perform its
+    /// own local CAS first; all certificate, registry, handoff, and spool authority is then
+    /// reconstructed afresh before the full certified adoption CAS.
+    pub(crate) async fn promote_completed_deposit_state_export(
+        &self,
+        work: CertifiedDepositStateTransferWorkContext,
+    ) -> anyhow::Result<bool> {
+        let Some((_evidence, _epochs, _seal, pre_import)) =
+            self.reopen_active_pre_import_export_spool(work).await?
+        else {
+            return Ok(false);
+        };
+        if !pre_import.object_graph_is_complete().await? {
+            return Ok(false);
+        }
+        drop(pre_import);
+
+        Box::pin(self.ensure_deposit_initialized()).await?;
+
+        let Some((_evidence, epochs, pre_import_seal, pre_import)) =
+            self.reopen_active_pre_import_export_spool(work).await?
+        else {
+            anyhow::bail!("completed certified export disappeared during wallet initialization")
+        };
+        let artifacts = pre_import.completed_artifacts().await?;
+        let (source, handoff, seal) = Self::authenticate_downloaded_deposit_state_transfer(
+            &artifacts,
+            &epochs,
+            &pre_import_seal,
+        )?;
+        let advertisement = artifacts.advertisement().clone();
+        drop(artifacts);
+        drop(pre_import);
+        drop(pre_import_seal);
+
+        let spool = self
+            .deposit_sync_spools
+            .reopen_active_certified_export(work.context, &seal, epochs.target_capability())
+            .await?
+            .context("fully authenticated certified export spool could not be reopened")?;
+        let deposit = self.deposit.as_ref().context("deposit wallet service is not enabled")?;
+        let reopened = deposit
+            .adopt_certified_deposit_sync_candidate(
+                advertisement,
+                spool,
+                &source,
+                &handoff,
+                epochs.target_capability(),
+                &seal,
+                &self.deposit_sync_spools,
+            )
+            .await?;
+        Ok(reopened.is_some())
+    }
+
+    /// Return this party's exact authenticated compact-deposit authority for state-based staging
+    /// garbage collection. Download age never participates in this decision.
+    pub async fn local_deposit_sync_advertisement(
+        &self,
+        context: DepositSyncContext,
+    ) -> anyhow::Result<DepositSyncAdvertisement> {
+        let deposit = self.deposit.as_ref().context("deposit wallet service is not enabled")?;
+        Ok(deposit.deposit_sync_advertisement(context).await?)
+    }
+
+    /// Ask the deposit service whether the advertised candidate can strictly advance this replica.
+    pub async fn deposit_sync_candidate_is_successor(
         &self,
         advertisement: &DepositSyncAdvertisement,
-    ) -> anyhow::Result<Option<DepositSyncObjectPageRequest>> {
+    ) -> anyhow::Result<bool> {
         let deposit = self.deposit.as_ref().context("deposit wallet service is not enabled")?;
+        let ordinary_epoch = self.require_ordinary_deposit_sync_ready_epoch().await?;
         let target = self.verified_deposit_sync_target(advertisement).await?;
-        Ok(deposit.deposit_sync_plan(advertisement, &target).await?)
+        self.require_ordinary_deposit_sync_epoch(ordinary_epoch).await?;
+        Ok(deposit.deposit_sync_candidate_is_successor(advertisement, &target).await?)
+    }
+
+    /// Record one matching authenticated source advertisement and expose a writable spool only
+    /// after the manager's locally authenticated `f+1` admission policy is satisfied.
+    pub async fn admit_deposit_sync_spool(
+        &self,
+        response: &DepositSyncHeadResponse,
+        source: PartyId,
+    ) -> anyhow::Result<DepositSyncSpoolAdmission> {
+        let ordinary_epoch = self.require_ordinary_deposit_sync_ready_epoch().await?;
+        let advertisement = response.advertisement();
+        let target = self.verified_deposit_sync_target(advertisement).await?;
+        self.require_ordinary_deposit_sync_epoch(ordinary_epoch).await?;
+        Ok(self.deposit_sync_spools.open_or_create(response, source, &target).await?)
+    }
+
+    /// Durably own the exact source lease before any terminal-event fetch or asynchronous
+    /// prefix-endorsement request is attempted.
+    pub async fn begin_deposit_sync_prefix_support_attempt(
+        &self,
+        response: &DepositSyncHeadResponse,
+    ) -> anyhow::Result<DepositSyncPrefixSupportWork> {
+        let ordinary_epoch = self.require_ordinary_deposit_sync_ready_epoch().await?;
+        let target = self.verified_deposit_sync_target(response.advertisement()).await?;
+        self.require_ordinary_deposit_sync_epoch(ordinary_epoch).await?;
+        Ok(self.deposit_sync_spools.begin_prefix_support_attempt(response, &target).await?)
+    }
+
+    /// Reconstruct a non-authoritative prefix collection after restart from the locally trusted
+    /// active target and the stage-owned exact source response.
+    pub async fn deposit_sync_prefix_support_work(
+        &self,
+        context: DepositSyncContext,
+        local: &DepositSyncAdvertisement,
+    ) -> anyhow::Result<Option<DepositSyncPrefixSupportWork>> {
+        anyhow::ensure!(local.context() == context, "local deposit sync context changed");
+        let ordinary_epoch = self.require_ordinary_deposit_sync_ready_epoch().await?;
+        let target = self.verified_deposit_sync_target(local).await?;
+        self.require_ordinary_deposit_sync_epoch(ordinary_epoch).await?;
+        Ok(self.deposit_sync_spools.prefix_support_work(context, &target).await?)
+    }
+
+    /// Begin or resume the exact requester-side `f+1` prefix-endorsement collection.
+    pub async fn begin_or_resume_deposit_prefix_collection(
+        &self,
+        work: &DepositSyncPrefixSupportWork,
+        request: Option<DepositSyncSupportRequest>,
+    ) -> anyhow::Result<Option<DepositPrefixCollectionStatus>> {
+        let deposit = self.deposit.as_ref().context("deposit wallet service is not enabled")?;
+        let epoch = work.statement().active_epoch();
+        let target = self.verified_current_deposit_sync_target(epoch).await?;
+        let identity = self.identity(epoch)?;
+        Ok(deposit
+            .begin_or_resume_prefix_collection(work, request, &target, identity.as_ref())
+            .await?)
+    }
+
+    /// Return a bounded canonical batch of exact durable prefix-scan requests.
+    pub async fn pending_deposit_prefix_collection_requests(
+        &self,
+        work: &DepositSyncPrefixSupportWork,
+        limit: usize,
+    ) -> anyhow::Result<Option<Vec<DepositPrefixCollectionRequest>>> {
+        let deposit = self.deposit.as_ref().context("deposit wallet service is not enabled")?;
+        let epoch = work.statement().active_epoch();
+        let target = self.verified_current_deposit_sync_target(epoch).await?;
+        let identity = self.identity(epoch)?;
+        Ok(deposit
+            .pending_prefix_collection_requests(work, limit, &target, identity.as_ref())
+            .await?)
+    }
+
+    /// Verify and journal one authenticated endorser's exact progress response.
+    pub async fn record_deposit_prefix_collection_progress(
+        &self,
+        work: &DepositSyncPrefixSupportWork,
+        peer: PartyId,
+        operation: DepositOperation,
+        request_body: &[u8],
+        progress: &DepositSyncPrefixSupportProgress,
+    ) -> anyhow::Result<DepositPrefixCollectionStatus> {
+        let deposit = self.deposit.as_ref().context("deposit wallet service is not enabled")?;
+        let epoch = work.statement().active_epoch();
+        let target = self.verified_current_deposit_sync_target(epoch).await?;
+        let identity = self.identity(epoch)?;
+        Ok(deposit
+            .record_prefix_collection_progress(
+                work,
+                peer,
+                operation,
+                request_body,
+                progress,
+                &target,
+                identity.as_ref(),
+            )
+            .await?)
+    }
+
+    /// Reconstruct a completed prefix certificate only under current live authority.
+    pub async fn deposit_prefix_collection_certificate(
+        &self,
+        work: &DepositSyncPrefixSupportWork,
+    ) -> anyhow::Result<Option<VerifiedDepositSyncSupportCertificate>> {
+        let deposit = self.deposit.as_ref().context("deposit wallet service is not enabled")?;
+        let epoch = work.statement().active_epoch();
+        let target = self.verified_current_deposit_sync_target(epoch).await?;
+        let identity = self.identity(epoch)?;
+        Ok(deposit.prefix_collection_certificate(work, &target, identity.as_ref()).await?)
+    }
+
+    /// Reverify and resume an already promoted prefix authority before ordinary head sampling.
+    pub async fn resume_deposit_sync_prefix_admission(
+        &self,
+        context: DepositSyncContext,
+        local: &DepositSyncAdvertisement,
+    ) -> anyhow::Result<Option<DepositSyncSpoolAdmission>> {
+        anyhow::ensure!(local.context() == context, "local deposit sync context changed");
+        let ordinary_epoch = self.require_ordinary_deposit_sync_ready_epoch().await?;
+        let target = self.verified_deposit_sync_target(local).await?;
+        let work = self.deposit_sync_spools.prefix_support_work(context, &target).await?;
+        self.require_ordinary_deposit_sync_epoch(ordinary_epoch).await?;
+        let admission = self.deposit_sync_spools.resume_prefix_admission(context, &target).await?;
+        if let (Some(work), Some(admission)) = (&work, &admission) {
+            let deposit = self.deposit.as_ref().context("deposit wallet service is not enabled")?;
+            let identity = self.identity(work.statement().active_epoch())?;
+            let _ = deposit
+                .mark_prefix_collection_admitted(work, admission, &target, identity.as_ref())
+                .await?;
+        }
+        Ok(admission)
+    }
+
+    /// Freshly reauthenticate and resume an exact-claims spool without requiring another Head.
+    ///
+    /// This is the restart path for a partially downloaded ordinary import. Both epoch fences are
+    /// checked around the durable catalog read so a handoff cannot lend stale process authority to
+    /// a recovered source lease.
+    pub async fn resume_deposit_sync_exact_admission(
+        &self,
+        context: DepositSyncContext,
+        local: &DepositSyncAdvertisement,
+    ) -> anyhow::Result<Option<DepositSyncSpoolAdmission>> {
+        anyhow::ensure!(local.context() == context, "local deposit sync context changed");
+        let ordinary_epoch = self.require_ordinary_deposit_sync_ready_epoch().await?;
+        let target = self.verified_deposit_sync_target(local).await?;
+        self.require_ordinary_deposit_sync_epoch(ordinary_epoch).await?;
+        let admission =
+            self.deposit_sync_spools.resume_exact_claims_admission(context, &target).await?;
+        self.require_ordinary_deposit_sync_epoch(ordinary_epoch).await?;
+        Ok(admission)
+    }
+
+    /// Atomically promote one stage-owned serving lease after the requester has durably collected
+    /// and verified exactly `f+1` current-member semantic-prefix endorsements.
+    pub async fn promote_deposit_sync_prefix_support(
+        &self,
+        work: &DepositSyncPrefixSupportWork,
+        certificate: &VerifiedDepositSyncSupportCertificate,
+    ) -> anyhow::Result<DepositSyncSpoolAdmission> {
+        let ordinary_epoch = self.require_ordinary_deposit_sync_ready_epoch().await?;
+        let target = self.verified_deposit_sync_target(work.response().advertisement()).await?;
+        self.require_ordinary_deposit_sync_epoch(ordinary_epoch).await?;
+        let admission = self
+            .deposit_sync_spools
+            .open_or_create_with_prefix_support(work.response(), certificate, &target)
+            .await?;
+        let deposit = self.deposit.as_ref().context("deposit wallet service is not enabled")?;
+        let identity = self.identity(work.statement().active_epoch())?;
+        let _ = deposit
+            .mark_prefix_collection_admitted(work, &admission, &target, identity.as_ref())
+            .await?;
+        Ok(admission)
+    }
+
+    /// Abandon one exact non-authoritative collection after its sole serving source fails.
+    ///
+    /// Endorsers are never treated as availability sources. The stage durably queues only the
+    /// source lease for release and applies its bounded transient cooldown before this returns.
+    pub async fn discard_deposit_sync_prefix_support(
+        &self,
+        work: &DepositSyncPrefixSupportWork,
+    ) -> anyhow::Result<()> {
+        let deposit = self.deposit.as_ref().context("deposit wallet service is not enabled")?;
+        let epoch = work.statement().active_epoch();
+        let target = self.verified_current_deposit_sync_target(epoch).await?;
+        let identity = self.identity(epoch)?;
+        self.deposit_sync_spools
+            .discard_prefix_support_attempt(
+                work.response().advertisement().context(),
+                work.statement().digest(),
+            )
+            .await?;
+        let _ = deposit.abandon_prefix_collection(work, &target, identity.as_ref()).await?;
+        self.reconcile_deposit_sync_lifetimes_after_stage_mutation().await
+    }
+
+    /// Permanently quarantine the sole serving source when its authenticated prefix-support
+    /// artifact is cryptographically or semantically invalid.
+    pub async fn reject_deposit_sync_prefix_support(
+        &self,
+        work: &DepositSyncPrefixSupportWork,
+        rejection: crate::deposit_sync_stage::DepositSyncVariantRejection,
+    ) -> anyhow::Result<()> {
+        let deposit = self.deposit.as_ref().context("deposit wallet service is not enabled")?;
+        let epoch = work.statement().active_epoch();
+        let target = self.verified_current_deposit_sync_target(epoch).await?;
+        let identity = self.identity(epoch)?;
+        self.deposit_sync_spools
+            .reject_prefix_support_attempt(
+                work.response().advertisement().context(),
+                work.statement().digest(),
+                rejection,
+            )
+            .await?;
+        let _ = deposit.abandon_prefix_collection(work, &target, identity.as_ref()).await?;
+        self.reconcile_deposit_sync_lifetimes_after_stage_mutation().await
+    }
+
+    /// Execute one requester-owned prefix scan against this party without routing through its own
+    /// peer map. The same canonical decoder, current-committee checks, durable scan reducer, and
+    /// response encoder used by authenticated QUIC ingress remain authoritative.
+    pub async fn handle_local_deposit_prefix_support_request(
+        self: &Arc<Self>,
+        operation: DepositOperation,
+        body: Vec<u8>,
+    ) -> anyhow::Result<Vec<u8>> {
+        anyhow::ensure!(
+            matches!(
+                operation,
+                DepositOperation::PrefixSupportStart | DepositOperation::PrefixSupportContinue
+            ),
+            "local deposit prefix-support dispatch received a non-scan operation"
+        );
+        self.boxed_dispatch_deposit_peer_request(self.party, operation, body).await
+    }
+
+    /// Enumerate restart-safe predecessor seal work for the current certified handoff.
+    ///
+    /// Only digest locators cross the runtime tick boundary. Every body reconstruction and
+    /// acknowledgement below reloads the exact transition and epoch-scoped signing authority.
+    pub(crate) async fn pending_deposit_state_export_seal_work(
+        &self,
+    ) -> anyhow::Result<Vec<DepositStateExportSealWorkLocator>> {
+        let deposit = self.deposit.as_ref().context("deposit wallet service is not enabled")?;
+        if !deposit.local_runtime_ready() {
+            let transition = self.consolidation_transition.lock().await;
+            let recovery = deposit
+                .reconcile_live_deposit_sync_import(&self.deposit_sync_spools)
+                .await
+                .map_err(anyhow::Error::from);
+            self.finish_deposit_runtime_mutation(&transition, deposit, recovery).await?;
+        }
+        let active_epoch = match deposit.active_epoch().await {
+            Ok(epoch) => epoch,
+            Err(DepositServiceError::NotInitialized) => return Ok(Vec::new()),
+            Err(error) => return Err(error.into()),
+        };
+        // A certified source or overlap party deliberately remains readiness-fenced while its
+        // predecessor seal is pending. Recover its existing epoch-scoped authority without
+        // reopening ordinary synchronization.
+        self.recover_deposit_epoch(active_epoch).await?;
+        // Genesis and target-only lagging replicas own no predecessor seal journal. In
+        // particular, a grow joiner may have a fully ready epoch-zero wallet while authenticated
+        // history and its cold import target epoch one; that must not prevent the certified
+        // download phase from running later in the same tick.
+        if active_epoch == 0 {
+            return Ok(Vec::new());
+        }
+        let transfer = self.authenticated_current_deposit_state_transfer().await?;
+        if transfer.source().active().committee().member(self.party).is_err() {
+            return Ok(Vec::new());
+        }
+        let signer = self.deposit_signer(transfer.source().active_epoch()).await?;
+        Ok(deposit.pending_post_handoff_export_seal_work(&transfer, signer.as_ref()).await?)
+    }
+
+    /// Return the exact local source-freeze fence after pending seal work has had an opportunity
+    /// to reconcile a crash-completed seal+pin CAS.
+    pub(crate) async fn deposit_state_export_freeze_pending(&self) -> anyhow::Result<bool> {
+        let deposit = self.deposit.as_ref().context("deposit wallet service is not enabled")?;
+        Box::pin(self.ensure_deposit_initialized()).await?;
+        Ok(deposit.local_state_export_freeze_pending().await?)
+    }
+
+    pub(crate) async fn reconstruct_deposit_state_export_seal_work(
+        &self,
+        locator: DepositStateExportSealWorkLocator,
+    ) -> anyhow::Result<ReconstructedDepositStateExportSealWork> {
+        let deposit = self.deposit.as_ref().context("deposit wallet service is not enabled")?;
+        Box::pin(self.ensure_deposit_initialized()).await?;
+        let transfer = self.authenticated_current_deposit_state_transfer().await?;
+        let signer = self.deposit_signer(transfer.source().active_epoch()).await?;
+        Ok(deposit
+            .reconstruct_post_handoff_export_seal_work(&transfer, signer.as_ref(), locator)
+            .await?)
+    }
+
+    /// Validate one typed peer receipt and commit the exact locator's durable tombstone.
+    ///
+    /// A source-request ACK is intentionally validation-only: the separately returned durable
+    /// vote is what suppresses that request. Vote and certificate receipts complete their
+    /// respective outbox records through CAS/readback before this method returns.
+    pub(crate) async fn acknowledge_deposit_state_export_seal_work(
+        &self,
+        locator: DepositStateExportSealWorkLocator,
+        authenticated_recipient: PartyId,
+        acknowledgement_bytes: &[u8],
+    ) -> anyhow::Result<()> {
+        let deposit = self.deposit.as_ref().context("deposit wallet service is not enabled")?;
+        Box::pin(self.ensure_deposit_initialized()).await?;
+        let transfer = self.authenticated_current_deposit_state_transfer().await?;
+        let signer = self.deposit_signer(transfer.source().active_epoch()).await?;
+        let work = deposit
+            .reconstruct_post_handoff_export_seal_work(&transfer, signer.as_ref(), locator)
+            .await?;
+        anyhow::ensure!(
+            work.route().recipient() == authenticated_recipient,
+            "deposit state-export seal receipt came from the wrong peer"
+        );
+        match work.route().operation() {
+            DepositOperation::PostHandoffExportSealRequest => {
+                deposit
+                    .validate_post_handoff_export_seal_request_ack(
+                        &transfer,
+                        signer.as_ref(),
+                        authenticated_recipient,
+                        locator,
+                        acknowledgement_bytes,
+                    )
+                    .await?
+            }
+            DepositOperation::PostHandoffExportSealVote => {
+                deposit
+                    .acknowledge_post_handoff_export_seal_vote_work(
+                        &transfer,
+                        signer.as_ref(),
+                        authenticated_recipient,
+                        locator,
+                        acknowledgement_bytes,
+                    )
+                    .await?
+            }
+            DepositOperation::PostHandoffExportSealCertificate => {
+                deposit
+                    .acknowledge_post_handoff_export_seal_certificate_work(
+                        &transfer,
+                        signer.as_ref(),
+                        authenticated_recipient,
+                        locator,
+                        acknowledgement_bytes,
+                    )
+                    .await?
+            }
+            _ => anyhow::bail!("invalid deposit state-export seal work operation"),
+        }
+        Ok(())
+    }
+
+    /// Enumerate restart-safe target ACK or installed-certificate fanout work.
+    pub(crate) async fn pending_deposit_state_import_work(
+        &self,
+    ) -> anyhow::Result<DepositStateImportWorkCensus> {
+        let deposit = self.deposit.as_ref().context("deposit wallet service is not enabled")?;
+        Box::pin(self.ensure_deposit_initialized()).await?;
+        if deposit.active_epoch().await? == 0 {
+            return Ok(DepositStateImportWorkCensus {
+                target_epoch: None,
+                finalized: false,
+                pending: Vec::new(),
+            });
+        }
+        let transfer = self.authenticated_current_deposit_state_transfer().await?;
+        let target_epoch = transfer.target().committee().epoch;
+        if transfer.target().committee().member(self.party).is_err() {
+            return Ok(DepositStateImportWorkCensus {
+                target_epoch: Some(target_epoch),
+                finalized: false,
+                pending: Vec::new(),
+            });
+        }
+        let identity = self.identity(target_epoch)?;
+        let (finalized, pending) = deposit
+            .pending_state_import_work(&transfer, identity.as_ref(), &self.deposit_sync_spools)
+            .await?;
+        Ok(DepositStateImportWorkCensus { target_epoch: Some(target_epoch), finalized, pending })
+    }
+
+    pub(crate) async fn reconstruct_deposit_state_import_work(
+        &self,
+        locator: DepositStateImportWorkLocator,
+    ) -> anyhow::Result<ReconstructedDepositStateImportWork> {
+        let deposit = self.deposit.as_ref().context("deposit wallet service is not enabled")?;
+        Box::pin(self.ensure_deposit_initialized()).await?;
+        let transfer = self.authenticated_current_deposit_state_transfer().await?;
+        transfer.target().committee().member(self.party)?;
+        let identity = self.identity(transfer.target().committee().epoch)?;
+        Ok(deposit.reconstruct_state_import_work(&transfer, identity.as_ref(), locator).await?)
+    }
+
+    /// Commit one exact typed StateImported receipt after reconstructing current authority.
+    pub(crate) async fn acknowledge_deposit_state_import_work(
+        &self,
+        locator: DepositStateImportWorkLocator,
+        authenticated_recipient: PartyId,
+        receipt_bytes: &[u8],
+    ) -> anyhow::Result<()> {
+        let deposit = self.deposit.as_ref().context("deposit wallet service is not enabled")?;
+        Box::pin(self.ensure_deposit_initialized()).await?;
+        let transfer = self.authenticated_current_deposit_state_transfer().await?;
+        transfer.target().committee().member(self.party)?;
+        let identity = self.identity(transfer.target().committee().epoch)?;
+        anyhow::ensure!(
+            locator.recipient() == authenticated_recipient,
+            "deposit state-import receipt came from the wrong peer"
+        );
+        deposit
+            .acknowledge_state_import_work(
+                &transfer,
+                identity.as_ref(),
+                authenticated_recipient,
+                locator,
+                receipt_bytes,
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// Return the local compact-registry head used only to bound historical epoch scheduling.
+    pub(crate) async fn deposit_state_import_active_epoch(&self) -> anyhow::Result<Option<u64>> {
+        let Some(deposit) = &self.deposit else {
+            return Ok(None);
+        };
+        Box::pin(self.ensure_deposit_initialized()).await?;
+        Ok(Some(deposit.active_epoch().await?))
+    }
+
+    /// Enumerate installed-certificate work for one exact historical target epoch.
+    pub(crate) async fn pending_historical_deposit_state_import_certificate_work(
+        &self,
+        target_epoch: u64,
+    ) -> anyhow::Result<Vec<DepositStateImportWorkLocator>> {
+        let deposit = self.deposit.as_ref().context("deposit wallet service is not enabled")?;
+        Box::pin(self.ensure_deposit_initialized()).await?;
+        anyhow::ensure!(
+            target_epoch != 0 && target_epoch < deposit.active_epoch().await?,
+            "historical deposit state-import epoch is not behind the active registry"
+        );
+        let transfer = self.authenticated_historical_deposit_state_transfer(target_epoch).await?;
+        if transfer.target().committee().member(self.party).is_err() {
+            return Ok(Vec::new());
+        }
+        Ok(deposit
+            .pending_historical_state_import_certificate_work(&transfer, &self.deposit_sync_spools)
+            .await?)
+    }
+
+    pub(crate) async fn reconstruct_historical_deposit_state_import_certificate_work(
+        &self,
+        locator: DepositStateImportWorkLocator,
+    ) -> anyhow::Result<ReconstructedDepositStateImportWork> {
+        let deposit = self.deposit.as_ref().context("deposit wallet service is not enabled")?;
+        Box::pin(self.ensure_deposit_initialized()).await?;
+        let transfer =
+            self.authenticated_historical_deposit_state_transfer(locator.target_epoch()).await?;
+        transfer.target().committee().member(self.party)?;
+        Ok(deposit.reconstruct_historical_state_import_certificate_work(&transfer, locator).await?)
+    }
+
+    pub(crate) async fn acknowledge_historical_deposit_state_import_certificate_work(
+        &self,
+        locator: DepositStateImportWorkLocator,
+        authenticated_recipient: PartyId,
+        receipt_bytes: &[u8],
+    ) -> anyhow::Result<()> {
+        let deposit = self.deposit.as_ref().context("deposit wallet service is not enabled")?;
+        Box::pin(self.ensure_deposit_initialized()).await?;
+        anyhow::ensure!(
+            locator.recipient() == authenticated_recipient,
+            "historical deposit state-import receipt came from the wrong peer"
+        );
+        let transfer =
+            self.authenticated_historical_deposit_state_transfer(locator.target_epoch()).await?;
+        transfer.target().committee().member(self.party)?;
+        deposit
+            .acknowledge_historical_state_import_certificate_work(
+                &transfer,
+                authenticated_recipient,
+                locator,
+                receipt_bytes,
+            )
+            .await?;
+        Ok(())
     }
 
     /// Install a completely downloaded and independently verified compact candidate atomically.
     pub async fn adopt_deposit_sync_candidate(
         &self,
         advertisement: DepositSyncAdvertisement,
-        objects: Vec<DepositSyncObject>,
-    ) -> anyhow::Result<bool> {
+        spool: Arc<DepositSyncSpoolStore>,
+    ) -> anyhow::Result<Option<VerifiedReopenedDepositSyncAdvertisement>> {
         let deposit = self.deposit.as_ref().context("deposit wallet service is not enabled")?;
+        let ordinary_epoch = self.require_ordinary_deposit_sync_ready_epoch().await?;
         let target = self.verified_deposit_sync_target(&advertisement).await?;
-        let adopted = deposit.adopt_deposit_sync_candidate(advertisement, objects, &target).await?;
-        if adopted {
-            let epoch = deposit.active_epoch().await?;
-            self.recover_deposit_epoch(epoch).await?;
-            self.reconcile_deposit_targets_allow_gap().await?;
-        }
-        Ok(adopted)
+        self.require_ordinary_deposit_sync_epoch(ordinary_epoch).await?;
+        Ok(deposit
+            .adopt_deposit_sync_candidate(advertisement, spool, &target, &self.deposit_sync_spools)
+            .await?)
+    }
+
+    /// Run fallible post-adoption host reconciliation only after the runtime has durably completed
+    /// the marker-owned spool. Failure here cannot hide or roll back import cleanup.
+    pub async fn finish_deposit_sync_adoption(&self) -> anyhow::Result<()> {
+        let deposit = self.deposit.as_ref().context("deposit wallet service is not enabled")?;
+        let epoch = deposit.active_epoch().await?;
+        self.recover_deposit_epoch(epoch).await?;
+        self.reconcile_deposit_targets_allow_gap().await
     }
 
     /// Reconstruct a non-serializable compact-registry authority exclusively from this host's
@@ -3385,44 +5630,118 @@ impl PartyServer {
         advertisement: &DepositSyncAdvertisement,
     ) -> anyhow::Result<VerifiedRegistryHandoffTarget> {
         let deposit = self.deposit.as_ref().context("deposit wallet service is not enabled")?;
+        let ordinary_epoch = self.require_ordinary_deposit_sync_ready_epoch().await?;
         let advertised_epoch = advertisement.registry_archive().registry().active_epoch();
-        let active = self.active_epoch_public().await?;
         anyhow::ensure!(
-            active.committee.epoch == advertised_epoch,
-            "deposit sync registry does not target the locally active certified epoch"
+            ordinary_epoch == advertised_epoch,
+            "deposit sync registry does not target the authenticated ordinary-sync epoch"
         );
-        let (target, source) = {
-            let targets = self.deposit_targets.read().await;
-            let target = targets
-                .get(&advertised_epoch)
-                .cloned()
-                .context("deposit sync target is absent from durable activation history")?;
-            let source = match advertised_epoch.checked_sub(1) {
-                None => None,
-                Some(epoch) => Some(targets.get(&epoch).cloned().context(
-                    "deposit sync predecessor is absent from durable activation history",
-                )?),
-            };
-            (target, source)
+        let (target, certified_root) = self.authenticated_deposit_target(advertised_epoch).await?;
+        let source = match (
+            advertisement.registry_archive().registry().active().start_sequence(),
+            advertised_epoch.checked_sub(1),
+        ) {
+            (1, _) => None,
+            (_, Some(epoch)) => Some(self.authenticated_deposit_target(epoch).await?.0),
+            (_, None) => {
+                anyhow::bail!("non-genesis deposit sync issuer has no predecessor epoch")
+            }
         };
-        anyhow::ensure!(
-            target == active,
-            "deposit sync target differs from the locally active activation certificate"
-        );
         let (committee, fault_bound) = self.trusted_committee_and_fault_bound(advertised_epoch)?;
         anyhow::ensure!(
             committee == target.committee,
             "deposit sync target differs from certified committee governance"
         );
-        let certified_root = self.certified_deposit_target_root(advertised_epoch).await?;
-        Ok(deposit
+        let verified = deposit
             .verify_registry_handoff_target(source.as_ref(), &target, fault_bound, certified_root)
-            .await?)
+            .await?;
+        self.require_ordinary_deposit_sync_epoch(ordinary_epoch).await?;
+        Ok(verified)
+    }
+
+    /// Reconstruct the current non-serializable registry authority for a prefix-support request
+    /// without accepting any registry fields from that request as trust input.
+    async fn verified_current_deposit_sync_target(
+        &self,
+        epoch: u64,
+    ) -> anyhow::Result<VerifiedRegistryHandoffTarget> {
+        let (public, target) = self.verified_current_deposit_registry_target(epoch).await?;
+        anyhow::ensure!(
+            public == self.active_epoch_public().await?,
+            "deposit prefix-support target differs from the active activation certificate"
+        );
+        Ok(target)
+    }
+
+    /// Authenticate the deposit head from permanent activation history. Retired source-only
+    /// parties still need this authority for export-seal votes, without an active signing share.
+    async fn verified_current_deposit_registry_target(
+        &self,
+        epoch: u64,
+    ) -> anyhow::Result<(EpochPublic, VerifiedRegistryHandoffTarget)> {
+        let deposit = self.deposit.as_ref().context("deposit wallet service is not enabled")?;
+        let registry = deposit.active_registry().await?;
+        let active_registry = registry.active();
+        anyhow::ensure!(
+            registry.active_epoch() == epoch,
+            "deposit authority targets a non-active registry"
+        );
+        let (target, certified_root) = self.authenticated_deposit_target(epoch).await?;
+        let source = match (active_registry.start_sequence(), epoch.checked_sub(1)) {
+            (1, _) => None,
+            (_, Some(previous)) => Some(self.authenticated_deposit_target(previous).await?.0),
+            (_, None) => {
+                anyhow::bail!("non-genesis deposit prefix-support issuer has no predecessor epoch")
+            }
+        };
+        let (committee, fault_bound) = self.trusted_committee_and_fault_bound(epoch)?;
+        anyhow::ensure!(
+            committee == target.committee,
+            "deposit prefix-support target differs from certified committee governance"
+        );
+        let verified = deposit
+            .verify_registry_handoff_target(source.as_ref(), &target, fault_bound, certified_root)
+            .await?;
+        Ok((target, verified))
     }
 
     /// Advance the durable allocation-consensus lane independently of scanner availability.
     /// Consensus timeouts and view changes are protocol liveness work, so a stale or unavailable
     /// Monero daemon must not prevent the current committee from replacing a silent leader.
+    async fn progress_deposit_allocation_turn(
+        &self,
+        deposit: &DepositService,
+        now_unix_ms: u64,
+    ) -> anyhow::Result<()> {
+        // Each of these reducers has a substantial concrete async state machine. Keep their
+        // storage behind explicit allocation boundaries so the always-live QUIC pacemaker does
+        // not need a worker-stack-sized parent future merely to poll this orchestration method.
+        match self.boxed_ensure_deposit_initialized().await {
+            Ok(()) => {}
+            Err(error)
+                if error
+                    .downcast_ref::<DepositServiceError>()
+                    .is_some_and(|error| matches!(error, DepositServiceError::NotInitialized)) =>
+            {
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        }
+        // A deposit runtime may be published after its threshold epoch has already advanced.
+        // Prepare that exact certified handoff before asking the allocation reducer for its
+        // current context; otherwise the missing fence makes progress fail before the tail
+        // reconciliation which would have installed it.
+        self.boxed_reconcile_deposit_targets_allow_gap().await?;
+        let epoch = Box::pin(deposit.active_epoch()).await?;
+        let identity = self.deposit_consensus_signer(epoch).await?;
+        if identity.scope() == EnvelopeSignerScope::Full {
+            self.boxed_progress_consolidation_abandonment_observations(deposit, identity.as_ref())
+                .await?;
+        }
+        self.boxed_progress_allocation_consensus(deposit, now_unix_ms, identity.as_ref()).await?;
+        self.boxed_reconcile_deposit_targets_allow_gap().await
+    }
+
     pub async fn progress_deposit_allocation_consensus(
         &self,
         now_unix_ms: u64,
@@ -3430,82 +5749,157 @@ impl PartyServer {
         let Some(deposit) = &self.deposit else {
             return Ok(());
         };
-        // Each of these reducers has a substantial concrete async state machine. Keep their
-        // storage behind explicit allocation boundaries so the always-live QUIC pacemaker does
-        // not need a worker-stack-sized parent future merely to poll this orchestration method.
-        match Box::pin(self.ensure_deposit_initialized()).await {
-            Ok(()) => {}
-            Err(error)
-                if error
-                    .downcast_ref::<DepositServiceError>()
-                    .is_some_and(|error| matches!(error, DepositServiceError::NotInitialized)) =>
-            {
-                return Ok(());
+        // Genesis preparation is the only initialization phase which calls Monero. With no
+        // service runtime there cannot be a volatile consolidation signer to protect, so perform
+        // that RPC before taking the shared transition fence. Existing-runtime recovery remains
+        // inside the fenced pacemaker turn below.
+        if matches!(deposit.active_epoch().await, Err(DepositServiceError::NotInitialized)) {
+            let initialization = self.boxed_ensure_deposit_initialized().await;
+            let transition = self.consolidation_transition.lock().await;
+            let initialization =
+                self.finish_deposit_runtime_mutation(&transition, deposit, initialization).await;
+            match initialization {
+                Ok(()) => {}
+                Err(error)
+                    if error.downcast_ref::<DepositServiceError>().is_some_and(|error| {
+                        matches!(error, DepositServiceError::NotInitialized)
+                    }) =>
+                {
+                    return Ok(());
+                }
+                Err(error) => return Err(error),
             }
-            Err(error) => return Err(error),
         }
-        let epoch = Box::pin(deposit.active_epoch()).await?;
-        let identity = self.identity(epoch)?;
-        Box::pin(deposit.progress_consolidation_abandonment_observations(identity.as_ref()))
-            .await?;
-        Box::pin(deposit.progress_allocation_consensus(now_unix_ms, identity.as_ref())).await?;
-        Box::pin(self.reconcile_deposit_targets_allow_gap()).await
+        // Share the same host transition fence as checkpoint ingress for the complete pacemaker
+        // turn. QUIC bounds and fairly admits complete authenticated mutation bodies before they
+        // wait on this fence, so an admitted checkpoint cannot be starved by repeated pacemaker
+        // reacquisition. Once ingress owns the fence, the pacemaker cannot overtake before the
+        // dispatcher has fixed its durable ACK result and completed required post-mutation safety
+        // work.
+        let transition = self.consolidation_transition.lock().await;
+        let progress = self.boxed_progress_deposit_allocation_turn(deposit, now_unix_ms).await;
+        self.finish_deposit_runtime_mutation(&transition, deposit, progress).await
     }
 
-    /// Run one scanner tick. A configured service remains dormant before the epoch-zero
-    /// activation certificate exists, and a missing handoff pauses issuance without pausing
-    /// observation of already-issued addresses.
-    pub async fn tick_deposit_worker(&self) -> anyhow::Result<()> {
+    /// Return the worker's configured per-scheduling-turn scan budget.
+    ///
+    /// Historical allocation backfill preserves a durable cut after every block, so the QUIC
+    /// supervisor applies this same bound across immediate cooperative follow-up ticks.
+    pub(crate) fn deposit_worker_backfill_burst_limit(&self) -> usize {
+        self.deposit.as_ref().map_or(1, |deposit| deposit.allocation_backfill_burst_limit())
+    }
+
+    /// Run one scanner tick and report whether durable allocation backfill remains pending.
+    ///
+    /// A configured service remains dormant before the epoch-zero activation certificate exists,
+    /// and a missing handoff pauses issuance without pausing observation of already-issued
+    /// addresses. The returned flag is only a runtime liveness hint; it does not alter the
+    /// independently persisted allocation-readiness fence.
+    pub async fn tick_deposit_worker(self: &Arc<Self>) -> anyhow::Result<bool> {
         let Some(deposit) = &self.deposit else {
-            return Ok(());
+            return Ok(false);
         };
-        match self.ensure_deposit_initialized().await {
+        // Successor initialization/recovery may wait for its independent StateImported
+        // certificate. Do not let that liveness gate pin a predecessor whose exact terminal
+        // handoff was already applied on an earlier tick. Dormant or incomplete handoffs still
+        // fail closed inside the retirement authorization and remain retryable below.
+        if let Err(error) = self.retry_local_share_retirements().await {
+            tracing::debug!(
+                party = %self.party,
+                %error,
+                "pre-initialization predecessor retirement remains pending"
+            );
+        }
+        // Genesis preparation is the only initialization phase which calls Monero. An absent
+        // service runtime cannot own a volatile consolidation signer, so perform that preparation
+        // without the transition fence. Every recovery of an existing runtime is fenced below.
+        let runtime_absent = match deposit.active_epoch().await {
+            Err(DepositServiceError::NotInitialized) => true,
+            Ok(_) => false,
+            Err(error) => return Err(error.into()),
+        };
+        let initialization = if runtime_absent {
+            let initialization = self.ensure_deposit_initialized().await;
+            let transition = self.consolidation_transition.lock().await;
+            self.finish_deposit_runtime_mutation(&transition, deposit, initialization).await
+        } else {
+            let transition = self.consolidation_transition.lock().await;
+            let initialization = self.ensure_deposit_initialized().await;
+            self.finish_deposit_runtime_mutation(&transition, deposit, initialization).await
+        };
+        match initialization {
             Ok(()) => {}
             Err(error)
                 if error
                     .downcast_ref::<DepositServiceError>()
                     .is_some_and(|error| matches!(error, DepositServiceError::NotInitialized)) =>
             {
-                return Ok(());
+                return Ok(false);
             }
-            Err(error) => return Err(error),
+            Err(error) => return Err(error.context("deposit initialization failed")),
         }
-        self.progress_deposit_state().await?;
-        let _transition = self.consolidation_transition.lock().await;
-        self.restore_consolidation_session_closures(&_transition, deposit).await?;
-        let outcome = deposit.tick_worker().await?;
-        // The service quarantine is already durable. Drop every matching linear machine before
-        // any fallible cross-store closure work so no error path can unblock with an orphan nonce.
-        let mut removed_purposes = BTreeMap::new();
         {
-            let mut live = self.consolidation_signing.lock().await;
-            for session in &outcome.invalidated_consolidation_sessions {
-                if let Some(runtime) = live.remove(session) {
-                    removed_purposes.insert(*session, runtime.nonce_tombstone_purpose);
-                }
-            }
+            let transition = self.consolidation_transition.lock().await;
+            let progress =
+                self.progress_deposit_state().await.context("deposit state progress failed");
+            self.finish_deposit_runtime_mutation(&transition, deposit, progress).await?;
         }
-        let closures = deposit
-            .consolidation_session_closures()
-            .await?
-            .into_iter()
-            .map(|closure| (closure.session, closure.purpose))
-            .collect::<BTreeMap<_, _>>();
-        for session in outcome.invalidated_consolidation_sessions {
-            let purpose = closures
-                .get(&session)
-                .context("invalidated consolidation session lacks a durable closure")?;
-            if let Some(expected_purpose) = removed_purposes.get(&session) {
-                anyhow::ensure!(
-                    expected_purpose == purpose,
-                    "invalidated consolidation session has another tombstone purpose"
-                );
-            }
-            // This idempotent path carries no create-new receipt. It closes the crash gap where
-            // the service persisted Released/Quarantined but the process died before FROST start.
-            self.protocol_store.save_session_tombstone(session, purpose, &mut OsRng).await?;
+        // A certified handoff may have just advanced the durable registry. Erase its predecessor
+        // share before any independent scanner/session work can fail; otherwise a persistently
+        // unavailable scanner can indefinitely postpone an already-authorized retirement. A
+        // handoff which is not terminal yet remains retryable and must not block the scanner work
+        // that may make its remaining obligations portable.
+        if let Err(error) = self.retry_local_share_retirements().await {
+            tracing::debug!(
+                party = %self.party,
+                %error,
+                "pre-scanner predecessor retirement remains pending after deposit progress"
+            );
         }
-        Ok(())
+        let prepared = {
+            let transition = self.consolidation_transition.lock().await;
+            let preparation =
+                deposit.prepare_worker_tick(&transition).await.map_err(anyhow::Error::from);
+            self.finish_deposit_runtime_mutation(&transition, deposit, preparation)
+                .await
+                .context("deposit scanner prelude failed")?
+        };
+        // The prepared worker is an exact, non-forgeable snapshot token. Monero calls run without
+        // the host transition fence; only authenticated local-index publications reacquire the
+        // shared Arc and invoke the host adapter before releasing it.
+        let mutation_host = PartyDepositWorkerMutationHost { server: self, deposit };
+        let scanned = deposit
+            .scan_prepared_worker_tick(
+                prepared,
+                Arc::clone(&self.consolidation_transition),
+                &mutation_host,
+            )
+            .await
+            .context("deposit scanner daemon phase failed")?;
+        let transition = self.consolidation_transition.lock().await;
+        let finalization =
+            deposit.finalize_worker_tick(&transition, scanned).await.map_err(anyhow::Error::from);
+        let outcome = self
+            .finish_deposit_runtime_mutation(&transition, deposit, finalization)
+            .await
+            .context("deposit scanner finalization failed")?;
+        let allocation_backfill_pending = outcome.allocation_backfill_pending;
+        // `finish_deposit_runtime_mutation` enumerated the complete durable closure set, pruned
+        // every invalidated signer, and persisted its idempotent tombstone under this same guard.
+        drop(transition);
+        self.retry_local_share_retirements()
+            .await
+            .context("post-scanner predecessor retirement failed")?;
+        Ok(allocation_backfill_pending)
+    }
+
+    /// Advance one bounded portable-index retention cleanup batch independently of scanner and
+    /// inbound QUIC progress.
+    pub async fn progress_deposit_retention_gc_batch(&self) -> anyhow::Result<bool> {
+        let Some(deposit) = &self.deposit else {
+            return Ok(false);
+        };
+        Ok(deposit.progress_deposit_index_retention_gc_batch().await?)
     }
 
     async fn start_byzantine_consolidation_release(
@@ -3570,6 +5964,7 @@ impl PartyServer {
             None => {}
         }
 
+        deposit.validate_live_byzantine_signing_attempt(family, view, &binding).await?;
         let Some((session, preprocess)) =
             self.start_persisted_consolidation_signer(transition, release, binding).await?
         else {
@@ -3660,6 +6055,9 @@ impl PartyServer {
                                 Ok((*party, contribution.preprocess().clone()))
                             })
                             .collect::<anyhow::Result<Vec<_>>>()?;
+                        deposit
+                            .validate_live_byzantine_signing_attempt(family, view, &binding)
+                            .await?;
                         let state = state.bind_transaction_bound(peers)?;
                         let result = deposit
                             .record_local_byzantine_key_image_preview(
@@ -3688,6 +6086,9 @@ impl PartyServer {
                         result?;
                     }
                     ConsolidationSignPhase::Authorization { state } => {
+                        deposit
+                            .validate_live_byzantine_signing_attempt(family, view, &binding)
+                            .await?;
                         let result = deposit
                             .record_local_byzantine_key_image_preview(
                                 family,
@@ -3865,6 +6266,7 @@ impl PartyServer {
                     return Err(error.into());
                 }
 
+                deposit.validate_live_byzantine_signing_attempt(family, view, &binding).await?;
                 let (state, share) = state.release_bound_signature_share()?;
                 let share = SignedShareContribution::sign(
                     identity.as_ref(),
@@ -3927,10 +6329,20 @@ impl PartyServer {
 
     async fn apply_byzantine_consolidation_action(
         &self,
-        transition: &tokio::sync::MutexGuard<'_, ()>,
         deposit: &DepositService,
         action: ByzantineConsolidationAction,
+        now: DepositClockSample,
     ) -> anyhow::Result<(bool, Vec<ByzantineConsolidationAction>)> {
+        // Bootstrap continuation performs a fresh Monero ring-membership RPC. Its deposit-service
+        // CAS already rechecks the exact lane/worker/root-key facts, so do not hold the global
+        // transition mutex while the daemon is unavailable. Every action which can touch a
+        // volatile signer still retains the transition fence for its complete local mutation.
+        let transition =
+            if matches!(&action, ByzantineConsolidationAction::BootstrapPrepared { .. }) {
+                None
+            } else {
+                Some(self.consolidation_transition.lock().await)
+            };
         match action {
             ByzantineConsolidationAction::BootstrapPrepared {
                 sweep,
@@ -3971,7 +6383,8 @@ impl PartyServer {
                     .continue_byzantine_bootstrap(
                         self.identity(epoch)?.as_ref(),
                         continuation,
-                        unix_time_millis()?,
+                        now.unix_millis,
+                        Arc::clone(&self.consolidation_transition),
                     )
                     .await?;
                 return Ok((false, follow_up));
@@ -3988,7 +6401,14 @@ impl PartyServer {
                     return Ok((true, Vec::new()));
                 }
                 self.start_byzantine_consolidation_release(
-                    transition, deposit, family, view, binding, release,
+                    transition
+                        .as_ref()
+                        .context("release action omitted its consolidation transition fence")?,
+                    deposit,
+                    family,
+                    view,
+                    binding,
+                    release,
                 )
                 .await?;
             }
@@ -4041,7 +6461,11 @@ impl PartyServer {
                     "signed consolidation survived an unresolved epoch cutover"
                 );
                 match deposit
-                    .propose_consolidation_completion(sweep, self.identity(active_epoch)?.as_ref())
+                    .propose_consolidation_completion(
+                        sweep,
+                        self.identity(active_epoch)?.as_ref(),
+                        now.unix_millis,
+                    )
                     .await
                 {
                     Ok(()) | Err(DepositServiceError::NotLeader(_)) => {}
@@ -4052,9 +6476,11 @@ impl PartyServer {
                 anyhow::ensure!(family != [0; 32], "Byzantine consolidation family is zero");
                 anyhow::ensure!(view.checked_add(1) == Some(binding.attempt().attempt()));
                 anyhow::ensure!(signing_session == binding.attempt().session());
-                if let Some(runtime) =
-                    self.consolidation_signing.lock().await.remove(&signing_session)
-                {
+                let runtime = {
+                    let mut signing = self.consolidation_signing.lock().await;
+                    signing.remove(&signing_session)
+                };
+                if let Some(runtime) = runtime {
                     validate_live_consolidation_binding(&runtime, &binding)?;
                     let tombstone =
                         self.protocol_store.load_session_tombstone(signing_session).await?;
@@ -4066,6 +6492,40 @@ impl PartyServer {
             }
         }
         Ok((false, Vec::new()))
+    }
+
+    async fn recover_signed_sweep_completion_proposals(
+        &self,
+        deposit: &DepositService,
+        now_unix_ms: u64,
+    ) -> anyhow::Result<()> {
+        let signed_sweeps = deposit.signed_sweeps_awaiting_completion().await?;
+        if signed_sweeps.is_empty() {
+            return Ok(());
+        }
+        let active_identity = self.identity(deposit.active_epoch().await?)?;
+        for sweep in signed_sweeps {
+            match boxed_propose_consolidation_completion(
+                deposit,
+                sweep,
+                active_identity.as_ref(),
+                now_unix_ms,
+            )
+            .await
+            {
+                Ok(()) | Err(DepositServiceError::NotLeader(_)) => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Ok(())
+    }
+
+    fn boxed_recover_signed_sweep_completion_proposals<'a>(
+        &'a self,
+        deposit: &'a DepositService,
+        now_unix_ms: u64,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + Send + 'a>> {
+        Box::pin(self.recover_signed_sweep_completion_proposals(deposit, now_unix_ms))
     }
 
     /// Advance coordinator-free Byzantine consolidation. Every intent view is committed by its
@@ -4085,34 +6545,37 @@ impl PartyServer {
         // `#[tokio::test]`). Awaiting the reducers inline stacks every construction temporary into
         // one multi-megabyte poll frame; route the large ones through non-async boxing shims so only
         // an eight-byte pointer stays live here per await.
-        self.boxed_ensure_deposit_initialized().await?;
-        let transition = self.consolidation_transition.lock().await;
-        self.restore_consolidation_session_closures(&transition, deposit).await?;
+        let runtime_absent = match deposit.active_epoch().await {
+            Err(DepositServiceError::NotInitialized) => true,
+            Ok(_) => false,
+            Err(error) => return Err(error.into()),
+        };
+        if runtime_absent {
+            // Canonical genesis preparation is the only Monero call in initialization. With no
+            // runtime there can be no volatile consolidation signer to protect, so fence only the
+            // resulting publication/recovery cut.
+            let initialization = self.boxed_ensure_deposit_initialized().await;
+            let transition = self.consolidation_transition.lock().await;
+            self.finish_deposit_runtime_mutation(&transition, deposit, initialization).await?;
+        } else {
+            let transition = self.consolidation_transition.lock().await;
+            let initialization = self.boxed_ensure_deposit_initialized().await;
+            self.finish_deposit_runtime_mutation(&transition, deposit, initialization).await?;
+        }
+        // One sample drives crash recovery, reducer progress, and every action in this bounded
+        // logical tick. A private-Regtest acceptance-clock update can therefore never split their
+        // authorization generations.
+        let now = self.deposit_clock_sample()?;
 
         // Recover the crash boundary after exact signed bytes were adopted but before the current
         // ledger leader reserved their completion statement. This runs before publication and
         // before either acceptance gate, and is idempotent across every restart/tick.
-        let signed_sweeps = deposit.signed_sweeps_awaiting_completion().await?;
-        if !signed_sweeps.is_empty() {
-            let active_identity = self.identity(deposit.active_epoch().await?)?;
-            for sweep in signed_sweeps {
-                match boxed_propose_consolidation_completion(
-                    deposit,
-                    sweep,
-                    active_identity.as_ref(),
-                )
-                .await
-                {
-                    Ok(()) | Err(DepositServiceError::NotLeader(_)) => {}
-                    Err(error) => return Err(error.into()),
-                }
-            }
-        }
-
-        // Any party with a globally certified completion may safely publish the exact bytes.
-        // Repeating after an RPC/CAS crash is intentionally idempotent.
-        for sweep in deposit.certified_sweeps_awaiting_publish().await? {
-            deposit.publish_certified_consolidation(sweep).await?;
+        {
+            let transition = self.consolidation_transition.lock().await;
+            let recovery = self
+                .boxed_recover_signed_sweep_completion_proposals(deposit, now.unix_millis)
+                .await;
+            self.finish_deposit_runtime_mutation(&transition, deposit, recovery).await?;
         }
 
         // While either acceptance barrier is held, neither bootstrap BA nor the later nonce/view
@@ -4127,7 +6590,12 @@ impl PartyServer {
         // A held one-shot capability is intentionally volatile. If this process restarted while
         // held, the service sees the durable released/tombstoned attempt and certifies a fresh view
         // after admin release; it never reconstructs the lost nonce authorization.
-        if let Some(held) = self.held_byzantine_consolidation_release.lock().await.take() {
+        let held = {
+            let mut release = self.held_byzantine_consolidation_release.lock().await;
+            release.take()
+        };
+        if let Some(held) = held {
+            let transition = self.consolidation_transition.lock().await;
             self.start_byzantine_consolidation_release(
                 &transition,
                 deposit,
@@ -4141,14 +6609,14 @@ impl PartyServer {
 
         let epoch = deposit.active_epoch().await?;
         let identity = self.identity(epoch)?;
-        let now_ms = unix_time_millis()?;
         let base_timeout_ms = u64::try_from(attempt_timeout.as_millis())
             .context("consolidation timeout exceeds u64 milliseconds")?;
         let actions = boxed_progress_byzantine_consolidations(
             deposit,
             identity.as_ref(),
-            now_ms,
+            now.unix_millis,
             base_timeout_ms,
+            Arc::clone(&self.consolidation_transition),
         )
         .await?;
         let mut actions = VecDeque::from(actions);
@@ -4159,13 +6627,28 @@ impl PartyServer {
                 "Byzantine consolidation action cascade exceeded its fixed bound"
             );
             applied += 1;
-            let (stop, follow_up) = self
-                .boxed_apply_byzantine_consolidation_action(&transition, deposit, action)
-                .await?;
+            let (stop, follow_up) =
+                self.boxed_apply_byzantine_consolidation_action(deposit, action, now).await?;
             if stop {
                 break;
             }
             actions.extend(follow_up);
+        }
+        Ok(())
+    }
+
+    /// Publish globally certified transactions on an independent pacemaker.
+    ///
+    /// Monero submission may stall or retry for an arbitrarily long time. It is idempotent and
+    /// carries no volatile nonce capability, so it must not hold the consolidation transition
+    /// mutex or delay BA/view timers.
+    pub async fn publish_deposit_consolidations_once(&self) -> anyhow::Result<()> {
+        let Some(deposit) = &self.deposit else {
+            return Ok(());
+        };
+        self.boxed_ensure_deposit_initialized().await?;
+        for sweep in deposit.certified_sweeps_awaiting_publish().await? {
+            deposit.publish_certified_consolidation(sweep).await?;
         }
         Ok(())
     }
@@ -4182,18 +6665,16 @@ impl PartyServer {
         );
         let certified_root = value.history_link.root()?;
         anyhow::ensure!(certified_root != [0_u8; 32], "certified deposit target root is zero");
-        {
-            let mut targets = self.deposit_targets.write().await;
-            if let Some(existing) = targets.get(&value.epoch) {
-                anyhow::ensure!(
-                    existing == &value.public,
-                    "deposit epoch is already bound to another public value"
-                );
-            } else {
-                targets.insert(value.epoch, value.public.clone());
-            }
-        }
+        let mut targets = self.deposit_targets.write().await;
         let mut roots = self.deposit_target_roots.write().await;
+        if let Some(existing) = targets.get(&value.epoch) {
+            anyhow::ensure!(
+                existing == &value.public,
+                "deposit epoch is already bound to another public value"
+            );
+        } else {
+            targets.insert(value.epoch, value.public.clone());
+        }
         if let Some(existing) = roots.get(&value.epoch) {
             anyhow::ensure!(
                 *existing == certified_root,
@@ -4202,28 +6683,266 @@ impl PartyServer {
         } else {
             roots.insert(value.epoch, certified_root);
         }
+        // This is only a hot acceleration cache. Exact cold epochs are loaded through the
+        // authenticated epoch-history index below, so an unbounded lifetime map is unnecessary.
+        while targets.len() > MAX_CURRENT_EPOCH_RECORDS {
+            let obsolete = targets
+                .keys()
+                .copied()
+                .find(|epoch| *epoch != value.epoch)
+                .context("deposit target cache cannot select an obsolete entry")?;
+            targets.remove(&obsolete);
+            roots.remove(&obsolete);
+        }
+        anyhow::ensure!(
+            targets.keys().eq(roots.keys()),
+            "deposit target and activation-root caches diverged"
+        );
         Ok(certified_root)
     }
 
-    async fn certified_deposit_target_root(&self, epoch: u64) -> anyhow::Result<[u8; 32]> {
-        self.deposit_target_roots.read().await.get(&epoch).copied().with_context(|| {
-            format!("deposit epoch {epoch} lacks its certified activation-history root")
+    /// Load one exact deposit issuer from the authenticated, bounded epoch-history index.
+    ///
+    /// The in-memory target maps are deliberately only a bounded hot cache. Genesis and
+    /// historical handoff recovery must therefore authenticate the requested cold entry and its
+    /// activation certificate rather than treating cache absence as history absence.
+    async fn authenticated_epoch_activation_value(
+        &self,
+        epoch: u64,
+    ) -> anyhow::Result<ActivationValue> {
+        Ok(self.authenticated_epoch_activation(epoch, false).await?.value)
+    }
+
+    /// Authenticate one exact epoch without relying on bounded predecessor caches. The optional
+    /// live registration is reserved for the one durable schedule source and its immediate target;
+    /// ordinary cold reads remain stateless and cannot grow the hot rotation/link registries.
+    async fn authenticated_epoch_activation(
+        &self,
+        epoch: u64,
+        register_live_rotation: bool,
+    ) -> anyhow::Result<AuthenticatedEpochActivation> {
+        let state = self.epoch_history.read().await.clone();
+        // These records enter the bounded gossip cache only after full certificate verification
+        // and the history CAS, and startup reauthenticates them before publishing the server.
+        // Bind an exact cache hit to the committed hot entry. Re-verifying its receiver-key
+        // proof on every pacemaker tick consumes the same scarce blocking permit needed for
+        // new rotations, which can starve live consensus even with entirely honest peers.
+        if let Some(entry) = state.hot_entries().iter().find(|entry| entry.epoch() == epoch)
+            && let Some(record) = self
+                .activation_gossip_records
+                .read()
+                .await
+                .get(&(epoch, entry.activation_digest()))
+                .cloned()
+        {
+            anyhow::ensure!(
+                record.value.epoch == epoch
+                    && record.value.history_link == entry.consensus_link()
+                    && record.value.activation_digest == entry.activation_digest()
+                    && record.value.public.activation_digest()? == entry.activation_digest()
+                    && avss_transition_digest(&record.transition)? == entry.transition_digest(),
+                "cached activation differs from its authenticated hot history entry"
+            );
+            let live_rotation_available = if epoch == 0 {
+                true
+            } else {
+                let rotations = self
+                    .certified_key_rotations
+                    .read()
+                    .map_err(|_| anyhow::anyhow!("key-rotation registry lock is poisoned"))?;
+                if let Some(rotation) = rotations.get(&epoch) {
+                    anyhow::ensure!(
+                        rotation.target == record.value.public.committee
+                            && rotation.context.target_fault_bound()
+                                == record.transition.fault_bound
+                            && rotation.receiver_keys == entry.consensus_link().receiver_keys()
+                            && Some(rotation.semantic_digest)
+                                == entry.consensus_link().key_rotation_digest(),
+                        "cached rotation differs from its authenticated hot history entry"
+                    );
+                    true
+                } else {
+                    false
+                }
+            };
+            if !register_live_rotation || live_rotation_available {
+                return Ok(AuthenticatedEpochActivation {
+                    value: record.value,
+                    fault_bound: record.transition.fault_bound,
+                });
+            }
+        }
+        let (entry, mut loaded) = self
+            .epoch_history_entry(&state, epoch)
+            .await?
+            .with_context(|| format!("epoch {epoch} is absent from authenticated history"))?;
+        let certificate =
+            self.load_epoch_history_object(entry.activation_certificate(), &mut loaded).await?;
+        let record: ActivationCertificateRecord = decode_postcard_exact(&certificate)?;
+        let rotation = match entry.key_rotation_certificate() {
+            Some(reference) => Some(self.load_epoch_history_object(reference, &mut loaded).await?),
+            None => None,
+        };
+        let manifest = entry.catchup_manifest()?;
+        anyhow::ensure!(
+            record.value.epoch == epoch
+                && record.value.public.committee.epoch == epoch
+                && record.value.history_link == entry.consensus_link()
+                && record.value.activation_digest == entry.activation_digest()
+                && record.transition.history_parent == manifest.parent()
+                && avss_transition_digest(&record.transition)? == entry.transition_digest(),
+            "deposit activation differs from its authenticated history entry"
+        );
+        let verified_rotation =
+            self.verified_history_key_rotation(&record, rotation.as_deref(), true)?;
+        let authority = match verified_rotation.as_ref() {
+            Some((context, _, verified)) => AvssTransitionValidationAuthority {
+                target: verified.target.clone(),
+                target_fault_bound: context.target_fault_bound(),
+                source: Some(AvssTransitionSourceAuthority {
+                    committee: context.source().clone(),
+                    fault_bound: context.source_fault_bound(),
+                    history_parent: manifest.parent(),
+                }),
+                rotation: Some(AvssTransitionRotationAuthority {
+                    context: context.clone(),
+                    target: verified.target.clone(),
+                }),
+            },
+            None => {
+                let (target, target_fault_bound) =
+                    self.trusted_committee_and_fault_bound(record.transition.target.epoch)?;
+                AvssTransitionValidationAuthority {
+                    target,
+                    target_fault_bound,
+                    source: None,
+                    rotation: None,
+                }
+            }
+        };
+        validate_avss_transition_with_authority(self, &record.transition, &authority)?;
+        verify_activation_certificate_with_history_authority(
+            self,
+            &record.transition,
+            &record.value,
+            &record.acknowledgements,
+            entry.consensus_link().receiver_keys(),
+            entry.consensus_link().key_rotation_digest(),
+        )?;
+        if register_live_rotation && let Some((context, certificate, verified)) = verified_rotation
+        {
+            let registered = self.register_certified_key_rotation(context, certificate).await?;
+            anyhow::ensure!(
+                registered == verified.target,
+                "live schedule rotation registration changed its authenticated target"
+            );
+        }
+        Ok(AuthenticatedEpochActivation {
+            value: record.value,
+            fault_bound: authority.target_fault_bound,
         })
+    }
+
+    /// Materialize the bounded live capability for one durable schedule endpoint. Unlike an
+    /// arbitrary cold history lookup, the pacemaker must subsequently derive the successor
+    /// rotation context from the source's certified committee and history accumulator.
+    async fn authenticated_live_schedule_source(
+        &self,
+        epoch: u64,
+    ) -> anyhow::Result<ActivationValue> {
+        let authenticated = self.authenticated_epoch_activation(epoch, true).await?;
+        self.remember_certified_history_link(authenticated.value.history_link)?;
+        Ok(authenticated.value)
+    }
+
+    async fn authenticated_deposit_target(
+        &self,
+        epoch: u64,
+    ) -> anyhow::Result<(EpochPublic, [u8; 32])> {
+        {
+            let targets = self.deposit_targets.read().await;
+            let roots = self.deposit_target_roots.read().await;
+            match (targets.get(&epoch), roots.get(&epoch)) {
+                (Some(public), Some(root)) => return Ok((public.clone(), *root)),
+                (None, None) => {}
+                _ => anyhow::bail!("deposit target hot cache is internally inconsistent"),
+            }
+        }
+
+        let value = self.authenticated_epoch_activation_value(epoch).await?;
+        let root = value.history_link.root()?;
+        anyhow::ensure!(root != [0_u8; 32], "certified deposit target root is zero");
+        Ok((value.public, root))
+    }
+
+    async fn certified_deposit_target_root(&self, epoch: u64) -> anyhow::Result<[u8; 32]> {
+        Ok(self.authenticated_deposit_target(epoch).await?.1)
     }
 
     async fn ensure_deposit_initialized(&self) -> anyhow::Result<()> {
         let Some(deposit) = &self.deposit else {
             return Ok(());
         };
+        if !deposit.local_runtime_ready() {
+            deposit.reconcile_live_deposit_sync_import(&self.deposit_sync_spools).await?;
+        }
         let active = match deposit.active_epoch().await {
             Ok(epoch) => epoch,
             Err(DepositServiceError::NotInitialized) => {
-                let Some(root) = self.deposit_targets.read().await.get(&0).cloned() else {
-                    return Err(DepositServiceError::NotInitialized.into());
+                let prepared_at_revision = self.deposit_activation_revision.load(Ordering::Acquire);
+                let prepared_history_parent = self.epoch_history.read().await.parent()?;
+                let certified_tip = prepared_history_parent
+                    .epoch()
+                    .context("deposit genesis requires a certified epoch-zero activation")?;
+                let (genesis_public, genesis_root) = self.authenticated_deposit_target(0).await?;
+
+                // Snapshot inspection is local and chain-independent. Absence permits creation
+                // of the one canonical epoch-zero registry only; it never authorizes an empty
+                // registry at the current signing epoch. A restored snapshot resumes from its
+                // exact durable issuer through adjacent certified handoffs.
+                let durable_epoch = deposit.durable_registry_epoch(&genesis_public).await?;
+                anyhow::ensure!(
+                    durable_epoch.is_none_or(|epoch| epoch <= certified_tip),
+                    "durable deposit registry is ahead of certified activation history"
+                );
+                let source_epoch = durable_epoch.unwrap_or(0);
+                let pending_handoff = match source_epoch.checked_add(1) {
+                    Some(successor) if successor <= certified_tip => {
+                        let (source, _) = self.authenticated_deposit_target(source_epoch).await?;
+                        let (target, _) = self.authenticated_deposit_target(successor).await?;
+                        Some((source, target))
+                    }
+                    _ => None,
                 };
-                let certified_root = self.certified_deposit_target_root(0).await?;
-                deposit.ensure_genesis(&root, certified_root).await?;
-                0
+                let prepared = deposit.prepare_genesis(&genesis_public, genesis_root).await?;
+                // Chain RPC completed without owning the activation fence. Serialize only the
+                // local publication and reject a preparation which crossed any certified epoch
+                // linearization point.
+                let _publication = self.deposit_genesis_publication.lock().await;
+                anyhow::ensure!(
+                    self.deposit_activation_revision.load(Ordering::Acquire)
+                        == prepared_at_revision,
+                    "deposit genesis preparation crossed an epoch activation"
+                );
+                anyhow::ensure!(
+                    self.epoch_history.read().await.parent()? == prepared_history_parent,
+                    "certified epoch history changed during deposit genesis preparation"
+                );
+                // Recheck the exact absence/presence fact while publication is serialized. A
+                // concurrent initializer may have created a snapshot during the chain RPC; it is
+                // never safe to replace that newly durable history with an empty genesis.
+                anyhow::ensure!(
+                    deposit.durable_registry_epoch(&genesis_public).await? == durable_epoch,
+                    "durable deposit registry changed during genesis preparation"
+                );
+                deposit
+                    .install_prepared_genesis(
+                        prepared,
+                        pending_handoff.as_ref().map(|(source, target)| (source, target)),
+                        Some(&self.deposit_sync_spools),
+                    )
+                    .await?;
+                deposit.active_epoch().await?
             }
             Err(error) => return Err(error.into()),
         };
@@ -4239,19 +6958,24 @@ impl PartyServer {
         if recovered.contains(&epoch) {
             return Ok(());
         }
-        let identity = {
-            let identities = self
-                .identities
-                .read()
-                .map_err(|_| anyhow::anyhow!("identity registry lock is poisoned"))?;
-            identities
-                .get(&epoch)
-                .or_else(|| identities.values().next())
-                .cloned()
-                .context("missing local identity for deposit recovery")?
-        };
-        deposit.recover_peer_messages(&identity, unix_time_seconds()?).await?;
+        let (target, _) = self.authenticated_deposit_target(epoch).await?;
+        if target.committee.member(self.party).is_ok() {
+            let identity = self.deposit_consensus_signer(epoch).await?;
+            let now = self.deposit_clock_sample()?;
+            deposit.recover_peer_messages(identity.as_ref(), now.unix_seconds).await?;
+        }
+        // A target-only joiner still records the authenticated authority as recovered. It has no
+        // local signer or reducer messages to replay for this committee, and attempting to create
+        // one would prevent a disjoint successor from cold-starting at canonical epoch zero.
         recovered.insert(epoch);
+        while recovered.len() > 2 {
+            let obsolete = recovered
+                .iter()
+                .copied()
+                .find(|retained| *retained != epoch)
+                .context("deposit recovery cache cannot select an obsolete epoch")?;
+            recovered.remove(&obsolete);
+        }
         Ok(())
     }
 
@@ -4262,27 +6986,31 @@ impl PartyServer {
         let Some(deposit) = &self.deposit else {
             return Ok(());
         };
-        self.ensure_deposit_initialized().await?;
+        self.boxed_ensure_deposit_initialized().await?;
         loop {
             let active = deposit.active_epoch().await?;
             let successor = active.checked_add(1).context("deposit epoch counter is exhausted")?;
-            let Some(target) = self.deposit_targets.read().await.get(&successor).cloned() else {
+            let certified_tip = self.epoch_history.read().await.tip_epoch();
+            if certified_tip.is_none_or(|tip| successor > tip) {
                 break;
-            };
-            let certified_root = self.certified_deposit_target_root(successor).await?;
-            let Some(old) = self.deposit_targets.read().await.get(&active).cloned() else {
-                anyhow::bail!("deposit source epoch is absent from certified activation history");
-            };
-            self.prepare_deposit_handoff(&old, &target, certified_root).await?;
-            self.progress_certified_deposit_handoff(&old, &target, certified_root).await?;
-            deposit.apply_certified_handoff(&old, &target, certified_root).await?;
-            self.recover_deposit_epoch(target.committee.epoch).await?;
+            }
+            let (old, _) = self.authenticated_deposit_target(active).await?;
+            let (target, certified_root) = self.authenticated_deposit_target(successor).await?;
+            self.boxed_prepare_deposit_handoff(&old, &target, certified_root).await?;
+            self.boxed_progress_certified_deposit_handoff(&old, &target, certified_root).await?;
+            *self.deposit_sync_lifetime_reconciliation.lock().await = None;
+            boxed_apply_certified_handoff(deposit, &old, &target, certified_root).await?;
+            // The handoff CAS may have completed before a crash. Replaying this exact,
+            // authenticated lifetime reconciliation is required before the successor committee
+            // is allowed to serve or request another Head lease.
+            self.boxed_reconcile_active_deposit_sync_lifetimes().await?;
+            self.boxed_recover_deposit_epoch(target.committee.epoch).await?;
         }
         Ok(())
     }
 
     async fn reconcile_deposit_targets_allow_gap(&self) -> anyhow::Result<()> {
-        match self.reconcile_deposit_targets().await {
+        match self.boxed_reconcile_deposit_targets().await {
             Ok(()) => Ok(()),
             Err(error) if is_expected_deposit_reconciliation_gap(&error) => Ok(()),
             Err(error) => Err(error),
@@ -4299,9 +7027,19 @@ impl PartyServer {
             return Ok(());
         };
         // A target-only joiner has no authority to sign the terminal old-epoch ledger entry and
-        // may not have the epoch-zero history yet. Threshold activation remains independent;
-        // deposit issuance stays closed until authenticated history bootstrap catches up.
+        // may not have the epoch-zero history yet. It must nevertheless durably pin the exact
+        // authenticated transition before checkpoint ingress, otherwise pre-dispatch
+        // reconciliation would reject the old-quorum certificate needed to complete the handoff.
         if old.committee.member(self.party).is_err() {
+            if !is_target_only_deposit_handoff_member(self.party, &old.committee, &target.committee)
+            {
+                return Ok(());
+            }
+            self.ensure_deposit_initialized().await?;
+            if deposit.active_epoch().await? >= target.committee.epoch {
+                return Ok(());
+            }
+            deposit.pin_certified_handoff_target_only(old, target, certified_root).await?;
             return Ok(());
         }
         self.ensure_deposit_initialized().await?;
@@ -4311,15 +7049,16 @@ impl PartyServer {
         // An older certified transition must be replayed first. This closes issuance rather than
         // constructing a fresh registry or signing a handoff from the wrong issuer window.
         if deposit.active_epoch().await? != old.committee.epoch {
-            Box::pin(self.reconcile_deposit_targets()).await?;
+            self.boxed_reconcile_deposit_targets().await?;
         }
         anyhow::ensure!(
             deposit.active_epoch().await? == old.committee.epoch,
             "deposit registry has not reached the resharing source epoch"
         );
-        let identity = self.identity(old.committee.epoch)?;
+        let identity = self.deposit_consensus_signer(old.committee.epoch).await?;
+        let now = self.deposit_clock_sample()?;
         match deposit
-            .begin_handoff(old, target, certified_root, unix_time_millis()?, &identity)
+            .begin_handoff(old, target, certified_root, now.unix_millis, identity.as_ref())
             .await
         {
             Ok(()) | Err(DepositServiceError::ConsolidationNotPortable) => {
@@ -4355,15 +7094,22 @@ impl PartyServer {
             self.certified_deposit_target_root(target.committee.epoch).await? == certified_root,
             "deposit successor root differs from durable activation history"
         );
-        let identity = self.identity(old.committee.epoch)?;
+        let identity = self.deposit_consensus_signer(old.committee.epoch).await?;
+        let now = self.deposit_clock_sample()?;
         match deposit
-            .progress_certified_handoff(old, target, certified_root, unix_time_millis()?, &identity)
+            .progress_certified_handoff(
+                old,
+                target,
+                certified_root,
+                now.unix_millis,
+                identity.as_ref(),
+            )
             .await
         {
             Ok(())
             | Err(DepositServiceError::NotLeader(_))
             | Err(DepositServiceError::ConsolidationNotPortable) => Ok(()),
-            Err(error) => Err(error.into()),
+            Err(error) => Err(error).context("certified deposit handoff consensus progress failed"),
         }
     }
 
@@ -4389,7 +7135,59 @@ impl PartyServer {
             return Ok(());
         };
         boxed_apply_certified_handoff(deposit, old, target, certified_root).await?;
-        self.boxed_recover_deposit_epoch(target.committee.epoch).await?;
+        // Applying the authenticated terminal handoff is the predecessor-share safety boundary.
+        // Successor message recovery may legitimately wait for its independent StateImported
+        // certificate and uses only successor/stable identities; coupling it to this gate would
+        // let an unavailable target pin obsolete threshold material after every old obligation is
+        // already portable. The deposit pacemaker retries that recovery independently.
+        Ok(())
+    }
+
+    /// Satisfy the deposit gate for threshold-share erasure without ever turning an unavailable
+    /// chain source into a dependency of the signing epoch.
+    ///
+    /// The caller must hold `deposit_genesis_publication`. If a runtime is live, the ordinary
+    /// terminal old-quorum handoff remains mandatory. If it is dormant, an authenticated wallet
+    /// snapshot must be absent: under the publication fence that absence proves no deposit
+    /// address, observed output, or consolidation obligation was ever made durable, so there is
+    /// no portable issuer window to hand off. A present, malformed, or unreadable snapshot fails
+    /// closed and is restored later by the independent deposit pacemaker.
+    async fn authorize_deposit_share_retirement(
+        &self,
+        old: &EpochPublic,
+        target: &EpochPublic,
+        certified_root: [u8; 32],
+    ) -> anyhow::Result<()> {
+        let Some(deposit) = &self.deposit else {
+            return Ok(());
+        };
+        match deposit.active_epoch().await {
+            Ok(active) if active == target.committee.epoch => {
+                // The runtime may be intentionally closed while the successor collects its
+                // independent StateImported certificate. The chain-independent registry is
+                // nevertheless live, and this exact apply check reauthenticates the already-won
+                // terminal handoff without requiring successor readiness.
+                boxed_apply_certified_handoff(deposit, old, target, certified_root).await?;
+                return Ok(());
+            }
+            Ok(active) if active == old.committee.epoch => {
+                if !deposit.local_runtime_ready() {
+                    return Err(DepositServiceError::ColdImportAwaitingCertificate.into());
+                }
+                return self
+                    .certify_deposit_handoff_before_share_retirement(old, target, certified_root)
+                    .await;
+            }
+            Ok(_) => anyhow::bail!(
+                "deposit registry is not at the certified retirement transition boundary"
+            ),
+            Err(DepositServiceError::NotInitialized) => {}
+            Err(error) => return Err(error.into()),
+        }
+        anyhow::ensure!(
+            deposit.durable_registry_epoch(old).await?.is_none(),
+            "durable deposit registry must be restored before predecessor share retirement"
+        );
         Ok(())
     }
 
@@ -4416,23 +7214,10 @@ impl PartyServer {
         Box::pin(self.progress_certified_deposit_handoff(old, target, certified_root))
     }
 
-    fn boxed_recover_deposit_epoch(
-        &self,
-        epoch: u64,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + Send + '_>> {
-        Box::pin(self.recover_deposit_epoch(epoch))
-    }
-
     fn boxed_ensure_deposit_initialized(
         &self,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + Send + '_>> {
         Box::pin(self.ensure_deposit_initialized())
-    }
-
-    fn boxed_progress_deposit_state(
-        &self,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + Send + '_>> {
-        Box::pin(self.progress_deposit_state())
     }
 
     fn boxed_reconcile_deposit_targets_allow_gap(
@@ -4441,12 +7226,60 @@ impl PartyServer {
         Box::pin(self.reconcile_deposit_targets_allow_gap())
     }
 
-    #[allow(clippy::type_complexity)]
-    fn boxed_apply_byzantine_consolidation_action<'a, 'g>(
+    fn boxed_reconcile_deposit_targets(
+        &self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + Send + '_>> {
+        Box::pin(self.reconcile_deposit_targets())
+    }
+
+    fn boxed_reconcile_active_deposit_sync_lifetimes(
+        &self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + Send + '_>> {
+        Box::pin(self.reconcile_active_deposit_sync_lifetimes())
+    }
+
+    fn boxed_recover_deposit_epoch(
+        &self,
+        epoch: u64,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + Send + '_>> {
+        Box::pin(self.recover_deposit_epoch(epoch))
+    }
+
+    fn boxed_progress_consolidation_abandonment_observations<'a>(
         &'a self,
-        transition: &'a tokio::sync::MutexGuard<'g, ()>,
+        deposit: &'a DepositService,
+        identity: &'a dyn EnvelopeSigner,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<(), DepositServiceError>> + Send + 'a>,
+    > {
+        Box::pin(deposit.progress_consolidation_abandonment_observations(identity))
+    }
+
+    fn boxed_progress_allocation_consensus<'a>(
+        &'a self,
+        deposit: &'a DepositService,
+        now_unix_ms: u64,
+        identity: &'a dyn EnvelopeSigner,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<(), DepositServiceError>> + Send + 'a>,
+    > {
+        Box::pin(deposit.progress_allocation_consensus(now_unix_ms, identity))
+    }
+
+    fn boxed_progress_deposit_allocation_turn<'a>(
+        &'a self,
+        deposit: &'a DepositService,
+        now_unix_ms: u64,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + Send + 'a>> {
+        Box::pin(self.progress_deposit_allocation_turn(deposit, now_unix_ms))
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn boxed_apply_byzantine_consolidation_action<'a>(
+        &'a self,
         deposit: &'a DepositService,
         action: ByzantineConsolidationAction,
+        now: DepositClockSample,
     ) -> std::pin::Pin<
         Box<
             dyn std::future::Future<
@@ -4455,7 +7288,7 @@ impl PartyServer {
                 + 'a,
         >,
     > {
-        Box::pin(self.apply_byzantine_consolidation_action(transition, deposit, action))
+        Box::pin(self.apply_byzantine_consolidation_action(deposit, action, now))
     }
 
     async fn progress_deposit_state(&self) -> anyhow::Result<()> {
@@ -4467,22 +7300,93 @@ impl PartyServer {
         let Some(successor) = active.checked_add(1) else {
             return Ok(());
         };
-        let targets = self.deposit_targets.read().await;
-        let Some(old) = targets.get(&active).cloned() else {
+        if self.epoch_history.read().await.tip_epoch().is_none_or(|tip| successor > tip) {
             return Ok(());
-        };
-        let Some(target) = targets.get(&successor).cloned() else {
-            return Ok(());
-        };
-        drop(targets);
-        let certified_root = self.certified_deposit_target_root(successor).await?;
+        }
+        let (old, _) = self.authenticated_deposit_target(active).await?;
+        let (target, certified_root) = self.authenticated_deposit_target(successor).await?;
         // Each deposit segment below is a ~quarter-megabyte async frame; drive them through the
         // non-async boxing shims so this progress path does not stack every segment's construction
         // temporary into one multi-megabyte poll frame. See
         // `certify_deposit_handoff_before_share_retirement` for the debug-lowering rationale.
-        self.boxed_prepare_deposit_handoff(&old, &target, certified_root).await?;
+        self.boxed_prepare_deposit_handoff(&old, &target, certified_root)
+            .await
+            .context("deposit handoff preparation failed")?;
         self.boxed_progress_certified_deposit_handoff(&old, &target, certified_root).await?;
-        self.boxed_reconcile_deposit_targets_allow_gap().await
+        self.boxed_reconcile_deposit_targets_allow_gap()
+            .await
+            .context("deposit target reconciliation failed")
+    }
+
+    /// Retry certified predecessor retirement from the deposit pacemaker, or from core progress
+    /// when deposits are disabled. Deposit handoff must not gate the independent core timer.
+    async fn retry_local_share_retirements(self: &Arc<Self>) -> anyhow::Result<()> {
+        let retained_epochs = self.epochs.read().await.keys().copied().collect::<BTreeSet<_>>();
+        if retained_epochs.is_empty() {
+            return Ok(());
+        }
+        let candidates = self
+            .activation_gossip_records
+            .read()
+            .await
+            .values()
+            .filter_map(|record| {
+                let old = record.transition.old.as_ref()?;
+                (old.committee.member(self.party).is_ok()
+                    && retained_epochs.contains(&old.committee.epoch))
+                .then(|| ActivateEpochRequest {
+                    transition: record.transition.clone(),
+                    value: record.value.clone(),
+                    acknowledgements: record.acknowledgements.clone(),
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let mut first_error = None;
+        for request in candidates {
+            if let Err(error) = boxed_retire_epoch(State(self.clone()), Json(request)).await {
+                let error = error.0.context("certified predecessor retirement failed");
+                tracing::debug!(
+                    party = %self.party,
+                    %error,
+                    "certified predecessor retirement remains pending"
+                );
+                if first_error.is_none() {
+                    first_error = Some(error);
+                }
+            }
+        }
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+
+    /// Keep a cancelled retirement discoverable until its authenticated marker is durable.
+    /// Callers hold the consolidation, epoch, and genesis-publication fences and have drained
+    /// signers. Acquire every volatile guard before storage; after readback, removal has no await.
+    async fn retire_local_epoch_share(&self, retirement: ShareRetirement) -> anyhow::Result<()> {
+        let mut epochs = self.epochs.write().await;
+        let mut activations = self.activations.write().await;
+        let mut active_epoch = self.active_epoch.write().await;
+        if tokio::fs::try_exists(self.store.share_path(retirement.epoch())).await? {
+            self.store.retire_share(retirement).await?;
+            let durable = self
+                .store
+                .load_retirement(retirement.epoch(), retirement.committee_digest())
+                .await?
+                .context("retired share record disappeared before observer promotion")?;
+            anyhow::ensure!(
+                durable == retirement,
+                "retired share readback differs before observer promotion"
+            );
+        }
+        epochs.remove(&retirement.epoch());
+        activations.remove(&retirement.epoch());
+        if *active_epoch == Some(retirement.epoch()) {
+            *active_epoch = None;
+        }
+        Ok(())
     }
 
     /// Snapshot non-secret liveness state for tests and operator diagnostics.
@@ -4499,10 +7403,25 @@ impl PartyServer {
             qual_round: run.qual.as_ref().map(QualConsensus::round),
             qual_decided: run.qual.as_ref().and_then(QualConsensus::decision).is_some(),
             finalized: run.finalized.is_some(),
+            secret_compacted: run.secret_compacted,
+            activation_acknowledgements: run.activation_acknowledgements.len(),
             pending_avss: run.pending_avss.len(),
             pending_qual: run.pending_qual.len(),
             pending_activation_ack: run.pending_activation_ack.len(),
         })
+    }
+
+    /// Report whether one exact AVSS transition has an authenticated permanent closure.
+    ///
+    /// This deliberately accepts the full transition instead of only a session identifier: a
+    /// tombstone is useful liveness evidence only when its purpose and durable activation
+    /// certificate bind the caller's exact transition.
+    pub async fn protocol_transition_is_durably_closed(
+        &self,
+        transition: &AvssTransition,
+    ) -> anyhow::Result<bool> {
+        validate_avss_transition(self, transition)?;
+        Ok(self.closed_transition_activation_record(transition).await?.is_some())
     }
 
     /// Inspect only the volatile phase marker or authenticated permanent closure for a
@@ -4580,11 +7499,13 @@ impl PartyServer {
             .clone()
             .context("dynamic key rotation has no durable proactive schedule")?;
         anyhow::ensure!(
-            schedule.source_epoch == context.source().epoch
+            schedule.phase == ProactiveRefreshSchedulePhase::Armed
+                && schedule.source_epoch == context.source().epoch
                 && schedule.source_activation == context.source_activation()
                 && schedule.target_epoch == Some(context.target_epoch()),
             "key-rotation pacemaker differs from its proactive schedule"
         );
+        Self::authenticate_selection_fallback_deadline(&schedule, context)?;
         anyhow::ensure!(
             schedule.due_unix_ms.is_some_and(|due| started_unix_ms >= due),
             "key-rotation view began before the proactive deadline"
@@ -4630,6 +7551,7 @@ impl PartyServer {
         source: &EpochPublic,
         now_unix_ms: u64,
     ) -> anyhow::Result<()> {
+        let _start_mutation = self.key_rotation_start_mutation.lock().await;
         let context = self
             .key_rotation_context_for_source(source)?
             .context("active epoch does not admit receiver-key rotation")?;
@@ -4639,21 +7561,83 @@ impl PartyServer {
             source_member.is_some() || target_member.is_some(),
             "party is not a source or target member for receiver-key rotation"
         );
+        if source_member.is_some() {
+            anyhow::ensure!(
+                *self.active_epoch.read().await == Some(source.committee.epoch),
+                "local key-rotation source share is not active"
+            );
+        }
+        let schedule = self
+            .proactive_refresh_schedule
+            .lock()
+            .await
+            .clone()
+            .context("key rotation has no durable proactive schedule")?;
+        anyhow::ensure!(
+            schedule.phase == ProactiveRefreshSchedulePhase::Armed
+                && schedule.source_epoch == source.committee.epoch
+                && schedule.source_activation == source.activation_digest()?
+                && schedule.target_epoch == Some(context.target_epoch()),
+            "key rotation differs from its durable proactive schedule"
+        );
+        Self::authenticate_selection_fallback_deadline(&schedule, &context)?;
+        let due_unix_ms = schedule.due_unix_ms.context("key rotation has no deadline")?;
+        anyhow::ensure!(
+            due_unix_ms != ACCEPTANCE_PROACTIVE_REFRESH_HELD_DUE_UNIX_MS
+                && now_unix_ms >= due_unix_ms,
+            "key rotation is not due yet"
+        );
+        self.record_acceptance_proactive_deadline_event(
+            schedule.source_epoch,
+            context.target_epoch(),
+            due_unix_ms,
+            now_unix_ms,
+        )
+        .await?;
+
+        // Receiver-key certification is terminal even though the proactive schedule must continue
+        // to name the source epoch until the successor AVSS activation is durable. In particular,
+        // a target-only joiner has no source reducer to retain as an in-memory terminal marker:
+        // finalization clears its advertisement outbox after registering the certificate. Never
+        // reconstruct advertisement authority from the now-certified candidate during that
+        // post-certificate/pre-activation interval or after a restart.
+        let already_certified = {
+            let rotations = self
+                .certified_key_rotations
+                .read()
+                .map_err(|_| anyhow::anyhow!("key-rotation registry lock is poisoned"))?;
+            if let Some(rotation) = rotations.get(&context.target_epoch()) {
+                anyhow::ensure!(
+                    rotation.context == context,
+                    "dynamic epoch is certified by another key-rotation decision"
+                );
+                true
+            } else {
+                false
+            }
+        };
+        if already_certified {
+            // Finalization publishes the durable registry before it clears a target-only
+            // advertiser. Cancellation at that await boundary must not leave stale signed
+            // advertisements live until restart (or wedge a later eligibility re-entry).
+            self.clear_matching_joining_key_rotation(&context).await;
+            return Ok(());
+        }
 
         if source_member.is_some() {
-            let existing_view = {
+            let existing = {
                 let live = self.key_rotation.lock().await;
                 if let Some(runtime) = live.as_ref() {
                     anyhow::ensure!(
                         runtime.round.context() == &context,
                         "another key-rotation round is still live"
                     );
-                    Some(runtime.round.view())
+                    Some((runtime.round.view(), runtime.round.certificate()))
                 } else {
                     None
                 }
             };
-            if let Some(view) = existing_view {
+            if let Some((view, certificate)) = existing {
                 let schedule = self
                     .proactive_refresh_schedule
                     .lock()
@@ -4670,6 +7654,13 @@ impl PartyServer {
                         KeyRotationPacemakerUpdate::PreserveExponent,
                     )
                     .await?;
+                }
+                if let Some(certificate) = certificate {
+                    // The round checkpoint precedes certificate registration and AVSS launch.
+                    // Cancellation at either later await leaves a terminal live reducer, so a
+                    // local due tick must finish that exact durable decision without requiring
+                    // another peer message or process restart.
+                    self.finalize_certified_key_rotation(context, certificate, true).await?;
                 }
                 return Ok(());
             }
@@ -4688,7 +7679,7 @@ impl PartyServer {
             Some(member) => Some(
                 self.protocol_store
                     .load_or_create_epoch_advertisement_identity(
-                        context.target_epoch(),
+                        &context,
                         &self.signing_seed,
                         member.signing_key,
                         &mut OsRng,
@@ -4736,10 +7727,27 @@ impl PartyServer {
                 }
                 LiveKeyRotation { round: stored.round, revision: stored.metadata.revision }
             } else {
-                let mut round = KeyRotationRound::new(context.clone(), self.party)?;
-                if let Some(capability) = target_capability.as_ref() {
-                    round.advertise(capability)?;
-                }
+                let round = KeyRotationRound::new(context.clone(), self.party)?;
+                let round = if let Some(capability) = target_capability {
+                    let blocking_permit = Arc::clone(&self.key_rotation_blocking_permits)
+                        .acquire_owned()
+                        .await
+                        .context("key-rotation blocking semaphore closed")?;
+                    let receiver_keys = Arc::clone(&self.receiver_keys);
+                    tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+                        let _blocking_permit = blocking_permit;
+                        let mut round = round;
+                        let receiver_keys = receiver_keys.read().map_err(|_| {
+                            anyhow::anyhow!("receiver-key accumulator lock is poisoned")
+                        })?;
+                        round.advertise(&capability, &receiver_keys)?;
+                        Ok(round)
+                    })
+                    .await
+                    .context("local key-rotation advertisement task failed")??
+                } else {
+                    round
+                };
                 let metadata = self
                     .protocol_store
                     .save_key_rotation_round(&context, 0, &round, &mut OsRng)
@@ -4752,15 +7760,13 @@ impl PartyServer {
             anyhow::ensure!(live.is_none(), "key-rotation start raced another local start");
             *live = Some(runtime);
         }
+        let initial_view = {
+            let live = self.key_rotation.lock().await;
+            live.as_ref().context("key rotation disappeared after start")?.round.view()
+        };
         self.persist_key_rotation_view_anchor(
             &context,
-            self.key_rotation
-                .lock()
-                .await
-                .as_ref()
-                .context("key rotation disappeared after start")?
-                .round
-                .view(),
+            initial_view,
             now_unix_ms,
             KeyRotationPacemakerUpdate::PreserveExponent,
         )
@@ -4771,20 +7777,82 @@ impl PartyServer {
         Ok(())
     }
 
+    async fn clear_matching_joining_key_rotation(&self, context: &KeyRotationContext) {
+        let mut joining = self.joining_key_rotation.lock().await;
+        if joining.as_ref().is_some_and(|pending| pending.context == *context) {
+            joining.take();
+        }
+    }
+
     async fn finalize_certified_key_rotation(
         self: &Arc<Self>,
         context: KeyRotationContext,
         certificate: KeyRotationCertificate,
         launch_avss: bool,
     ) -> anyhow::Result<()> {
-        let target = certificate.verify(&context)?;
+        let blocking_permit = Arc::clone(&self.key_rotation_blocking_permits)
+            .acquire_owned()
+            .await
+            .context("key-rotation blocking semaphore closed")?;
+        let verification_context = context.clone();
+        let verification_certificate = certificate.clone();
+        let target = tokio::task::spawn_blocking(move || {
+            let _blocking_permit = blocking_permit;
+            verification_certificate.verify(&verification_context)
+        })
+        .await
+        .context("key-rotation certificate verification task failed")??;
         self.protocol_store
             .save_key_rotation_certificate(&context, &certificate, &mut OsRng)
             .await?;
+        // The first valid representation is this node's canonical durable artifact. Concurrent
+        // honest collectors may supply another witness subset for the same decision; every
+        // destructive identity/reducer operation below must bind to the exact local artifact.
+        let certificate = self
+            .protocol_store
+            .load_key_rotation_certificate(&context)
+            .await?
+            .context("saved key-rotation certificate disappeared")?;
+        let blocking_permit = Arc::clone(&self.key_rotation_blocking_permits)
+            .acquire_owned()
+            .await
+            .context("key-rotation blocking semaphore closed")?;
+        let verification_context = context.clone();
+        let verification_certificate = certificate.clone();
+        let verified_durable = tokio::task::spawn_blocking(move || {
+            let _blocking_permit = blocking_permit;
+            verification_certificate.verify_rotation_certificate(&verification_context)
+        })
+        .await
+        .context("durable key-rotation certificate verification task failed")??;
+        let durable_target = verified_durable.target.clone();
+        anyhow::ensure!(
+            durable_target == target,
+            "durable key-rotation certificate proves another target"
+        );
+        let already_registered = {
+            let rotations = self
+                .certified_key_rotations
+                .read()
+                .map_err(|_| anyhow::anyhow!("key-rotation registry lock is poisoned"))?;
+            match rotations.get(&context.target_epoch()) {
+                Some(existing) => {
+                    anyhow::ensure!(
+                        existing.context == context
+                            && existing.target == durable_target
+                            && existing.receiver_keys == verified_durable.receiver_keys
+                            && existing.semantic_digest == verified_durable.semantic_digest(),
+                        "durable key-rotation certificate differs from its verified cache"
+                    );
+                    true
+                }
+                None => false,
+            }
+        };
         if let Ok(target_member) = target.member(self.party) {
             let candidate = self
                 .protocol_store
-                .load_or_create_epoch_identity_secret(context.target_epoch(), &mut OsRng)
+                .load_or_create_epoch_identity_secret(&context, &mut OsRng)
                 .await?;
             let promoted = self
                 .protocol_store
@@ -4801,14 +7869,15 @@ impl PartyServer {
                 target_member.encryption_key,
             )?;
             self.install_certified_or_matching_identity(context.target_epoch(), identity, true)?;
+        } else if context.target_policy().eligible().member(self.party).is_ok() {
+            self.protocol_store
+                .destroy_unselected_epoch_identity_secret(&context, &certificate)
+                .await?;
         }
-        self.register_certified_key_rotation(context.clone(), certificate)?;
-        {
-            let mut joining = self.joining_key_rotation.lock().await;
-            if joining.as_ref().is_some_and(|pending| pending.context == context) {
-                joining.take();
-            }
+        if !already_registered {
+            self.register_certified_key_rotation(context.clone(), certificate).await?;
         }
+        self.clear_matching_joining_key_rotation(&context).await;
 
         if !launch_avss || context.source().member(self.party).is_err() {
             return Ok(());
@@ -4827,7 +7896,12 @@ impl PartyServer {
             "certified AVSS target differs from receiver-key rotation"
         );
         if expected_avss_dealers(&transition).contains(&self.party) {
-            let already_started = self.avss.lock().await.contains_key(&transition.session);
+            let already_started = self
+                .avss
+                .lock()
+                .await
+                .get(&transition.session)
+                .is_some_and(|run| run.dealer_outbound.is_some());
             if !already_started {
                 let _ = avss_start(State(self.clone()), Json(AvssStartRequest { transition }))
                     .await
@@ -4850,6 +7924,7 @@ impl PartyServer {
         let Some(rotation) = rotation else {
             return Ok(());
         };
+        let _round_mutation = self.key_rotation_mutation.lock().await;
         anyhow::ensure!(
             rotation.target.digest() == activated.committee.digest(),
             "activated committee differs from its key-rotation certificate"
@@ -4868,11 +7943,25 @@ impl PartyServer {
             let mut live = self.key_rotation.lock().await;
             match live.as_ref() {
                 Some(runtime) if runtime.round.context() == &rotation.context => {
-                    anyhow::ensure!(
-                        runtime.round.certificate().as_ref() == Some(&rotation.certificate),
-                        "activated key rotation differs from the live reducer"
-                    );
+                    if let Some(round_certificate) = runtime.round.certificate() {
+                        anyhow::ensure!(
+                            round_certificate
+                                .proves_same_decision(&rotation.certificate, &rotation.context,)?,
+                            "activated key rotation differs from the live reducer"
+                        );
+                    }
                     live.take();
+                }
+                Some(runtime)
+                    if runtime.round.context().source().digest()
+                        == activated.committee.digest()
+                        && runtime.round.context().source_activation()
+                            == activated.activation_digest()? =>
+                {
+                    // A later progress tick may already have started this activated source's next
+                    // rotation after the old durable round was retired but before an idempotent
+                    // cleanup retry reached this in-memory check. Preserve that exact successor
+                    // runtime; it is evidence that the predecessor cleanup already linearized.
                 }
                 Some(_) => anyhow::bail!("another key-rotation round is live at activation"),
                 None => {}
@@ -4929,22 +8018,26 @@ impl PartyServer {
             .await
             .clone()
             .context("key rotation has no durable proactive schedule")?;
-        let source = if let Some(source) = self
-            .activations
-            .read()
-            .await
-            .get(&schedule.source_epoch)
-            .map(|activation| activation.public.clone())
+        // Cold history reads are stateless. Starting the one live durable pacemaker is the narrow
+        // exception: pin its exact source rotation/link and an already-certified immediate target
+        // so the existing live transition machinery can proceed. The source/immediate-target
+        // cap is enforced after registration and every later history CAS preserves only those
+        // schedule capabilities beside the authenticated current suffix.
+        let source_value = self.authenticated_live_schedule_source(schedule.source_epoch).await?;
+        if let Some(target_epoch) = schedule.target_epoch
+            && self.epoch_history.read().await.tip_epoch().is_some_and(|tip| tip >= target_epoch)
         {
-            source
-        } else {
-            self.deposit_targets
-                .read()
-                .await
-                .get(&schedule.source_epoch)
-                .cloned()
-                .context("key-rotation source activation is unavailable")?
-        };
+            let target_value = self.authenticated_epoch_activation(target_epoch, true).await?;
+            anyhow::ensure!(
+                target_value.value.epoch == target_epoch
+                    && target_value.value.public.key_id == source_value.public.key_id
+                    && target_value.value.public.group_key_bytes()
+                        == source_value.public.group_key_bytes(),
+                "scheduled certified target changes the threshold key"
+            );
+        }
+        self.retain_bounded_schedule_history_authority(&schedule).await?;
+        let source = source_value.public;
         anyhow::ensure!(
             source.activation_digest()? == schedule.source_activation,
             "key-rotation source differs from its durable schedule"
@@ -4958,37 +8051,74 @@ impl PartyServer {
         wire: KeyRotationWire,
         now_unix_ms: u64,
     ) -> anyhow::Result<()> {
-        if let KeyRotationWire::Certificate(certificate) = &wire {
-            let rotations = self
+        let preverified_certificate = if let KeyRotationWire::Certificate(certificate) = &wire {
+            let certified = self
                 .certified_key_rotations
                 .read()
                 .map_err(|_| anyhow::anyhow!("key-rotation registry lock is poisoned"))?
-                .values()
-                .cloned()
-                .collect::<Vec<_>>();
-            if rotations.iter().any(|rotation| {
-                rotation.certificate == *certificate
-                    && certificate.verify(&rotation.context).is_ok()
-            }) {
-                // Immutable certificate gossip remains idempotent after reducer retirement and
-                // across any number of later epoch activations.
-                return Ok(());
+                .get(&certificate.embedded_context().target_epoch())
+                .map(|rotation| (rotation.context.clone(), rotation.semantic_digest));
+            if let Some((certified_context, certified_semantic_digest)) = certified {
+                let blocking_permit =
+                    try_acquire_key_rotation_blocking_permit(&self.key_rotation_blocking_permits)?;
+                let verification_context = certified_context.clone();
+                let verification_certificate = certificate.clone();
+                let verified = tokio::task::spawn_blocking(move || {
+                    let _blocking_permit = blocking_permit;
+                    verification_certificate.verify_rotation_certificate(&verification_context)
+                })
+                .await
+                .context("cached key-rotation certificate comparison task failed")??;
+                if verified.semantic_digest() == certified_semantic_digest {
+                    // Independently assembled witness subsets for one immutable decision remain
+                    // idempotent after reducer retirement and across later epoch activations. Also
+                    // finish the registry-before-advertiser-cleanup cancellation cut using only
+                    // the already-authenticated local decision.
+                    self.clear_matching_joining_key_rotation(&certified_context).await;
+                    return Ok(());
+                }
+                Some((certified_context, verified))
+            } else {
+                None
             }
-        }
+        } else {
+            None
+        };
         let source = self.scheduled_key_rotation_source().await?;
+        // A source-only Retire can be cancelled after the successor schedule/history become
+        // durable but before its predecessor receiver-key reducer is closed. Repair that exact
+        // certified cut before admitting traffic for the scheduled successor. Source members
+        // that already started this source's live next round are preserved by the exact-successor
+        // check inside the cleanup helper.
+        self.retire_key_rotation_after_activation(&source).await?;
         let context = self
             .key_rotation_context_for_source(&source)?
             .context("active epoch does not admit receiver-key rotation")?;
-        let current_source_certificate = match &wire {
-            KeyRotationWire::Certificate(certificate) => {
-                anyhow::ensure!(
-                    context.is_participant(authenticated_party),
-                    "key-rotation certificate sender is not a transition participant"
-                );
-                certificate.verify(&context)?;
-                true
-            }
-            _ => false,
+        if let KeyRotationWire::Certificate(_) = &wire {
+            anyhow::ensure!(
+                context.is_participant(authenticated_party),
+                "key-rotation certificate sender is not a transition participant"
+            );
+        }
+        let verified_certificate = if let KeyRotationWire::Certificate(certificate) = &wire {
+            Some(match preverified_certificate {
+                Some((verified_context, verified)) if verified_context == context => verified,
+                _ => {
+                    let blocking_permit = try_acquire_key_rotation_blocking_permit(
+                        &self.key_rotation_blocking_permits,
+                    )?;
+                    let verification_context = context.clone();
+                    let verification_certificate = certificate.clone();
+                    tokio::task::spawn_blocking(move || {
+                        let _blocking_permit = blocking_permit;
+                        verification_certificate.verify_rotation_certificate(&verification_context)
+                    })
+                    .await
+                    .context("key-rotation certificate ingress task failed")??
+                }
+            })
+        } else {
+            None
         };
         let schedule = self
             .proactive_refresh_schedule
@@ -4997,54 +8127,141 @@ impl PartyServer {
             .clone()
             .context("key rotation has no durable proactive schedule")?;
         anyhow::ensure!(
-            schedule.source_epoch == source.committee.epoch
+            schedule.phase == ProactiveRefreshSchedulePhase::Armed
+                && schedule.source_epoch == source.committee.epoch
                 && schedule.source_activation == source.activation_digest()?
                 && schedule.target_epoch == Some(context.target_epoch()),
             "key rotation differs from its durable proactive schedule"
         );
+        Self::authenticate_selection_fallback_deadline(&schedule, &context)?;
         let due_unix_ms = schedule.due_unix_ms.context("key rotation has no deadline")?;
         anyhow::ensure!(
             due_unix_ms != ACCEPTANCE_PROACTIVE_REFRESH_HELD_DUE_UNIX_MS,
             "key rotation is not due yet: proactive refresh is held for exact-epoch acceptance"
         );
-        anyhow::ensure!(
-            current_source_certificate || now_unix_ms >= due_unix_ms,
-            "key rotation is not due yet"
-        );
+        anyhow::ensure!(now_unix_ms >= due_unix_ms, "key rotation is not due yet");
         if let KeyRotationWire::Certificate(certificate) = &wire {
-            return self.finalize_certified_key_rotation(context, certificate.clone(), true).await;
+            self.record_acceptance_proactive_deadline_event(
+                schedule.source_epoch,
+                context.target_epoch(),
+                due_unix_ms,
+                now_unix_ms,
+            )
+            .await?;
+            if context.source().member(self.party).is_err() {
+                // A target-only joiner owns no source-quorum reducer. It persists the first valid
+                // witness representation and treats later equivalent subsets semantically.
+                return self
+                    .finalize_certified_key_rotation(context, certificate.clone(), true)
+                    .await;
+            }
         }
         context.source().member(self.party)?;
         self.ensure_key_rotation_started(&source, now_unix_ms.max(due_unix_ms)).await?;
+        let round_mutation = Arc::clone(&self.key_rotation_mutation).lock_owned().await;
         let identity = self.identity(context.source().epoch)?;
-        let (certificate, entered_view) = {
-            let mut live = self.key_rotation.lock().await;
-            let runtime = live.as_mut().context("key rotation is not initialized")?;
+        let blocking_permit =
+            try_acquire_key_rotation_blocking_permit(&self.key_rotation_blocking_permits)?;
+        let runtime = {
+            let live = self.key_rotation.lock().await;
+            let runtime = live.as_ref().context("key rotation is not initialized")?;
             anyhow::ensure!(runtime.round.context() == &context, "key-rotation context changed");
-            let before = runtime.round.clone();
-            let before_view = before.view();
-            let step = runtime.round.handle_wire(authenticated_party, wire, &identity)?;
-            if runtime.round != before {
-                let revision =
-                    runtime.revision.checked_add(1).context("key-rotation revision exhausted")?;
-                if let Err(error) = self
-                    .protocol_store
-                    .save_key_rotation_round(&context, revision, &runtime.round, &mut OsRng)
-                    .await
-                {
-                    runtime.round = before;
-                    return Err(error.into());
-                }
-                runtime.revision = revision;
-            }
-            let entered_view =
-                (runtime.round.view() != before_view).then_some(runtime.round.view());
-            (step.committed.or_else(|| runtime.round.certificate()), entered_view)
+            runtime.clone()
         };
-        drop(identity);
+        let base_revision = runtime.revision;
+        let receiver_keys = Arc::clone(&self.receiver_keys);
+        let reduction_context = context.clone();
+        let (next_round, changed, certificate, entered_view, blocking_permit) =
+            tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+                let mut round = runtime.round;
+                let before_view = round.view();
+                let (step, received_certificate) = match wire {
+                    KeyRotationWire::Certificate(certificate) => {
+                        let verified = verified_certificate
+                            .as_ref()
+                            .context("verified key-rotation certificate disappeared")?;
+                        (
+                            round.handle_verified_certificate(
+                                authenticated_party,
+                                certificate.clone(),
+                                verified,
+                                identity.as_ref(),
+                            )?,
+                            Some(certificate),
+                        )
+                    }
+                    wire => {
+                        let receiver_keys = receiver_keys.read().map_err(|_| {
+                            anyhow::anyhow!("receiver-key accumulator lock is poisoned")
+                        })?;
+                        (
+                            round.handle_wire(
+                                authenticated_party,
+                                wire,
+                                identity.as_ref(),
+                                &receiver_keys,
+                            )?,
+                            None,
+                        )
+                    }
+                };
+                let entered_view = (round.view() != before_view).then_some(round.view());
+                let certificate =
+                    step.committed.or(received_certificate).or_else(|| round.certificate());
+                Ok((round, step.changed, certificate, entered_view, blocking_permit))
+            })
+            .await
+            .context("key-rotation reducer task failed")??;
+        if changed {
+            let revision =
+                base_revision.checked_add(1).context("key-rotation revision exhausted")?;
+            let server = Arc::clone(self);
+            let persistence_context = reduction_context.clone();
+            tokio::spawn(async move {
+                let _round_mutation = round_mutation;
+                let _blocking_permit = blocking_permit;
+                let metadata = server
+                    .protocol_store
+                    .save_key_rotation_round(
+                        &persistence_context,
+                        revision,
+                        &next_round,
+                        &mut OsRng,
+                    )
+                    .await?;
+                anyhow::ensure!(
+                    metadata.revision == revision,
+                    "key-rotation durable CAS returned another revision"
+                );
+                // This task is detached from the request future: if the caller is cancelled after
+                // the durable CAS, publication still completes while the process remains live.
+                let mut live = server.key_rotation.lock().await;
+                let runtime =
+                    live.as_mut().context("key rotation disappeared after durable CAS")?;
+                anyhow::ensure!(
+                    runtime.round.context() == &persistence_context,
+                    "key-rotation context changed during durable CAS"
+                );
+                if runtime.revision == base_revision {
+                    runtime.round = next_round;
+                    runtime.revision = revision;
+                } else {
+                    anyhow::ensure!(
+                        runtime.revision == revision && runtime.round == next_round,
+                        "key-rotation runtime raced another durable reducer transition"
+                    );
+                }
+                Ok::<_, anyhow::Error>(())
+            })
+            .await
+            .context("key-rotation durable publication task failed")??;
+        } else {
+            drop(blocking_permit);
+            drop(round_mutation);
+        }
         if let Some(view) = entered_view {
             self.persist_key_rotation_view_anchor(
-                &context,
+                &reduction_context,
                 view,
                 now_unix_ms,
                 KeyRotationPacemakerUpdate::PreserveExponent,
@@ -5052,7 +8269,7 @@ impl PartyServer {
             .await?;
         }
         if let Some(certificate) = certificate {
-            self.finalize_certified_key_rotation(context, certificate, true).await?;
+            self.finalize_certified_key_rotation(reduction_context, certificate, true).await?;
         }
         Ok(())
     }
@@ -5073,7 +8290,7 @@ impl PartyServer {
         // Peer dispatch spans every protocol reducer and consequently has a large concrete
         // future. Erase that storage here so neither an inbound QUIC task nor durable loopback
         // relay embeds the entire dispatch state machine in its own worker-stack poll path.
-        match Box::pin(self.dispatch_peer_request(authenticated_party, request, false)).await {
+        match self.boxed_dispatch_peer_request(authenticated_party, request, false).await {
             Ok(body) => PeerResponse::Success { body },
             Err(error) => quic_peer_rejection(error),
         }
@@ -5083,11 +8300,24 @@ impl PartyServer {
         self.authenticated_quic_responses.fetch_add(1, Ordering::AcqRel);
     }
 
-    /// Apply one durable loopback effect without manufacturing a network identity. Only AVSS and
-    /// QUAL messages whose signed inner sender is this party are accepted. Keeping this path
-    /// separate from [`Self::handle_quic_peer_request`] prevents a transport bug from treating a
-    /// self-issued message as evidence of a mutually authenticated remote connection.
+    /// Apply one durable loopback effect without manufacturing a network identity.
+    ///
+    /// Deposit checkpoint broadcast deliberately excludes the local party. Rejecting that family
+    /// here preserves the invariant that every checkpoint request crossed QUIC's per-peer body and
+    /// endpoint-wide fair mutation admission. Other protocol-generated loopback families, including
+    /// certified deposit state transfer, retain their typed local paths.
     pub async fn handle_local_peer_request(self: &Arc<Self>, request: PeerRequest) -> PeerResponse {
+        if matches!(
+            &request,
+            PeerRequest::Deposit { operation, .. }
+                if is_deposit_checkpoint_operation(*operation)
+        ) {
+            return PeerResponse::Rejected {
+                code: RejectionCode::InvalidRequest,
+                retryable: false,
+                message: LOCAL_DEPOSIT_CHECKPOINT_REJECTION.to_owned(),
+            };
+        }
         if matches!(
             request,
             PeerRequest::Epoch { operation: EpochOperation::Activate | EpochOperation::Retire, .. }
@@ -5098,7 +8328,7 @@ impl PartyServer {
                 message: "epoch loopback requests are not enabled".to_owned(),
             };
         }
-        match Box::pin(self.dispatch_peer_request(self.party, request, true)).await {
+        match self.boxed_dispatch_peer_request(self.party, request, true).await {
             Ok(body) => PeerResponse::Success { body },
             Err(error) => quic_peer_rejection(error),
         }
@@ -5139,9 +8369,45 @@ impl PartyServer {
                 .await
             }
             PeerRequest::Deposit { operation, body } => {
-                Box::pin(self.dispatch_deposit_peer_request(authenticated_party, operation, body))
-                    .await
+                self.boxed_dispatch_deposit_peer_request(authenticated_party, operation, body).await
             }
+        }
+    }
+
+    fn boxed_dispatch_peer_request<'a>(
+        self: &'a Arc<Self>,
+        authenticated_party: PartyId,
+        request: PeerRequest,
+        allow_local: bool,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<Vec<u8>>> + Send + 'a>>
+    {
+        Box::pin(self.dispatch_peer_request(authenticated_party, request, allow_local))
+    }
+
+    fn boxed_dispatch_deposit_peer_request<'a>(
+        self: &'a Arc<Self>,
+        authenticated_party: PartyId,
+        operation: DepositOperation,
+        body: Vec<u8>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<Vec<u8>>> + Send + 'a>>
+    {
+        if matches!(
+            operation,
+            DepositOperation::SyncHead
+                | DepositOperation::SyncObjects
+                | DepositOperation::SyncRelease
+                | DepositOperation::PrefixSupportStart
+                | DepositOperation::PrefixSupportContinue
+        ) {
+            Box::pin(self.dispatch_deposit_sync_peer_request(authenticated_party, operation, body))
+        } else if is_deposit_checkpoint_operation(operation) {
+            Box::pin(self.dispatch_deposit_checkpoint_peer_request(
+                authenticated_party,
+                operation,
+                body,
+            ))
+        } else {
+            Box::pin(self.dispatch_deposit_peer_request(authenticated_party, operation, body))
         }
     }
 
@@ -5251,85 +8517,313 @@ impl PartyServer {
         Ok(Vec::new())
     }
 
-    async fn dispatch_deposit_peer_request(
+    /// Serve the hot compact-sync family without polling the much larger mutating deposit
+    /// dispatcher. Keeping this as a distinct coroutine is operationally significant in debug
+    /// builds: the generic dispatcher's largest reducer fixes its poll frame at several MiB even
+    /// when the selected operation is a small read. The non-async boxing shim above selects this
+    /// future before either coroutine is constructed in its caller's frame.
+    async fn dispatch_deposit_sync_peer_request(
         self: &Arc<Self>,
         authenticated_party: PartyId,
         operation: DepositOperation,
         body: Vec<u8>,
     ) -> anyhow::Result<Vec<u8>> {
         let deposit = self.deposit.as_ref().context("deposit wallet service is not enabled")?;
-        Box::pin(self.ensure_deposit_initialized()).await?;
-        let mut response_body = Vec::new();
+        if operation == DepositOperation::SyncRelease {
+            let (request, acknowledgement) =
+                deposit.release_deposit_sync_source_pin(authenticated_party, &body).await?;
+            return Ok(acknowledgement.to_bytes(request)?);
+        }
+        anyhow::ensure!(
+            matches!(
+                operation,
+                DepositOperation::SyncHead
+                    | DepositOperation::SyncObjects
+                    | DepositOperation::PrefixSupportStart
+                    | DepositOperation::PrefixSupportContinue
+            ),
+            "non-sync deposit operation reached the compact-sync dispatcher"
+        );
+        anyhow::ensure!(
+            self.deposit_sync_state_read_authorized(authenticated_party)
+                .await
+                .map_err(retryable_local_deposit_sync_error)?,
+            "authenticated peer is not in the current deposit committee"
+        );
+        let deposit_epoch = deposit.active_epoch().await?;
+        let certified_tip = self
+            .epoch_history
+            .read()
+            .await
+            .tip_epoch()
+            .context("deposit ingress requires certified activation history")?;
+        anyhow::ensure!(
+            deposit_epoch <= certified_tip,
+            "deposit registry is ahead of certified activation history"
+        );
+
         match operation {
-            DepositOperation::Allocate => {
-                let wire: DepositAllocateWire = decode_canonical_postcard(&body)?;
-                anyhow::ensure!(
-                    matches!(&wire.statement.payload, LedgerPayload::Allocation(_)),
-                    "deposit operation differs from its statement payload"
-                );
-                let identity = self.identity(wire.statement.issuer_epoch)?;
-                deposit
-                    .handle_allocate(authenticated_party, wire, unix_time_seconds()?, &identity)
-                    .await?;
+            DepositOperation::SyncHead => {
+                let request =
+                    DepositSyncHeadRequest::from_bytes(self.party, authenticated_party, &body)?;
+                if let Some(response) = deposit
+                    .pinned_deposit_sync_head_response(authenticated_party, request)
+                    .await
+                    .map_err(retryable_local_deposit_sync_read)?
+                {
+                    return Ok(response.to_bytes(request)?);
+                }
+                let advertisement = deposit
+                    .deposit_sync_advertisement(request.context())
+                    .await
+                    .map_err(retryable_local_deposit_sync_read)?;
+                let target = self.verified_deposit_sync_target(&advertisement).await?;
+                let response = deposit
+                    .deposit_sync_head_response(authenticated_party, request, &target)
+                    .await
+                    .map_err(retryable_local_deposit_sync_read)?;
+                Ok(response.to_bytes(request)?)
             }
-            DepositOperation::Handoff | DepositOperation::ConsolidationCompletion => {
-                let wire: DepositAllocateWire = decode_canonical_postcard(&body)?;
-                anyhow::ensure!(
-                    matches!(
-                        (operation, &wire.statement.payload),
-                        (DepositOperation::Handoff, LedgerPayload::HandoffFence(_))
-                            | (DepositOperation::Handoff, LedgerPayload::Handoff(_))
-                            | (
-                                DepositOperation::ConsolidationCompletion,
-                                LedgerPayload::ConsolidationCompletion(_)
-                            )
-                            | (
-                                DepositOperation::ConsolidationCompletion,
-                                LedgerPayload::ConsolidationAbandonment(_)
-                            )
-                            | (
-                                DepositOperation::ConsolidationCompletion,
-                                LedgerPayload::LateConsolidationSettlement(_)
-                            )
-                    ),
-                    "deposit operation differs from its statement payload"
-                );
-                let identity = self.identity(wire.statement.issuer_epoch)?;
-                let transition = self.consolidation_transition.lock().await;
-                deposit
-                    .handle_allocate(authenticated_party, wire, unix_time_seconds()?, &identity)
-                    .await?;
-                self.restore_consolidation_session_closures(&transition, deposit).await?;
+            DepositOperation::SyncObjects => {
+                let context = DepositSyncObjectPageRequest::context_from_bytes(&body)?;
+                let request = deposit.decode_deposit_sync_object_request(
+                    authenticated_party,
+                    context,
+                    &body,
+                )?;
+                let page =
+                    deposit.serve_deposit_sync_objects(authenticated_party, &request).await?;
+                Ok(page.to_bytes(&request)?)
             }
-            DepositOperation::Attest => {
+            DepositOperation::PrefixSupportStart => {
+                let start = DepositSyncPrefixSupportStart::from_bytes(&body)?;
+                let epoch = start.request().statement().active_epoch();
+                let target = self.verified_current_deposit_sync_target(epoch).await?;
+                let identity = self.identity(epoch)?;
+                let progress = deposit
+                    .handle_prefix_support_start(
+                        authenticated_party,
+                        &start,
+                        &target,
+                        identity.as_ref(),
+                    )
+                    .await?;
+                Ok(progress.to_bytes()?)
+            }
+            DepositOperation::PrefixSupportContinue => {
+                let continuation = DepositSyncPrefixSupportContinue::from_bytes(&body)?;
+                let epoch = deposit.active_epoch().await?;
+                let target = self.verified_current_deposit_sync_target(epoch).await?;
+                let identity = self.identity(epoch)?;
+                let progress = deposit
+                    .handle_prefix_support_continue(
+                        authenticated_party,
+                        continuation,
+                        &target,
+                        identity.as_ref(),
+                    )
+                    .await?;
+                Ok(progress.to_bytes()?)
+            }
+            DepositOperation::SyncRelease => {
+                unreachable!("handled by the storage-only release path before initialization")
+            }
+            _ => unreachable!("operation family was checked before compact-sync dispatch"),
+        }
+    }
+
+    /// Return whether one operation may still close an obligation owned by the lagging source
+    /// registry after its authenticated successor activation has become certified.
+    ///
+    /// This is intentionally a pure route policy. The service remains responsible for checking
+    /// the operation's exact issuer window and its durable handoff state; in particular, a
+    /// `ClientRequest` reaches that check only after the dispatcher has reconciled the certified
+    /// successor and therefore pinned `pending_handoff`.
+    const fn lagging_deposit_source_operation_allowed(operation: DepositOperation) -> bool {
+        matches!(
+            operation,
+            DepositOperation::Attest
+                | DepositOperation::Certificate
+                | DepositOperation::DepositObservation
+                | DepositOperation::DepositObservationAttest
+                | DepositOperation::DepositObservationCertificate
+                | DepositOperation::IndexCheckpointAttest
+                | DepositOperation::IndexCheckpointCertificate
+                | DepositOperation::DepositObservationIndexCheckpointAttest
+                | DepositOperation::DepositObservationIndexCheckpointCertificate
+                | DepositOperation::ClientRequest
+                | DepositOperation::ConsensusProposal
+                | DepositOperation::ConsensusMessage
+                | DepositOperation::ConsensusCertificate
+                | DepositOperation::Consolidation
+                | DepositOperation::ConsolidationAbandonment
+                | DepositOperation::PostHandoffExportSealRequest
+                | DepositOperation::PostHandoffExportSealVote
+                | DepositOperation::PostHandoffExportSealCertificate
+                | DepositOperation::ExportHead
+                | DepositOperation::ExportObjects
+                | DepositOperation::ExportRelease
+                | DepositOperation::StateImportedAck
+                | DepositOperation::StateImportedCertificate
+        )
+    }
+
+    /// Enforce the certified-epoch fence shared by every initialized mutating deposit reducer.
+    async fn validate_deposit_peer_operation_epoch(
+        &self,
+        deposit: &DepositService,
+        operation: DepositOperation,
+    ) -> anyhow::Result<()> {
+        let deposit_epoch = deposit.active_epoch().await?;
+        let certified_tip = self
+            .epoch_history
+            .read()
+            .await
+            .tip_epoch()
+            .context("deposit ingress requires certified activation history")?;
+        anyhow::ensure!(
+            deposit_epoch <= certified_tip,
+            "deposit registry is ahead of certified activation history"
+        );
+        if deposit_epoch != certified_tip {
+            anyhow::ensure!(
+                Self::lagging_deposit_source_operation_allowed(operation),
+                "deposit registry has not reached the active certified signing epoch"
+            );
+        }
+        Ok(())
+    }
+
+    /// Drive the archive/checkpoint protocol without embedding unrelated consolidation and state
+    /// transfer reducers in every poll. This family is the sustained deposit-allocation hot path.
+    async fn apply_deposit_checkpoint_peer_request(
+        self: &Arc<Self>,
+        deposit: &DepositService,
+        _transition: &tokio::sync::MutexGuard<'_, ()>,
+        authenticated_party: PartyId,
+        operation: DepositOperation,
+        body: Vec<u8>,
+    ) -> anyhow::Result<()> {
+        // Ingress may recover an existing runtime under the shared fence, but it never performs
+        // genesis preparation. The autonomous pacemaker owns that potentially blocking Monero
+        // RPC outside the fence.
+        deposit.active_epoch().await?;
+        self.boxed_ensure_deposit_initialized().await?;
+        // Certified activation is also a durable ingress fence. Reconcile it before validating or
+        // applying the body so even an otherwise valid old-epoch ClientRequest observes the
+        // service's persisted `pending_handoff` marker and cannot race fresh allocation ingress.
+        self.boxed_reconcile_deposit_targets_allow_gap().await?;
+        self.validate_deposit_peer_operation_epoch(deposit, operation).await?;
+        self.boxed_apply_deposit_checkpoint_peer_operation(
+            deposit,
+            authenticated_party,
+            operation,
+            body,
+        )
+        .await
+    }
+
+    fn boxed_apply_deposit_checkpoint_peer_request<'a>(
+        self: &'a Arc<Self>,
+        deposit: &'a DepositService,
+        transition: &'a tokio::sync::MutexGuard<'_, ()>,
+        authenticated_party: PartyId,
+        operation: DepositOperation,
+        body: Vec<u8>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + Send + 'a>> {
+        Box::pin(self.apply_deposit_checkpoint_peer_request(
+            deposit,
+            transition,
+            authenticated_party,
+            operation,
+            body,
+        ))
+    }
+
+    async fn dispatch_deposit_checkpoint_peer_request(
+        self: &Arc<Self>,
+        authenticated_party: PartyId,
+        operation: DepositOperation,
+        body: Vec<u8>,
+    ) -> anyhow::Result<Vec<u8>> {
+        let deposit = self.deposit.as_ref().context("deposit wallet service is not enabled")?;
+        // A checkpoint cannot release a certified state-transfer fence. Reject it before joining
+        // the transition queue so it cannot occupy QUIC's sole mutation turn while an intentionally
+        // cold runtime performs storage reauthentication for every retry.
+        if !deposit.local_runtime_ready() {
+            return Err(DepositServiceError::ColdImportAwaitingCertificate.into());
+        }
+        // Every operation in this family mutates the same durable wallet snapshot. QUIC admits
+        // only a complete authenticated body, bounds the queue to one body per fixed peer and by
+        // weighted body memory, then fairly serializes endpoint-wide mutation execution. Await
+        // this finite local transition turn as the second serialization tier: fail-fast retry can
+        // remain phase-locked with the pacemaker forever and starve a durable checkpoint. Hold
+        // the established global lock order through the complete durable boundary. An admitted
+        // reducer is never cancelled ambiguously.
+        let transition = self.consolidation_transition.lock().await;
+        // Activation or state-transfer publication may have closed readiness while this request
+        // waited for the transition turn. Recheck under the fence before any initialization,
+        // recovery, body reduction, or post-mutation reconciliation can run.
+        if !deposit.local_runtime_ready() {
+            return Err(DepositServiceError::ColdImportAwaitingCertificate.into());
+        }
+        let mutation = self
+            .boxed_apply_deposit_checkpoint_peer_request(
+                deposit,
+                &transition,
+                authenticated_party,
+                operation,
+                body,
+            )
+            .await;
+        // The pre-dispatch reconciliation above is the safety/epoch fence. Success here means the
+        // requested reducer effect crossed its own durable readback boundary; successor
+        // reconciliation is independent liveness work retried before and after every allocation
+        // pacemaker turn. Keeping it out of this response path prevents accepted requests from
+        // receiving a late negative ACK or waiting behind an unrelated handoff continuation.
+        self.finish_deposit_runtime_mutation(&transition, deposit, mutation).await?;
+        Ok(Vec::new())
+    }
+
+    /// Select the exact checkpoint reducer before constructing its coroutine. Each match arm is a
+    /// distinct heap-erased future, so a small ClientRequest or Attest poll no longer reserves the
+    /// sum of every ledger, observation, checkpoint, consolidation, and transfer reducer frame.
+    fn boxed_apply_deposit_checkpoint_peer_operation<'a>(
+        self: &'a Arc<Self>,
+        deposit: &'a DepositService,
+        authenticated_party: PartyId,
+        operation: DepositOperation,
+        body: Vec<u8>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + Send + 'a>> {
+        match operation {
+            DepositOperation::Attest => Box::pin(async move {
                 let wire: DepositAttestationWire = decode_canonical_postcard(&body)?;
-                let identity = self.identity(wire.statement.issuer_epoch)?;
-                let transition = self.consolidation_transition.lock().await;
+                let identity = self.deposit_consensus_signer(wire.statement.issuer_epoch).await?;
                 deposit
                     .handle_attestation(
                         authenticated_party,
                         wire,
                         identity.as_ref(),
-                        unix_time_seconds()?,
+                        self.deposit_clock_sample()?.unix_seconds,
                     )
                     .await?;
-                self.restore_consolidation_session_closures(&transition, deposit).await?;
-            }
-            DepositOperation::Certificate => {
+                Ok(())
+            }),
+            DepositOperation::Certificate => Box::pin(async move {
                 let wire: DepositCertificateWire = decode_canonical_postcard(&body)?;
-                let identity = self.identity(wire.entry.statement.issuer_epoch)?;
-                let transition = self.consolidation_transition.lock().await;
+                let identity =
+                    self.deposit_consensus_signer(wire.entry.statement.issuer_epoch).await?;
                 deposit
                     .handle_certificate(
                         authenticated_party,
                         wire,
                         identity.as_ref(),
-                        unix_time_seconds()?,
+                        self.deposit_clock_sample()?.unix_seconds,
                     )
                     .await?;
-                self.restore_consolidation_session_closures(&transition, deposit).await?;
-            }
-            DepositOperation::DepositObservation => {
+                Ok(())
+            }),
+            DepositOperation::DepositObservation => Box::pin(async move {
                 let wire: DepositObservationWire = decode_canonical_postcard(&body)?;
                 let identity = self.identity(wire.statement.issuer_epoch())?;
                 deposit
@@ -5337,11 +8831,12 @@ impl PartyServer {
                         authenticated_party,
                         wire,
                         identity.as_ref(),
-                        unix_time_seconds()?,
+                        self.deposit_clock_sample()?.unix_seconds,
                     )
                     .await?;
-            }
-            DepositOperation::DepositObservationAttest => {
+                Ok(())
+            }),
+            DepositOperation::DepositObservationAttest => Box::pin(async move {
                 let wire: DepositObservationAttestationWire = decode_canonical_postcard(&body)?;
                 let identity = self.identity(wire.statement.issuer_epoch())?;
                 deposit
@@ -5349,79 +8844,386 @@ impl PartyServer {
                         authenticated_party,
                         wire,
                         identity.as_ref(),
-                        unix_time_seconds()?,
+                        self.deposit_clock_sample()?.unix_seconds,
                     )
                     .await?;
-            }
-            DepositOperation::DepositObservationCertificate => {
+                Ok(())
+            }),
+            DepositOperation::DepositObservationCertificate => Box::pin(async move {
                 let wire: DepositObservationCertificateWire = decode_canonical_postcard(&body)?;
-                let identity = self.identity(wire.observation.statement.issuer_epoch())?;
+                let identity = self
+                    .deposit_consensus_signer(wire.observation.statement.issuer_epoch())
+                    .await?;
                 deposit
                     .handle_deposit_observation_certificate(
                         authenticated_party,
                         wire,
                         identity.as_ref(),
-                        unix_time_seconds()?,
+                        self.deposit_clock_sample()?.unix_seconds,
                     )
                     .await?;
-            }
-            DepositOperation::IndexCheckpointAttest => {
+                Ok(())
+            }),
+            DepositOperation::IndexCheckpointAttest => Box::pin(async move {
                 let wire = DepositIndexCheckpointAttestWire::from_bytes(&body)?;
-                let identity = self.identity(wire.statement().context().epoch())?;
+                let identity =
+                    self.deposit_consensus_signer(wire.statement().context().epoch()).await?;
                 deposit
                     .handle_index_checkpoint_attest(
                         authenticated_party,
                         wire,
                         identity.as_ref(),
-                        unix_time_seconds()?,
+                        self.deposit_clock_sample()?.unix_seconds,
                     )
                     .await?;
-            }
-            DepositOperation::IndexCheckpointCertificate => {
+                Ok(())
+            }),
+            DepositOperation::IndexCheckpointCertificate => Box::pin(async move {
                 let wire = DepositIndexCheckpointCertificateWire::from_bytes(&body)?;
                 deposit
                     .handle_index_checkpoint_certificate(
                         authenticated_party,
                         wire,
-                        unix_time_seconds()?,
+                        self.deposit_clock_sample()?.unix_seconds,
                     )
                     .await?;
-            }
-            DepositOperation::DepositObservationIndexCheckpointAttest => {
+                Ok(())
+            }),
+            DepositOperation::DepositObservationIndexCheckpointAttest => Box::pin(async move {
                 let wire = DepositObservationIndexCheckpointAttestWire::from_bytes(&body)?;
-                let identity = self.identity(wire.statement().context().epoch())?;
+                let identity =
+                    self.deposit_consensus_signer(wire.statement().context().epoch()).await?;
                 deposit
                     .handle_deposit_observation_index_checkpoint_attest(
                         authenticated_party,
                         wire,
                         identity.as_ref(),
-                        unix_time_seconds()?,
+                        self.deposit_clock_sample()?.unix_seconds,
                     )
                     .await?;
-            }
+                Ok(())
+            }),
             DepositOperation::DepositObservationIndexCheckpointCertificate => {
-                let wire = DepositObservationIndexCheckpointCertificateWire::from_bytes(&body)?;
+                Box::pin(async move {
+                    let wire = DepositObservationIndexCheckpointCertificateWire::from_bytes(&body)?;
+                    deposit
+                        .handle_deposit_observation_index_checkpoint_certificate(
+                            authenticated_party,
+                            wire,
+                            self.deposit_clock_sample()?.unix_seconds,
+                        )
+                        .await?;
+                    Ok(())
+                })
+            }
+            DepositOperation::ClientRequest => Box::pin(async move {
+                let wire: DepositClientRequestWire = decode_canonical_postcard(&body)?;
+                let epoch = deposit.active_epoch().await?;
                 deposit
-                    .handle_deposit_observation_index_checkpoint_certificate(
+                    .handle_client_request(
                         authenticated_party,
                         wire,
-                        unix_time_seconds()?,
+                        self.deposit_clock_sample()?.unix_millis,
+                        self.identity(epoch)?.as_ref(),
                     )
                     .await?;
-            }
-            DepositOperation::SyncHead => {
-                let request = DepositSyncHeadRequest::from_bytes(&body)?;
-                let advertisement = deposit.deposit_sync_advertisement(request.context()).await?;
-                response_body = advertisement.to_bytes(request)?;
-            }
-            DepositOperation::SyncObjects => {
-                let context = DepositSyncObjectPageRequest::context_from_bytes(&body)?;
-                let advertisement = deposit.deposit_sync_advertisement(context).await?;
-                let request = DepositSyncObjectPageRequest::from_bytes(&advertisement, &body)?;
-                let page = deposit
-                    .serve_deposit_sync_objects(authenticated_party, &advertisement, &request)
+                Ok(())
+            }),
+            operation @ (DepositOperation::ConsensusProposal
+            | DepositOperation::ConsensusMessage
+            | DepositOperation::ConsensusCertificate) => Box::pin(async move {
+                let wire: DepositConsensusWire = decode_canonical_postcard(&body)?;
+                let epoch = deposit.active_epoch().await?;
+                let identity = self.deposit_consensus_signer(epoch).await?;
+                deposit
+                    .handle_consensus(
+                        authenticated_party,
+                        operation,
+                        wire,
+                        self.deposit_clock_sample()?.unix_millis,
+                        identity.as_ref(),
+                    )
                     .await?;
-                response_body = page.to_bytes(&request, &advertisement)?;
+                Ok(())
+            }),
+            _ => Box::pin(async move {
+                anyhow::bail!("non-checkpoint operation reached the checkpoint dispatcher")
+            }),
+        }
+    }
+
+    async fn dispatch_deposit_peer_request(
+        self: &Arc<Self>,
+        authenticated_party: PartyId,
+        operation: DepositOperation,
+        body: Vec<u8>,
+    ) -> anyhow::Result<Vec<u8>> {
+        let deposit = self.deposit.as_ref().context("deposit wallet service is not enabled")?;
+        if operation == DepositOperation::ExportRelease {
+            let (request, acknowledgement) =
+                deposit.release_deposit_state_export_source_pin(authenticated_party, &body).await?;
+            return Ok(acknowledgement.to_bytes(request)?);
+        }
+        if operation == DepositOperation::ExportObjects {
+            // An exact requester lease and its per-object capabilities remain the authority after
+            // either endpoint leaves the live committee. Keep immutable historical reads
+            // available while runtime recovery is closed; the service reauthenticates the MAC,
+            // active source pin, and every requested object before returning a bounded page.
+            let request =
+                deposit.decode_deposit_state_export_objects_request(authenticated_party, &body)?;
+            let page =
+                deposit.serve_deposit_state_export_objects(authenticated_party, &request).await?;
+            return Ok(page.to_bytes(&request)?);
+        }
+        if operation == DepositOperation::PostHandoffExportSealCertificate {
+            // A target-only party may receive its old-quorum seal before a wallet runtime exists.
+            // Persist the exact cold download intent before acknowledging it. An overlap party
+            // must take the live path below because it also owes the predecessor retention effect.
+            let delivery = DepositPostHandoffExportSealCertificateDelivery::from_bytes(
+                authenticated_party,
+                self.party,
+                &body,
+            )?;
+            let target_epoch = delivery.certificate().statement().target_epoch();
+            let epochs = self.authenticated_pre_import_deposit_epochs(target_epoch).await?;
+            let local_deposit_epoch = match deposit.active_epoch().await {
+                Ok(epoch) => Some(epoch),
+                Err(DepositServiceError::NotInitialized) => None,
+                Err(error) => return Err(error.into()),
+            };
+            if epochs.source().committee.member(self.party).is_err()
+                && local_deposit_epoch != Some(target_epoch)
+            {
+                anyhow::ensure!(
+                    Self::deposit_state_transfer_route_authorized(
+                        self.party,
+                        authenticated_party,
+                        operation,
+                        &epochs.source().committee,
+                        epochs.target_capability().committee(),
+                    ),
+                    "authenticated peer is not authorized for this cold deposit state transfer"
+                );
+                let seal = deposit.authenticate_preimport_deposit_state_export_seal(
+                    &epochs,
+                    delivery.certificate(),
+                )?;
+                delivery.validate_pre_import_verified_seal(&seal)?;
+                let _request = self
+                    .deposit_sync_spools
+                    .record_pre_import_certified_export_intent(&seal, epochs.target_capability())
+                    .await?;
+                let acknowledgement = DepositPostHandoffExportSealCertificateAck::issue(&delivery)?;
+                return Ok(acknowledgement.to_bytes(&delivery)?);
+            }
+            // Readiness does not select this path. A target-only joiner can have a perfectly live
+            // older (for example epoch-zero) replica, while an overlap party deliberately has
+            // readiness closed during its current import/export fences. Only a body-selected
+            // target epoch absent from a non-source replica is cold. Every source member, and a
+            // target whose local registry already reached this epoch, executes the full reducer
+            // below so duplicate delivery remains idempotent after adoption.
+        }
+        Box::pin(self.ensure_deposit_initialized()).await?;
+        // Deposit genesis can finish concurrently with a certified epoch activation. Fence a
+        // newly published predecessor runtime before accepting any fresh mutating reducer input;
+        // otherwise an old-epoch proposal could enter between the activation's readiness probe
+        // and the first deposit pacemaker tick. Sync reads use their dedicated small dispatcher
+        // and remain available while the terminal handoff catches up.
+        self.validate_deposit_peer_operation_epoch(deposit, operation).await?;
+        let mut response_body = Vec::new();
+        match operation {
+            DepositOperation::Attest
+            | DepositOperation::Certificate
+            | DepositOperation::DepositObservation
+            | DepositOperation::DepositObservationAttest
+            | DepositOperation::DepositObservationCertificate
+            | DepositOperation::IndexCheckpointAttest
+            | DepositOperation::IndexCheckpointCertificate
+            | DepositOperation::DepositObservationIndexCheckpointAttest
+            | DepositOperation::DepositObservationIndexCheckpointCertificate
+            | DepositOperation::ClientRequest
+            | DepositOperation::ConsensusProposal
+            | DepositOperation::ConsensusMessage
+            | DepositOperation::ConsensusCertificate => {
+                unreachable!("checkpoint operation bypassed its dedicated dispatcher")
+            }
+            DepositOperation::SyncHead
+            | DepositOperation::SyncObjects
+            | DepositOperation::SyncRelease
+            | DepositOperation::PrefixSupportStart
+            | DepositOperation::PrefixSupportContinue => {
+                unreachable!("compact-sync operation bypassed its dedicated dispatcher")
+            }
+            DepositOperation::PostHandoffExportSealRequest => {
+                let transfer = self.authenticated_current_deposit_state_transfer().await?;
+                self.require_deposit_state_transfer_route(
+                    authenticated_party,
+                    operation,
+                    &transfer,
+                )?;
+                let signer = self.deposit_signer(transfer.source().active_epoch()).await?;
+                let receipt = deposit
+                    .accept_post_handoff_export_seal_request(
+                        &transfer,
+                        authenticated_party,
+                        &body,
+                        signer.as_ref(),
+                    )
+                    .await?;
+                response_body = receipt.acknowledgement_bytes()?;
+            }
+            DepositOperation::PostHandoffExportSealVote => {
+                let transfer = self.authenticated_current_deposit_state_transfer().await?;
+                self.require_deposit_state_transfer_route(
+                    authenticated_party,
+                    operation,
+                    &transfer,
+                )?;
+                let signer = self.deposit_signer(transfer.source().active_epoch()).await?;
+                let recorded = deposit
+                    .record_post_handoff_export_seal_vote(
+                        &transfer,
+                        signer.as_ref(),
+                        authenticated_party,
+                        &body,
+                    )
+                    .await?;
+                response_body = recorded.acknowledgement_bytes()?;
+            }
+            DepositOperation::PostHandoffExportSealCertificate => {
+                let transfer = self.authenticated_current_deposit_state_transfer().await?;
+                self.require_deposit_state_transfer_route(
+                    authenticated_party,
+                    operation,
+                    &transfer,
+                )?;
+                let signer_epoch =
+                    if transfer.source().active().committee().member(self.party).is_ok() {
+                        transfer.source().active_epoch()
+                    } else {
+                        transfer.target().committee().epoch
+                    };
+                let signer = self.deposit_signer(signer_epoch).await?;
+                let installed = deposit
+                    .install_received_post_handoff_export_seal_certificate(
+                        &transfer,
+                        authenticated_party,
+                        &body,
+                        signer.as_ref(),
+                    )
+                    .await?;
+                if transfer.target().committee().member(self.party).is_ok()
+                    && !installed.target_seeded()
+                {
+                    // Equal logical state need not have the serving source's exact witness
+                    // archive. Preserve its certified download intent before acknowledging;
+                    // only the exact-archive path may reopen the existing local checkpoint.
+                    let epochs = self
+                        .authenticated_pre_import_deposit_epochs(
+                            transfer.target().committee().epoch,
+                        )
+                        .await?;
+                    let seal = deposit.authenticate_preimport_deposit_state_export_seal(
+                        &epochs,
+                        installed.delivery().certificate(),
+                    )?;
+                    self.deposit_sync_spools
+                        .record_pre_import_certified_export_intent(
+                            &seal,
+                            epochs.target_capability(),
+                        )
+                        .await?;
+                }
+                response_body = installed.acknowledgement_bytes()?;
+            }
+            DepositOperation::ExportHead => {
+                let transfer = self.authenticated_current_deposit_state_transfer().await?;
+                self.require_deposit_state_transfer_route(
+                    authenticated_party,
+                    operation,
+                    &transfer,
+                )?;
+                let request = DepositStateExportHeadRequest::from_bytes(
+                    self.party,
+                    authenticated_party,
+                    &body,
+                )?;
+                let response = deposit
+                    .deposit_state_export_head_response(authenticated_party, &transfer, request)
+                    .await?;
+                response_body = response.to_bytes(request)?;
+            }
+            DepositOperation::ExportObjects => {
+                unreachable!("handled by the lease-authorized storage path before initialization")
+            }
+            DepositOperation::ExportRelease => {
+                unreachable!("handled by the storage-only release path before initialization")
+            }
+            DepositOperation::StateImportedAck => {
+                let transfer = self.authenticated_current_deposit_state_transfer().await?;
+                self.require_deposit_state_transfer_route(
+                    authenticated_party,
+                    operation,
+                    &transfer,
+                )?;
+                let identity = self.identity(transfer.target().committee().epoch)?;
+                let accepted = deposit
+                    .accept_state_imported_ack_delivery(
+                        &transfer,
+                        identity.as_ref(),
+                        authenticated_party,
+                        &body,
+                    )
+                    .await?;
+                response_body = accepted.receipt_bytes()?;
+            }
+            DepositOperation::StateImportedCertificate => {
+                let target_epoch = deposit
+                    .state_imported_certificate_delivery_target_epoch(authenticated_party, &body)?;
+                let active_epoch = deposit.active_epoch().await?;
+                anyhow::ensure!(
+                    target_epoch <= active_epoch,
+                    "StateImported certificate targets a future deposit epoch"
+                );
+                if target_epoch < active_epoch {
+                    let transfer =
+                        self.authenticated_historical_deposit_state_transfer(target_epoch).await?;
+                    self.require_historical_deposit_state_transfer_route(
+                        authenticated_party,
+                        operation,
+                        &transfer,
+                    )?;
+                    let accepted = deposit
+                        .accept_historical_state_imported_certificate_delivery(
+                            &transfer,
+                            authenticated_party,
+                            &body,
+                        )
+                        .await?;
+                    response_body = accepted.receipt_bytes()?;
+                } else {
+                    let transfer = self.authenticated_current_deposit_state_transfer().await?;
+                    self.require_deposit_state_transfer_route(
+                        authenticated_party,
+                        operation,
+                        &transfer,
+                    )?;
+                    let target_identity =
+                        if transfer.target().committee().member(self.party).is_ok() {
+                            Some(self.identity(transfer.target().committee().epoch)?)
+                        } else {
+                            None
+                        };
+                    let accepted = deposit
+                        .accept_state_imported_certificate_delivery(
+                            &transfer,
+                            target_identity.as_deref(),
+                            authenticated_party,
+                            &body,
+                        )
+                        .await?;
+                    response_body = accepted.receipt_bytes()?;
+                }
             }
             DepositOperation::Consolidation => {
                 let wire = ByzantineConsolidationWireMessage::decode(&body)?;
@@ -5467,7 +9269,7 @@ impl PartyServer {
                                 identity.as_ref(),
                                 authenticated_party,
                                 wire,
-                                unix_time_millis()?,
+                                self.deposit_clock_sample()?.unix_millis,
                             )
                             .await?
                     }
@@ -5476,18 +9278,6 @@ impl PartyServer {
                 // Service success proves the exact effect survived snapshot readback.
                 // Only this typed full-delivery ACK may retire the sender's outbox item.
                 response_body = ByzantineConsolidationWireMessage::Ack(acknowledgement).encode()?;
-            }
-            DepositOperation::ClientRequest => {
-                let wire: DepositClientRequestWire = decode_canonical_postcard(&body)?;
-                let epoch = deposit.active_epoch().await?;
-                deposit
-                    .handle_client_request(
-                        authenticated_party,
-                        wire,
-                        unix_time_millis()?,
-                        self.identity(epoch)?.as_ref(),
-                    )
-                    .await?;
             }
             DepositOperation::ConsolidationAbandonment => {
                 anyhow::ensure!(
@@ -5505,32 +9295,19 @@ impl PartyServer {
                     .await?;
                 self.restore_consolidation_session_closures(&transition, deposit).await?;
             }
-            operation @ (DepositOperation::ConsensusProposal
-            | DepositOperation::ConsensusMessage
-            | DepositOperation::ConsensusCertificate) => {
-                let wire: DepositConsensusWire = decode_canonical_postcard(&body)?;
-                let epoch = deposit.active_epoch().await?;
-                let transition = self.consolidation_transition.lock().await;
-                deposit
-                    .handle_consensus(
-                        authenticated_party,
-                        operation,
-                        wire,
-                        unix_time_millis()?,
-                        self.identity(epoch)?.as_ref(),
-                    )
-                    .await?;
-                // Completion BA can atomically burn a newer attempt. Reconcile permanent
-                // high-water/session closures and erase any volatile signer before this
-                // gate admits another signing message.
-                self.restore_consolidation_session_closures(&transition, deposit).await?;
-            }
         }
         // The operation above has already crossed its durable reducer boundary. Retry the exact
         // same idempotent successor hook, but do not turn the expected absence of the next n-f
         // handoff certificate into a negative ACK for the accepted operation.
-        if !matches!(operation, DepositOperation::SyncHead | DepositOperation::SyncObjects) {
-            Box::pin(self.reconcile_deposit_targets_allow_gap()).await?;
+        if !matches!(
+            operation,
+            DepositOperation::SyncHead
+                | DepositOperation::SyncObjects
+                | DepositOperation::SyncRelease
+                | DepositOperation::PrefixSupportStart
+                | DepositOperation::PrefixSupportContinue
+        ) {
+            self.boxed_reconcile_deposit_targets_allow_gap().await?;
         }
         Ok(response_body)
     }
@@ -5585,11 +9362,18 @@ impl PartyServer {
             .merge(admin)
             .layer(TraceLayer::new_for_http());
         if self.deposit.is_some() {
-            let deposits = Router::new()
-                .route("/v1/deposits/allocate", post(deposit_allocate))
+            let deposit_reads = Router::new()
                 .route("/v1/deposits/status", post(deposit_status))
                 .route("/v1/deposits/consolidations/status", post(deposit_consolidation_status))
-                .route_layer(middleware::from_fn_with_state(authenticator, require_deposits));
+                .route_layer(middleware::from_fn_with_state(
+                    Arc::clone(&self.deposit_read_admission_permits),
+                    require_deposit_read_admission,
+                ));
+            let deposits = Router::new()
+                .route("/v1/deposits/allocate", post(deposit_allocate))
+                .merge(deposit_reads)
+                .route_layer(middleware::from_fn_with_state(authenticator, require_deposits))
+                .layer(DefaultBodyLimit::max(MAX_DEPOSIT_HTTP_JSON_BYTES));
             app = app.merge(deposits);
         }
         app.with_state(self)
@@ -5610,6 +9394,62 @@ impl PartyServer {
             .context("missing epoch identity")?;
         drop(retiring);
         Ok(identity)
+    }
+
+    /// Acquire the narrow signing authority used by deposit-registry consensus.
+    ///
+    /// A live epoch identity is preferred. After proactive retirement has erased its X25519
+    /// receiver secret, the stable Ed25519 seed can still attest the exact historical registry
+    /// handoff without reconstructing or dummying any encryption capability.
+    async fn deposit_signer(&self, epoch: u64) -> anyhow::Result<Arc<dyn EnvelopeSigner>> {
+        if let Ok(identity) = self.identity(epoch) {
+            return Ok(identity);
+        }
+        let (public, _) = self.authenticated_deposit_target(epoch).await?;
+        public.committee.member(self.party)?;
+        Ok(Arc::new(StableSigningIdentity::for_committee(
+            self.party,
+            &self.signing_seed,
+            &public.committee,
+        )?))
+    }
+
+    /// Select the least-authority signer which can advance the live deposit consensus phase.
+    ///
+    /// A retired source identity may carry only certificate-backed pre-pin recovery and the
+    /// ordinary HandoffFence pipeline. Once the exact portable Fence is installed, the service
+    /// stops issuing that transition authority and the separate final-Handoff-only capability is
+    /// selected on the next retry.
+    async fn deposit_consensus_signer(
+        &self,
+        epoch: u64,
+    ) -> anyhow::Result<Arc<dyn EnvelopeSigner>> {
+        if let Ok(identity) = self.identity(epoch) {
+            return Ok(identity);
+        }
+        let (public, _) = self.authenticated_deposit_target(epoch).await?;
+        public.committee.member(self.party)?;
+        let recovery_authority = match &self.deposit {
+            Some(deposit) => {
+                deposit.handoff_recovery_signing_authority(epoch, &public.committee).await?
+            }
+            None => None,
+        };
+        match recovery_authority {
+            Some(authority) => {
+                Ok(Arc::new(StableRecoverySigningIdentity::for_certified_transition(
+                    self.party,
+                    &self.signing_seed,
+                    &public.committee,
+                    authority,
+                )?))
+            }
+            None => Ok(Arc::new(StableSigningIdentity::for_committee(
+                self.party,
+                &self.signing_seed,
+                &public.committee,
+            )?)),
+        }
     }
 
     /// Stop new identity leases, then wait a bounded number of scheduler turns for every
@@ -5744,17 +9584,57 @@ impl PartyServer {
         &self,
         source: &EpochPublic,
     ) -> anyhow::Result<Option<KeyRotationContext>> {
-        source.validate()?;
-        let target_epoch =
-            source.committee.epoch.checked_add(1).context("key-rotation epoch exhausted")?;
+        let source_receiver_keys = self
+            .history_links
+            .read()
+            .map_err(|_| anyhow::anyhow!("epoch-history registry lock is poisoned"))?
+            .get(&source.committee.epoch)
+            .copied()
+            .context("key-rotation source lacks an authenticated epoch-history link")?
+            .receiver_keys();
+        self.key_rotation_context_for_source_receiver_keys(source, source_receiver_keys)
+    }
+
+    fn key_rotation_context_for_source_receiver_keys(
+        &self,
+        source: &EpochPublic,
+        source_receiver_keys: ReceiverKeyAccumulatorCommitment,
+    ) -> anyhow::Result<Option<KeyRotationContext>> {
         let (trusted_source, source_fault_bound) =
             self.trusted_committee_and_fault_bound(source.committee.epoch)?;
         anyhow::ensure!(
             trusted_source.digest() == source.committee.digest(),
             "key-rotation source committee differs from the certified chain"
         );
-        let target_policy = if let Some(configured) =
-            self.scenario.configured_key_rotation_target_policy(&source.committee)?
+        self.key_rotation_context_for_authenticated_source(
+            source,
+            source_receiver_keys,
+            source_fault_bound,
+        )
+    }
+
+    /// Derive the next rotation policy from an explicitly authenticated source authority. Cold
+    /// history supplies `source_fault_bound` from the exact embedded rotation certificate, so
+    /// schedule verification need not mutate or consult the bounded live committee cache.
+    fn key_rotation_context_for_authenticated_source(
+        &self,
+        source: &EpochPublic,
+        source_receiver_keys: ReceiverKeyAccumulatorCommitment,
+        source_fault_bound: u16,
+    ) -> anyhow::Result<Option<KeyRotationContext>> {
+        source.validate()?;
+        source.committee.validate_async_security_with_faults(source_fault_bound)?;
+        source_receiver_keys.validate()?;
+        anyhow::ensure!(
+            source_receiver_keys.network() == self.scenario.quic_network_id()?
+                && source_receiver_keys.through_epoch() == source.committee.epoch,
+            "key-rotation source receiver-key commitment has another network or epoch"
+        );
+        let target_epoch =
+            source.committee.epoch.checked_add(1).context("key-rotation epoch exhausted")?;
+        let target_policy = if let Some(configured) = self
+            .scenario
+            .configured_key_rotation_target_policy(&source.committee, source_receiver_keys)?
         {
             configured
         } else {
@@ -5778,9 +9658,15 @@ impl PartyServer {
             };
             KeyRotationTargetPolicy::new(
                 &source.committee,
+                source_fault_bound,
                 eligible,
                 source.committee.n(),
                 source_fault_bound,
+                source_receiver_keys,
+                self.scenario
+                    .protocol_timeout_seconds
+                    .checked_mul(1_000)
+                    .context("key-rotation fallback window overflow")?,
             )?
         };
         Ok(Some(KeyRotationContext::new(
@@ -5792,12 +9678,81 @@ impl PartyServer {
         )?))
     }
 
-    fn register_certified_key_rotation(
+    async fn register_certified_key_rotation(
         &self,
         context: KeyRotationContext,
         certificate: KeyRotationCertificate,
     ) -> anyhow::Result<Committee> {
-        let target = certificate.verify(&context)?;
+        #[cfg(test)]
+        self.certified_key_rotation_registration_verifications.fetch_add(1, Ordering::AcqRel);
+        let blocking_permit = Arc::clone(&self.key_rotation_blocking_permits)
+            .acquire_owned()
+            .await
+            .context("key-rotation blocking semaphore closed")?;
+        let receiver_keys = Arc::clone(&self.receiver_keys);
+        let (
+            context,
+            certificate,
+            target,
+            resulting_receiver_keys,
+            semantic_digest,
+            certificate_retry_id,
+        ) = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+            let _blocking_permit = blocking_permit;
+            // This one capability carries every value derived from the generic certificate and
+            // sparse accumulator proof. Staging and retry construction must reuse it rather than
+            // replaying proof verification on an async runtime worker.
+            let verified = certificate.verify_rotation_certificate(&context)?;
+            let semantic_digest = verified.semantic_digest();
+            let template_recipient = context
+                .participants()
+                .into_iter()
+                .next()
+                .context("certified key rotation has no participant")?;
+            let certificate_retry_id = pending_verified_key_rotation_certificate(
+                &context,
+                &certificate,
+                &verified,
+                template_recipient,
+            )?
+            .id;
+            let stage_binding =
+                ReceiverKeyStageBinding::for_certificate(context.digest(), semantic_digest)?;
+            let selected = verified
+                .target
+                .members
+                .iter()
+                .map(|member| (member.id, member.encryption_key))
+                .collect::<Vec<_>>();
+            let mut receiver_keys = receiver_keys
+                .write()
+                .map_err(|_| anyhow::anyhow!("receiver-key accumulator lock is poisoned"))?;
+            let current_receiver_keys = receiver_keys.commitment();
+            if current_receiver_keys == context.target_policy().prior_receiver_keys() {
+                receiver_keys.stage_verified_update(
+                    context.target_epoch(),
+                    &selected,
+                    verified.history_update(),
+                    stage_binding,
+                )?;
+            } else {
+                anyhow::ensure!(
+                    current_receiver_keys == verified.receiver_keys
+                        || current_receiver_keys.through_epoch() > context.target_epoch(),
+                    "receiver-key accumulator is not contiguous with the certified rotation"
+                );
+            }
+            Ok((
+                context,
+                certificate,
+                verified.target,
+                verified.receiver_keys,
+                semantic_digest,
+                certificate_retry_id,
+            ))
+        })
+        .await
+        .context("certified receiver-key registration task failed")??;
         let mut rotations = self
             .certified_key_rotations
             .write()
@@ -5806,27 +9761,78 @@ impl PartyServer {
             anyhow::ensure!(
                 existing.context == context
                     && existing.target == target
-                    && existing.certificate.semantic_digest(&existing.context)?
-                        == certificate.semantic_digest(&context)?,
+                    && existing.receiver_keys == resulting_receiver_keys
+                    && existing.semantic_digest == semantic_digest,
                 "dynamic epoch is certified by another key-rotation decision"
             );
         } else {
             rotations.insert(
                 context.target_epoch(),
-                CertifiedKeyRotation { context, certificate, target: target.clone() },
+                CertifiedKeyRotation {
+                    context,
+                    certificate,
+                    target: target.clone(),
+                    receiver_keys: resulting_receiver_keys,
+                    semantic_digest,
+                    certificate_retry_id,
+                },
             );
         }
         Ok(target)
     }
 
-    fn validate_committee(&self, supplied: &Committee) -> anyhow::Result<()> {
-        // `Committee::digest` assumes a previously validated canonical committee. Peer-supplied
-        // transition bodies are untrusted even after mTLS authentication, so reject malformed
-        // structure before either digest can reach that invariant.
-        supplied.validate()?;
-        let (expected, _) = self.trusted_committee_and_fault_bound(supplied.epoch)?;
-        anyhow::ensure!(expected.digest() == supplied.digest(), "committee differs from scenario");
-        Ok(())
+    async fn promote_receiver_keys_after_history_cas(
+        &self,
+        value: &ActivationValue,
+    ) -> anyhow::Result<()> {
+        let expected = value.history_link.receiver_keys();
+        let binding = self
+            .certified_key_rotations
+            .read()
+            .map_err(|_| anyhow::anyhow!("key-rotation registry lock is poisoned"))?
+            .get(&value.epoch)
+            .map(|rotation| {
+                ReceiverKeyStageBinding::for_certificate(
+                    rotation.context.digest(),
+                    rotation.semantic_digest,
+                )
+            })
+            .transpose()?;
+        let receiver_keys = Arc::clone(&self.receiver_keys);
+        // Keep the observation and promotion under one writer. Several honest collectors can
+        // deliver the same immutable activation certificate concurrently; a split read/write
+        // sequence lets one delivery promote between another delivery's snapshot and CAS, which
+        // used to turn a valid retry into permanently retained Byzantine evidence.
+        tokio::task::spawn_blocking(move || {
+            let mut receiver_keys = receiver_keys
+                .write()
+                .map_err(|_| anyhow::anyhow!("receiver-key accumulator lock is poisoned"))?;
+            let active = receiver_keys.commitment();
+            if active == expected {
+                return Ok(());
+            }
+            let staged = receiver_keys
+                .staged_update()
+                .context("activated receiver-key accumulator has no staged successor")?;
+            anyhow::ensure!(
+                staged.prior() == active && staged.next() == expected,
+                "activated receiver-key accumulator differs from its staged successor"
+            );
+            let binding = binding
+                .context("activated receiver-key accumulator lacks its certified rotation")?;
+            anyhow::ensure!(
+                staged.binding() == binding,
+                "activated receiver-key accumulator has another certificate binding"
+            );
+            anyhow::ensure!(
+                receiver_keys.reconcile_staged(expected, Some(binding))?
+                    == ReceiverKeyAccumulatorReconcile::Promoted(expected),
+                "history-gated receiver-key promotion differs from activated history"
+            );
+            Ok(())
+        })
+        .await
+        .context("receiver-key accumulator promotion task failed")?
     }
 
     async fn ensure_reshare_source_certified(
@@ -5935,7 +9941,7 @@ impl PartyServer {
                 }
                 None => None,
             };
-            self.register_history_key_rotation(&record, rotation.as_deref(), true)?;
+            self.register_history_key_rotation(&record, rotation.as_deref(), true).await?;
             anyhow::ensure!(
                 record.value.epoch == boundary_epoch
                     && record.value.history_link == boundary.consensus_link(),
@@ -5961,7 +9967,7 @@ impl PartyServer {
                 }
                 None => None,
             };
-            self.register_history_key_rotation(&record, rotation.as_deref(), false)?;
+            self.register_history_key_rotation(&record, rotation.as_deref(), false).await?;
             validate_avss_transition(self, &record.transition)?;
             verify_activation_certificate(
                 self,
@@ -6009,8 +10015,7 @@ impl PartyServer {
                     .await?
                     .context("enumerated key-rotation certificate disappeared")?;
                 anyhow::ensure!(
-                    durable.semantic_digest(&rotation.context)?
-                        == rotation.certificate.semantic_digest(&rotation.context)?,
+                    durable.semantic_digest(&rotation.context)? == rotation.semantic_digest,
                     "current key-rotation certificate differs from epoch history"
                 );
             }
@@ -6042,9 +10047,72 @@ impl PartyServer {
                 .load_key_rotation_certificate(&context)
                 .await?
                 .context("enumerated terminal key-rotation certificate disappeared")?;
-            self.register_certified_key_rotation(context, certificate)?;
+            self.register_certified_key_rotation(context, certificate).await?;
         }
         anyhow::ensure!(remaining.is_empty(), "key-rotation certificate set has a gap or fork");
+
+        let authenticated_history_tip = self
+            .epoch_history
+            .read()
+            .await
+            .hot_entries()
+            .last()
+            .map(|entry| entry.receiver_keys())
+            .unwrap_or(
+                self.scenario
+                    .bootstrap_receiver_key_accumulator(self.scenario.quic_network_id()?)?,
+            );
+        let receiver_keys = Arc::clone(&self.receiver_keys);
+        let staged = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+            Ok(receiver_keys
+                .read()
+                .map_err(|_| anyhow::anyhow!("receiver-key accumulator lock is poisoned"))?
+                .staged_update())
+        })
+        .await
+        .context("receiver-key staged-head inspection task failed")??;
+        let terminal_binding = staged
+            .map(|staged| {
+                let rotation = self
+                    .certified_key_rotations
+                    .read()
+                    .map_err(|_| anyhow::anyhow!("key-rotation registry lock is poisoned"))?
+                    .get(&staged.next().through_epoch())
+                    .cloned()
+                    .context(
+                        "staged receiver-key successor lacks its exact durable rotation certificate",
+                    )?;
+                anyhow::ensure!(
+                    rotation.context.target_policy().prior_receiver_keys() == staged.prior()
+                        && rotation.receiver_keys == staged.next(),
+                    "staged receiver-key successor differs from its durable rotation certificate"
+                );
+                ReceiverKeyStageBinding::for_certificate(
+                    rotation.context.digest(),
+                    rotation.semantic_digest,
+                )
+                .map_err(anyhow::Error::from)
+            })
+            .transpose()?;
+        let receiver_keys = Arc::clone(&self.receiver_keys);
+        let reconciliation = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+            Ok(receiver_keys
+                .write()
+                .map_err(|_| anyhow::anyhow!("receiver-key accumulator lock is poisoned"))?
+                .reconcile_staged(authenticated_history_tip, terminal_binding)?)
+        })
+        .await
+        .context("receiver-key restart reconciliation task failed")??;
+        match reconciliation {
+            ReceiverKeyAccumulatorReconcile::Clean
+            | ReceiverKeyAccumulatorReconcile::Retained(_) => {}
+            ReceiverKeyAccumulatorReconcile::Promoted(commitment) => {
+                anyhow::ensure!(
+                    commitment == authenticated_history_tip,
+                    "receiver-key restart promotion differs from authenticated history"
+                );
+            }
+        }
 
         let restored_rotations = self
             .certified_key_rotations
@@ -6054,14 +10122,12 @@ impl PartyServer {
             .cloned()
             .collect::<Vec<_>>();
         for rotation in &restored_rotations {
-            let Ok(member) = rotation.target.member(self.party) else {
-                continue;
-            };
-            if self
-                .protocol_store
-                .load_epoch_identity_retirement(rotation.target.epoch, member.encryption_key)
-                .await?
-                .is_some()
+            if let Ok(member) = rotation.target.member(self.party)
+                && self
+                    .protocol_store
+                    .load_epoch_identity_retirement(rotation.target.epoch, member.encryption_key)
+                    .await?
+                    .is_some()
             {
                 continue;
             }
@@ -6286,6 +10352,22 @@ impl PartyServer {
             // catch-up run from the live reducer bound. The cache is reconstructed from permanent
             // evidence on every restart and never from session-state fields supplied by a peer.
             *self.certified_avss_sessions.write().await = certified_avss_sessions;
+            let mut activation_gossip_records = BTreeMap::new();
+            for (key, record) in &records {
+                if cold_through.is_none_or(|cold| key.epoch > cold) {
+                    anyhow::ensure!(
+                        activation_gossip_records
+                            .insert((key.epoch, key.activation_digest), record.clone())
+                            .is_none(),
+                        "multiple hot activation certificates share one gossip key"
+                    );
+                }
+            }
+            anyhow::ensure!(
+                activation_gossip_records.len() <= MAX_CURRENT_EPOCH_RECORDS,
+                "restored activation gossip cache exceeds the hot-history bound"
+            );
+            *self.activation_gossip_records.write().await = activation_gossip_records;
             // Rewrite every still-retained certified reducer before replaying any predecessor
             // share retirement. This closes the crash case where the activation certificate
             // reached disk but the process stopped before its plaintext snapshot was compacted.
@@ -6304,20 +10386,25 @@ impl PartyServer {
         let restored_terminal_rotation = self.key_rotation.lock().await.as_ref().and_then(|live| {
             live.round.certificate().map(|certificate| (live.round.context().clone(), certificate))
         });
+        // Restore the source-bound pacemaker before a terminal receiver-key round attempts to
+        // launch its certified AVSS transition. Reshare ingress now requires the local source
+        // share and Armed schedule to agree; launching first would make a valid
+        // post-certificate/pre-AVSS restart fail construction.
+        let refresh_reconciliation_now = unix_time_millis()?;
+        Box::pin(self.restore_proactive_refresh_schedule(refresh_reconciliation_now)).await?;
+        Box::pin(
+            self.reconcile_proactive_refresh_schedule_from_history(refresh_reconciliation_now),
+        )
+        .await?;
         if let Some((context, certificate)) = restored_terminal_rotation {
             Box::pin(self.finalize_certified_key_rotation(context, certificate, true)).await?;
         }
-        if self.deposit.is_some() && self.deposit_targets.read().await.contains_key(&0) {
-            Box::pin(self.ensure_deposit_initialized()).await?;
-            if let Err(error) = Box::pin(self.reconcile_deposit_targets()).await
-                && !error.downcast_ref::<DepositServiceError>().is_some_and(|error| {
-                    matches!(error, DepositServiceError::CertifiedHandoffUnavailable(_))
-                })
-            {
-                return Err(error.context("cannot restore the certified deposit epoch chain"));
-            }
-        }
-        Box::pin(self.restore_proactive_refresh_schedule(unix_time_millis()?)).await
+        // Deposit genesis and handoff recovery have independent runtime pacemakers. In
+        // particular, resolving a scanner birth anchor may need an unavailable Monero daemon.
+        // The authenticated activation/share replay above must still make the threshold network
+        // live; deposit issuance remains closed until those independent loops durably initialize
+        // and reconcile their certified registry.
+        Ok(())
     }
 
     // Certificate-replay retirement, kept under the same global lock order as the live path. This
@@ -6330,15 +10417,15 @@ impl PartyServer {
         Box::pin(async move {
             let consolidation_transition = self.consolidation_transition.lock().await;
             let epoch_transition = self.epoch_transition.lock().await;
+            let deposit_genesis_publication = self.deposit_genesis_publication.lock().await;
             for (key, record) in records {
                 let certified_root = self.remember_certified_deposit_target(&record.value).await?;
-                if let Some(old) = &record.transition.old {
-                    self.deposit_targets
-                        .write()
-                        .await
-                        .entry(old.committee.epoch)
-                        .or_insert_with(|| old.clone());
-                }
+                // Reconstruct the same receiver-key-round cleanup ordering as the live
+                // Activate/Retire paths. A process can stop after the activation/history CAS but
+                // before a removed source member writes the certificate-bound round tombstone.
+                // The rotation chain was authenticated in the preceding restore phase, and no
+                // current live round is loaded until after this replay loop.
+                self.retire_key_rotation_after_activation(&record.value.public).await?;
 
                 let local_target = record.transition.target.member(self.party).is_ok();
                 let mut successor_ready = !local_target;
@@ -6376,7 +10463,7 @@ impl PartyServer {
                     && old.committee.member(self.party).is_ok()
                 {
                     match self
-                        .certify_deposit_handoff_before_share_retirement(
+                        .authorize_deposit_share_retirement(
                             old,
                             &record.value.public,
                             certified_root,
@@ -6424,6 +10511,14 @@ impl PartyServer {
 
             let active_epoch = self.epochs.read().await.keys().next_back().copied();
             *self.active_epoch.write().await = active_epoch;
+            self.deposit_activation_revision.store(
+                active_epoch
+                    .map(|epoch| epoch.checked_add(1).context("active epoch revision exhausted"))
+                    .transpose()?
+                    .unwrap_or(0),
+                Ordering::Release,
+            );
+            drop(deposit_genesis_publication);
             drop(epoch_transition);
             drop(consolidation_transition);
 
@@ -6451,54 +10546,19 @@ impl PartyServer {
         self: &Arc<Self>,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + Send + '_>> {
         Box::pin(async move {
-            let (acceptance_gate_session, acceptance_gate_context) =
-                acceptance_consolidation_gate_storage_key(
-                    self.scenario.quic_network_id()?,
-                    self.party,
-                )?;
-            let (acceptance_bootstrap_gate_session, acceptance_bootstrap_gate_context) =
-                acceptance_consolidation_bootstrap_gate_storage_key(
-                    self.scenario.quic_network_id()?,
-                    self.party,
-                )?;
-            let (acceptance_protocol_gate_session, acceptance_protocol_gate_context) =
-                acceptance_protocol_fault_gate_storage_key(
-                    self.scenario.quic_network_id()?,
-                    self.party,
-                )?;
-            let (acceptance_driver_latch_session, acceptance_driver_latch_context) =
-                acceptance_driver_latch_storage_key(self.scenario.quic_network_id()?, self.party)?;
-            let (acceptance_deposit_checkpoint_session, acceptance_deposit_checkpoint_context) =
-                acceptance_deposit_checkpoint_gate_storage_key(
-                    self.scenario.quic_network_id()?,
-                    self.party,
-                )?;
+            let acceptance_keys =
+                acceptance_control_storage_keys(self.scenario.quic_network_id()?, self.party)?;
             for key in self.protocol_store.session_states().await? {
-                if (key.session == acceptance_gate_session
-                    && key.context_digest == acceptance_gate_context)
-                    || (key.session == acceptance_bootstrap_gate_session
-                        && key.context_digest == acceptance_bootstrap_gate_context)
-                    || (key.session == acceptance_protocol_gate_session
-                        && key.context_digest == acceptance_protocol_gate_context)
-                    || (key.session == acceptance_driver_latch_session
-                        && key.context_digest == acceptance_driver_latch_context)
-                    || (key.session == acceptance_deposit_checkpoint_session
-                        && key.context_digest == acceptance_deposit_checkpoint_context)
-                {
+                if acceptance_keys.contains(&(key.session, key.context_digest)) {
                     // Dedicated acceptance records share ProtocolStore's opaque encrypted blob
                     // machinery but are not AVSS reducers. They were fully decoded before
                     // PartyServer construction. The protocol crash gate separately fails closed
                     // above if an Armed/Held record is restored without its explicit demo flag;
                     // inert records are authenticated here and excluded from AVSS decoding.
-                    drop(
-                        self.protocol_store
-                            .load_session_state(key.session, key.context_digest)
-                            .await?,
-                    );
+                    drop(key.state);
                     continue;
                 }
-                let bytes =
-                    self.protocol_store.load_session_state(key.session, key.context_digest).await?;
+                let bytes = key.state;
                 let DurableSessionState::Avss(run) = decode_postcard_exact(&bytes)?;
                 anyhow::ensure!(
                     run.transition.session == key.session,
@@ -6569,8 +10629,14 @@ impl PartyServer {
                 }
                 let certified = self.certified_avss_sessions.read().await.clone();
                 let mut runs = self.avss.lock().await;
-                ensure_avss_live_capacity(&runs, &certified, &run.transition, MAX_LIVE_AVSS_RUNS)
-                    .context("durable AVSS session count exceeds the live bound")?;
+                ensure_avss_live_capacity(
+                    self.party,
+                    &runs,
+                    &certified,
+                    &run.transition,
+                    MAX_LIVE_AVSS_RUNS,
+                )
+                .context("durable AVSS session count exceeds the live bound")?;
                 anyhow::ensure!(
                     runs.insert(key.session, run).is_none(),
                     "duplicate durable AVSS session"
@@ -6658,7 +10724,7 @@ impl PartyServer {
                 }
                 None => None,
             };
-            self.register_history_key_rotation(&record, rotation.as_deref(), true)?;
+            self.register_history_key_rotation(&record, rotation.as_deref(), true).await?;
             anyhow::ensure!(
                 record.transition == *transition
                     && record.value.history_link == entry.consensus_link(),
@@ -6722,7 +10788,7 @@ impl PartyServer {
             Some(reference) => Some(self.load_epoch_history_object(reference, &mut loaded).await?),
             None => None,
         };
-        self.register_history_key_rotation(&successor_record, rotation.as_deref(), true)?;
+        self.register_history_key_rotation(&successor_record, rotation.as_deref(), true).await?;
         verify_activation_certificate(
             self,
             &successor_record.transition,
@@ -6769,6 +10835,33 @@ impl PartyServer {
         Ok(Some(record))
     }
 
+    /// Classify only reducer-final or permanently closed state for an exact transition.
+    ///
+    /// Holding the AVSS lock across the absent-session tombstone check serializes this observation
+    /// with both ordinary retirement and successor supersession. A durable certificate by itself is
+    /// intentionally insufficient: a slower target may still need its live catch-up reducer.
+    async fn transition_has_terminal_avss_replay_state(
+        &self,
+        transition: &AvssTransition,
+    ) -> anyhow::Result<bool> {
+        let runs = self.avss.lock().await;
+        if let Some(run) = runs.get(&transition.session) {
+            anyhow::ensure!(
+                run.transition == *transition,
+                "session was bound to another transition"
+            );
+            if run.secret_compacted {
+                validate_avss_secret_compaction(run)?;
+                anyhow::ensure!(
+                    run.transition.target.member(self.party).is_err() || run.finalized.is_some(),
+                    "local-target AVSS reducer was compacted before finalization"
+                );
+            }
+            return Ok(run.secret_compacted || run.finalized.is_some());
+        }
+        Ok(self.closed_transition_activation_record(transition).await?.is_some())
+    }
+
     async fn transition_has_durable_activation_certificate(
         &self,
         transition: &AvssTransition,
@@ -6801,6 +10894,11 @@ impl PartyServer {
             return Ok(true);
         };
         anyhow::ensure!(run.transition == *transition, "session was bound to another transition");
+        if transition.target.member(self.party).is_ok() && run.finalized.is_none() {
+            // Global activation is not local reconstruction. Keep accepting authenticated
+            // AVSS/QUAL catch-up until this target has staged the exact certified share.
+            return Ok(false);
+        }
         if !peer_outbox_is_empty(run) {
             return Ok(false);
         }
@@ -6814,8 +10912,9 @@ impl PartyServer {
         Ok(true)
     }
 
-    /// Snapshot a bounded prefix of the durable peer outbox. Items remain pending across any
-    /// number of calls and process restarts until [`Self::acknowledge_peer_messages`] succeeds.
+    /// Snapshot a bounded, fair selection of the durable peer outbox. Items remain pending across
+    /// any number of calls and process restarts until [`Self::acknowledge_peer_messages`]
+    /// succeeds.
     pub async fn pending_peer_messages(&self, limit: usize) -> Vec<PendingPeerMessage> {
         let limit = limit.min(MAX_PEER_OUTBOX_SNAPSHOT);
         if limit == 0 {
@@ -6823,81 +10922,61 @@ impl PartyServer {
         }
         let runs = self.avss.lock().await;
         let protocol_fault_gate = self.acceptance_protocol_fault_gate.lock().await.clone();
-        let total = runs
-            .iter()
-            .filter(|(session, _)| !protocol_fault_gate.blocks_session(**session))
-            .map(|(_, run)| {
-                run.pending_avss
-                    .len()
-                    .saturating_add(run.pending_qual.len())
-                    .saturating_add(run.pending_activation_ack.len())
-            })
-            .sum::<usize>();
-        if total == 0 {
-            return Vec::new();
-        }
-        let take = limit.min(total);
-        let mut cursor = self.peer_outbox_cursor.lock().await;
-        let start = *cursor % total;
-        *cursor = start.saturating_add(take) % total;
-        drop(cursor);
-
-        let mut batch = Vec::with_capacity(take);
-        let mut index = 0_usize;
+        let mut protocol = BTreeMap::new();
+        let mut activation_ack = BTreeMap::new();
         for (session, run) in runs.iter() {
             if protocol_fault_gate.blocks_session(*session) {
                 continue;
             }
             for (key, wire) in &run.pending_avss {
-                let distance = index.saturating_add(total).saturating_sub(start) % total;
-                if distance < take {
-                    let id =
-                        PeerMessageId::Avss { session: *session, recipient: key.0, digest: key.1 };
-                    batch.push(PendingPeerMessage::Avss {
-                        id,
-                        request: AvssDeliverRequest {
-                            transition: run.transition.clone(),
-                            wire: wire.clone(),
-                        },
-                    });
-                }
-                index = index.saturating_add(1);
+                let id = PeerMessageId::Avss { session: *session, recipient: key.0, digest: key.1 };
+                let previous = protocol
+                    .insert(id, PendingPeerMessageRef::Avss { transition: &run.transition, wire });
+                debug_assert!(previous.is_none(), "duplicate stable AVSS outbox identifier");
             }
             for (key, wire) in &run.pending_qual {
-                let distance = index.saturating_add(total).saturating_sub(start) % total;
-                if distance < take {
-                    let id =
-                        PeerMessageId::Qual { session: *session, recipient: key.0, digest: key.1 };
-                    batch.push(PendingPeerMessage::Qual {
-                        id,
-                        request: QualDeliverRequest {
-                            transition: run.transition.clone(),
-                            wire: wire.clone(),
-                        },
-                    });
-                }
-                index = index.saturating_add(1);
+                let id = PeerMessageId::Qual { session: *session, recipient: key.0, digest: key.1 };
+                let previous = protocol
+                    .insert(id, PendingPeerMessageRef::Qual { transition: &run.transition, wire });
+                debug_assert!(previous.is_none(), "duplicate stable QUAL outbox identifier");
             }
             for (key, acknowledgement) in &run.pending_activation_ack {
-                let distance = index.saturating_add(total).saturating_sub(start) % total;
-                if distance < take {
-                    let id = PeerMessageId::ActivationAck {
-                        session: *session,
-                        recipient: key.0,
-                        digest: key.1,
-                    };
-                    batch.push(PendingPeerMessage::ActivationAck {
-                        id,
-                        request: ActivationAckDeliverRequest {
-                            transition: run.transition.clone(),
-                            acknowledgement: acknowledgement.clone(),
-                        },
-                    });
-                }
-                index = index.saturating_add(1);
+                let id = PeerMessageId::ActivationAck {
+                    session: *session,
+                    recipient: key.0,
+                    digest: key.1,
+                };
+                let previous = activation_ack.insert(
+                    id,
+                    PendingPeerMessageRef::ActivationAck {
+                        transition: &run.transition,
+                        acknowledgement,
+                    },
+                );
+                debug_assert!(
+                    previous.is_none(),
+                    "duplicate stable activation-acknowledgement outbox identifier"
+                );
             }
         }
-        batch
+
+        let mut cursor = self.peer_outbox_cursor.lock().await;
+        let protocol_ids = protocol.keys().copied().collect::<BTreeSet<_>>();
+        let activation_ack_ids = activation_ack.keys().copied().collect::<BTreeSet<_>>();
+        let selected =
+            select_bounded_peer_message_ids(&protocol_ids, &activation_ack_ids, &mut cursor, limit);
+        drop(cursor);
+
+        selected
+            .into_iter()
+            .map(|id| {
+                protocol
+                    .remove(&id)
+                    .or_else(|| activation_ack.remove(&id))
+                    .expect("selected durable peer-outbox item disappeared from its snapshot")
+                    .into_owned(id)
+            })
+            .collect()
     }
 
     /// Durably remove peer messages after transport-level remote acceptance or an authenticated
@@ -6973,26 +11052,13 @@ impl PartyServer {
         let scenario_parties =
             self.scenario.parties.iter().map(|party| party.id).collect::<Vec<_>>();
         let mut messages = Vec::new();
-        for key in
-            self.protocol_store.activation_certificates_bounded(MAX_CURRENT_EPOCH_RECORDS).await?
-        {
-            let bytes = self
-                .protocol_store
-                .load_activation_certificate(key.epoch, key.activation_digest)
-                .await?;
-            let record: ActivationCertificateRecord = decode_postcard_exact(&bytes)?;
-            validate_avss_transition(self, &record.transition)?;
-            verify_activation_certificate(
-                self,
-                &record.transition,
-                &record.value,
-                &record.acknowledgements,
-            )?;
-            anyhow::ensure!(
-                record.value.epoch == key.epoch
-                    && record.value.activation_digest == key.activation_digest,
-                "activation gossip key differs from its certificate"
-            );
+        let records =
+            self.activation_gossip_records.read().await.values().cloned().collect::<Vec<_>>();
+        anyhow::ensure!(
+            records.len() <= MAX_CURRENT_EPOCH_RECORDS,
+            "activation gossip cache exceeded the authenticated hot-history bound"
+        );
+        for record in records {
             let request = ActivateEpochRequest {
                 transition: record.transition.clone(),
                 value: record.value,
@@ -7007,8 +11073,8 @@ impl PartyServer {
             ) {
                 messages.push(PendingEpochPeerMessage {
                     id: EpochPeerMessageId {
-                        epoch: key.epoch,
-                        activation_digest: key.activation_digest,
+                        epoch: request.value.epoch,
+                        activation_digest: request.value.activation_digest,
                         recipient,
                         operation,
                     },
@@ -7042,11 +11108,7 @@ impl PartyServer {
             return Ok(None);
         };
         anyhow::ensure!(rotation.context == context, "receiver-key rotation context differs");
-        let target = rotation.certificate.verify(&rotation.context)?;
-        anyhow::ensure!(
-            target.digest() == rotation.target.digest(),
-            "receiver-key rotation target differs from its registered certificate"
-        );
+        let target = rotation.target.clone();
         drop(rotations);
 
         if same_refresh_layout(&source.committee, &target) {
@@ -7072,21 +11134,18 @@ impl PartyServer {
             )?));
         }
 
-        let eligible_dealers = if let Ok(specification) = self.scenario.committee_spec(target_epoch)
-        {
+        if let Ok(specification) = self.scenario.committee_spec(target_epoch) {
             anyhow::ensure!(
                 specification.operation == Operation::Reshare,
                 "configured resharing target is not a reshare successor"
             );
-            specification
-                .old_dealers
-                .iter()
-                .copied()
-                .filter(|party| source.committee.member(*party).is_ok())
-                .collect()
-        } else {
-            source.committee.members.iter().map(|member| member.id).collect()
-        };
+        }
+        // Receiver-key agreement may certificate-select any exact desired-size advertiser subset.
+        // Derive dealer eligibility from the committee that was actually certified,
+        // never from the nominal predecessor roster: every source member has an authenticated old
+        // share and using all n candidates leaves enough honest dealers for exact-threshold QUAL
+        // after any f omissions.
+        let eligible_dealers = source.committee.members.iter().map(|member| member.id).collect();
         Ok(Some(AvssTransition {
             purpose: DealPurpose::Reshare,
             session: canonical_reshare_session(source, &target, history_parent)?,
@@ -7130,17 +11189,67 @@ impl PartyServer {
         Ok(())
     }
 
+    /// Retain the authenticated current suffix plus at most the two durable pacemaker endpoints.
+    /// This is a hot capability cache, not history: arbitrary exact cold reads never enter it.
+    async fn retain_bounded_schedule_history_authority(
+        &self,
+        schedule: &ProactiveRefreshSchedule,
+    ) -> anyhow::Result<()> {
+        let current_floor = self.epoch_history.read().await.cold_through().unwrap_or(0);
+        let primary = schedule.source_epoch;
+        let target = schedule.target_epoch;
+
+        let mut rotations = self
+            .certified_key_rotations
+            .write()
+            .map_err(|_| anyhow::anyhow!("key-rotation registry lock is poisoned"))?;
+        rotations.retain(|epoch, _| {
+            *epoch >= current_floor || *epoch == primary || target == Some(*epoch)
+        });
+        anyhow::ensure!(
+            rotations.len() <= MAX_SCHEDULE_PINNED_EPOCH_RECORDS,
+            "live key-rotation authority exceeds its authenticated history/schedule bound"
+        );
+        drop(rotations);
+
+        let mut links = self
+            .history_links
+            .write()
+            .map_err(|_| anyhow::anyhow!("epoch-history registry lock is poisoned"))?;
+        links.retain(|epoch, _| *epoch >= current_floor || *epoch == primary);
+        anyhow::ensure!(
+            links.len() <= MAX_SCHEDULE_PINNED_EPOCH_RECORDS,
+            "live epoch-history authority exceeds its authenticated history/schedule bound"
+        );
+        Ok(())
+    }
+
     fn key_rotation_semantic_digest(&self, target_epoch: u64) -> anyhow::Result<Option<[u8; 32]>> {
         let rotations = self
             .certified_key_rotations
             .read()
             .map_err(|_| anyhow::anyhow!("key-rotation registry lock is poisoned"))?;
-        rotations
-            .get(&target_epoch)
-            .map(|rotation| {
-                rotation.certificate.semantic_digest(&rotation.context).map_err(Into::into)
-            })
-            .transpose()
+        Ok(rotations.get(&target_epoch).map(|rotation| rotation.semantic_digest))
+    }
+
+    fn receiver_key_commitment_for_epoch(
+        &self,
+        epoch: u64,
+    ) -> anyhow::Result<crate::receiver_key_accumulator::ReceiverKeyAccumulatorCommitment> {
+        if epoch == 0 {
+            return self
+                .scenario
+                .bootstrap_receiver_key_accumulator(self.scenario.quic_network_id()?)
+                .map_err(Into::into);
+        }
+        let rotations = self
+            .certified_key_rotations
+            .read()
+            .map_err(|_| anyhow::anyhow!("key-rotation registry lock is poisoned"))?;
+        let rotation = rotations
+            .get(&epoch)
+            .with_context(|| format!("epoch {epoch} lacks its receiver-key accumulator update"))?;
+        Ok(rotation.receiver_keys)
     }
 
     async fn load_epoch_history_object(
@@ -7211,7 +11320,12 @@ impl PartyServer {
         epoch: u64,
     ) -> anyhow::Result<Option<(crate::epoch_history::EpochHistoryEntry, LoadedEpochHistoryObjects)>>
     {
-        let mut loaded = self.preload_epoch_history_reader(state, None).await?;
+        // Direct lookup must not preload the entire hot suffix. At the maximum policy that would
+        // read hundreds of multi-megabyte certificate artifacts for one authenticated peer
+        // query, even though a hot lookup needs no object payload at all. A cold lookup needs only
+        // its fixed-depth authenticated index path and the entry named by its leaf; callers load
+        // that entry's exact certificate objects lazily.
+        let mut loaded = LoadedEpochHistoryObjects::default();
         if state.cold_through().is_some_and(|cold| epoch <= cold) {
             self.preload_epoch_history_index_path(state, epoch, true, &mut loaded).await?;
         }
@@ -7296,6 +11410,7 @@ impl PartyServer {
 
     /// Current authenticated parent used by the QUIC history puller.
     pub async fn epoch_history_catchup_parent(&self) -> anyhow::Result<EpochHistoryParent> {
+        self.reconcile_proactive_refresh_schedule_from_history(unix_time_millis()?).await?;
         self.epoch_history.read().await.parent().map_err(Into::into)
     }
 
@@ -7303,79 +11418,48 @@ impl PartyServer {
         &self,
         record: &ActivationCertificateRecord,
         allow_authenticated_checkpoint_source: bool,
+        embedded: Option<&KeyRotationContext>,
     ) -> anyhow::Result<KeyRotationContext> {
         let source = record
             .transition
             .old
             .as_ref()
             .context("key-rotated activation omitted its source epoch")?;
-        let context = match self.key_rotation_context_for_source(source) {
-            Ok(Some(context)) => context,
-            Ok(None) => anyhow::bail!("activation has no receiver-key rotation policy"),
-            Err(error) if !allow_authenticated_checkpoint_source => return Err(error),
-            Err(_) => {
-                // The authenticated cold-history boundary is a local trust checkpoint. Its
-                // predecessor rotation may already have been deliberately compacted, so recover
-                // the source fault policy from immutable governance when configured, or from the
-                // invariant same-layout dynamic refresh policy otherwise. This exception is
-                // never available to peer catch-up or ordinary hot-history validation.
-                source.validate()?;
-                let source_fault_bound = if let Ok(specification) =
-                    self.scenario.committee_spec(source.committee.epoch)
-                {
-                    specification.fault_bound
-                } else {
-                    anyhow::ensure!(
-                        same_refresh_layout(&source.committee, &record.transition.target),
-                        "unconfigured history checkpoint changed committee layout"
-                    );
-                    record.transition.fault_bound
-                };
-                source.committee.validate_async_security_with_faults(source_fault_bound)?;
-                let target_policy = if let Some(configured) =
-                    self.scenario.configured_key_rotation_target_policy(&source.committee)?
-                {
-                    configured
-                } else {
-                    let target_epoch = source
-                        .committee
-                        .epoch
-                        .checked_add(1)
-                        .context("history checkpoint target epoch exhausted")?;
-                    let eligible = Committee {
-                        epoch: target_epoch,
-                        threshold: source.committee.threshold,
-                        members: self
-                            .scenario
-                            .parties
-                            .iter()
-                            .map(|party| Member {
-                                id: party.id,
-                                signing_key: party.signing_key.0,
-                                encryption_key: eligibility_reference_key(
-                                    target_epoch,
-                                    party.id,
-                                    party.signing_key.0,
-                                ),
-                            })
-                            .collect(),
-                    };
-                    KeyRotationTargetPolicy::new(
-                        &source.committee,
-                        eligible,
-                        source.committee.n(),
-                        source_fault_bound,
-                    )?
-                };
-                KeyRotationContext::new(
-                    self.scenario.quic_network_id()?,
-                    source.committee.clone(),
-                    source.activation_digest()?,
-                    source_fault_bound,
-                    target_policy,
-                )?
+        if let Some(context) = embedded {
+            context.validate()?;
+            anyhow::ensure!(
+                context.network() == self.scenario.quic_network_id()?
+                    && context.source() == &source.committee
+                    && context.source_activation() == source.activation_digest()?
+                    && context.target_epoch() == record.value.epoch
+                    && context.target_fault_bound() == record.transition.fault_bound,
+                "embedded receiver-key context differs from authenticated epoch history"
+            );
+            if allow_authenticated_checkpoint_source {
+                // The caller binds this record to an exact authenticated history entry and then
+                // verifies the embedded rotation certificate. Do not make cold verification
+                // depend on whichever unrelated hot predecessor happened to remain cached.
+                return Ok(context.clone());
             }
-        };
+            let (trusted_source, trusted_fault_bound) =
+                self.trusted_committee_and_fault_bound(source.committee.epoch)?;
+            anyhow::ensure!(
+                trusted_source.digest() == source.committee.digest()
+                    && trusted_fault_bound == context.source_fault_bound(),
+                "embedded receiver-key context differs from its certified source"
+            );
+            let expected = self
+                .key_rotation_context_for_source(source)?
+                .context("authenticated source has no receiver-key rotation policy")?;
+            anyhow::ensure!(
+                context == &expected,
+                "embedded receiver-key context differs from authenticated source policy"
+            );
+            return Ok(context.clone());
+        }
+        let context = self
+            .key_rotation_context_for_source(source)?
+            .context("activation has no receiver-key rotation policy")?;
         anyhow::ensure!(
             context.target_epoch() == record.value.epoch
                 && context.target_fault_bound() == record.transition.fault_bound,
@@ -7384,12 +11468,14 @@ impl PartyServer {
         Ok(context)
     }
 
-    fn register_history_key_rotation(
+    fn verified_history_key_rotation(
         &self,
         record: &ActivationCertificateRecord,
         certificate_bytes: Option<&[u8]>,
         allow_authenticated_checkpoint_source: bool,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<
+        Option<(KeyRotationContext, KeyRotationCertificate, VerifiedKeyRotationCertificate)>,
+    > {
         match (record.value.history_link.key_rotation_digest(), certificate_bytes) {
             (None, None) => {
                 anyhow::ensure!(
@@ -7398,21 +11484,25 @@ impl PartyServer {
                         && record.transition.old.is_none(),
                     "non-genesis epoch history omitted its receiver-key rotation certificate"
                 );
-                Ok(())
+                Ok(None)
             }
             (Some(expected_digest), Some(bytes)) => {
-                let context = self
-                    .history_key_rotation_context(record, allow_authenticated_checkpoint_source)?;
-                let certificate = KeyRotationCertificate::decode(&context, bytes)?;
-                let target = certificate.verify(&context)?;
+                let certificate = KeyRotationCertificate::decode_embedded(bytes)?;
+                let context = self.history_key_rotation_context(
+                    record,
+                    allow_authenticated_checkpoint_source,
+                    Some(certificate.embedded_context()),
+                )?;
+                let verified = certificate.verify_rotation_certificate(&context)?;
+                let target = &verified.target;
                 anyhow::ensure!(
                     target.digest() == record.transition.target.digest()
                         && record.value.public.committee.digest() == target.digest()
-                        && certificate.semantic_digest(&context)? == expected_digest,
+                        && record.value.history_link.receiver_keys() == verified.receiver_keys
+                        && verified.semantic_digest() == expected_digest,
                     "epoch-history key rotation differs from its activation"
                 );
-                self.register_certified_key_rotation(context, certificate)?;
-                Ok(())
+                Ok(Some((context, certificate, verified)))
             }
             _ => anyhow::bail!(
                 "epoch-history activation and key-rotation certificate presence differ"
@@ -7420,10 +11510,28 @@ impl PartyServer {
         }
     }
 
+    async fn register_history_key_rotation(
+        &self,
+        record: &ActivationCertificateRecord,
+        certificate_bytes: Option<&[u8]>,
+        allow_authenticated_checkpoint_source: bool,
+    ) -> anyhow::Result<()> {
+        if let Some((context, certificate, _)) = self.verified_history_key_rotation(
+            record,
+            certificate_bytes,
+            allow_authenticated_checkpoint_source,
+        )? {
+            self.register_certified_key_rotation(context, certificate).await?;
+        }
+        Ok(())
+    }
+
     /// Verify and append one immediate successor reconstructed from bounded QUIC object chunks.
     ///
-    /// This path deliberately records public activation history only. A member which did not
-    /// complete AVSS cannot manufacture a signing share from a certificate.
+    /// A target member with the exact locally staged AVSS result completes the ordinary activation
+    /// path so its proactive-refresh schedule reaches stable storage before the certificate. A
+    /// member which did not complete AVSS records public history only and cannot manufacture a
+    /// signing share from a certificate.
     pub async fn apply_epoch_history_catchup(
         self: &Arc<Self>,
         authenticated_source: PartyId,
@@ -7440,9 +11548,21 @@ impl PartyServer {
         }
 
         let _epoch_transition = self.epoch_transition.lock().await;
-        let expected_parent = self.epoch_history.read().await.parent()?;
+        let history = self.epoch_history.read().await.clone();
+        let expected_parent = history.parent()?;
+        // A previous attempt can have won the activation/history CAS and then stopped before its
+        // passive schedule candidate reached stable storage. Certificate witness subsets are not
+        // consensus fields: persistence can retain an already-local, semantically equivalent
+        // representation whose content address differs from this retry. Recognize the installed
+        // tip by its witness-independent consensus link, then subject the supplied objects to the
+        // same complete transition, activation-certificate, and key-rotation verification below.
+        // A different stale parent/link remains a fork or replay error.
+        let exact_tip_repair = history
+            .hot_entries()
+            .last()
+            .is_some_and(|entry| entry.consensus_link() == manifest.link());
         anyhow::ensure!(
-            manifest.parent() == expected_parent,
+            manifest.parent() == expected_parent || exact_tip_repair,
             "epoch-history catch-up no longer extends the local tip"
         );
         let record: ActivationCertificateRecord = decode_postcard_exact(&activation_certificate)?;
@@ -7460,7 +11580,6 @@ impl PartyServer {
                 "epoch-zero history catch-up unexpectedly carries a predecessor"
             );
         } else {
-            let history = self.epoch_history.read().await.clone();
             let predecessor_epoch = record.value.epoch - 1;
             let (predecessor, mut loaded) = self
                 .epoch_history_entry(&history, predecessor_epoch)
@@ -7477,7 +11596,31 @@ impl PartyServer {
                 "epoch-history catch-up source epoch differs from the authenticated predecessor"
             );
         }
-        self.register_history_key_rotation(&record, key_rotation_certificate.as_deref(), false)?;
+        if let Some(old) = &record.transition.old
+            && let Some(staged) = self.staged.read().await.get(&old.committee.epoch)
+        {
+            anyhow::ensure!(
+                staged.response.public == *old,
+                "epoch-history catch-up source differs from the locally staged predecessor"
+            );
+            anyhow::bail!(
+                "epoch-history catch-up cannot advance beyond a locally staged predecessor activation"
+            );
+        }
+        // Finalize the exact embedded receiver-key decision before making it visible through the
+        // certified registry. An omitted eligible party may have persisted a target candidate
+        // before going offline. Merely registering this catch-up certificate would make later
+        // direct certificate gossip take its idempotent fast path and strand that candidate
+        // indefinitely (and, after cold compaction, outside the restart hot suffix).
+        //
+        // Finalization persists the verified certificate, promotes a selected candidate or erases
+        // an omitted candidate, and only then registers the decision. This step never manufactures
+        // a threshold share; only the exact locally staged AVSS result handled below may activate.
+        if let Some((context, certificate, _)) =
+            self.verified_history_key_rotation(&record, key_rotation_certificate.as_deref(), false)?
+        {
+            self.finalize_certified_key_rotation(context, certificate, false).await?;
+        }
         validate_avss_transition(self, &record.transition)?;
         verify_activation_certificate(
             self,
@@ -7485,6 +11628,63 @@ impl PartyServer {
             &record.value,
             &record.acknowledgements,
         )?;
+        let local_activation = if record.transition.target.member(self.party).is_ok() {
+            let staged = self.staged.read().await;
+            staged
+                .get(&record.value.epoch)
+                .map(|staged| {
+                    anyhow::ensure!(
+                        staged.transition == record.transition,
+                        "epoch-history activation differs from the local staged transition"
+                    );
+                    anyhow::ensure!(
+                        activation_value(&staged.response) == record.value,
+                        "epoch-history activation differs from the local staged value"
+                    );
+                    Ok::<_, anyhow::Error>(ActivateEpochRequest {
+                        transition: record.transition.clone(),
+                        value: record.value.clone(),
+                        acknowledgements: record.acknowledgements.clone(),
+                    })
+                })
+                .transpose()?
+        } else {
+            None
+        };
+        if let Some(request) = local_activation {
+            // `activate_epoch` takes the global consolidation-then-epoch lock order and revalidates
+            // the certificate, staged result, and history-tip CAS after this guard is released.
+            // Routing exact local catch-up through that path preserves its schedule-before-
+            // certificate crash invariant without weakening passive observation for shareless
+            // targets or non-members.
+            drop(_epoch_transition);
+            let _installed = activate_epoch(State(self.clone()), Json(request))
+                .await
+                .map_err(|error| error.0)?;
+            return Ok(());
+        }
+        let local_target_without_share = record.transition.target.member(self.party).is_ok();
+        // Serialize schedule preflight and passive publication with every live pacemaker mutation.
+        // The terminal candidate cannot be authenticated through history until its certificate
+        // wins the history CAS below, but structural/source conflicts are rejected first.
+        let schedule_mutation = if local_target_without_share {
+            None
+        } else {
+            Some(self.proactive_refresh_schedule_mutation.lock().await)
+        };
+        let passive_schedule = if local_target_without_share {
+            None
+        } else {
+            Some(self.proactive_refresh_schedule_for_activation_value(
+                &record.value,
+                unix_time_millis()?,
+            )?)
+        };
+        if let Some(candidate) = passive_schedule.as_ref() {
+            let existing = self.proactive_refresh_schedule.lock().await.clone();
+            self.preflight_passive_refresh_schedule(existing.as_ref(), candidate)
+                .context("epoch-history catch-up schedule preflight failed")?;
+        }
         self.persist_activation_certificate(
             &record.transition,
             &record.value,
@@ -7492,13 +11692,17 @@ impl PartyServer {
         )
         .await?;
         self.remember_certified_deposit_target(&record.value).await?;
-        if let Some(old) = &record.transition.old {
-            self.deposit_targets
-                .write()
-                .await
-                .entry(old.committee.epoch)
-                .or_insert_with(|| old.clone());
+        if local_target_without_share {
+            // A selected target which has not staged the exact AVSS result may authenticate public
+            // history, but it still owns no successor share. Retain the predecessor pacemaker so
+            // restart remains valid and later AVSS delivery can stage/activate normally; only the
+            // activation path may advance this local signer to the target schedule.
+            return Ok(());
         }
+        if let Some(schedule) = passive_schedule {
+            self.defer_or_promote_passive_refresh_schedule_locked(schedule).await?;
+        }
+        drop(schedule_mutation);
         Ok(())
     }
 
@@ -7508,33 +11712,39 @@ impl PartyServer {
         value: &ActivationValue,
         activation_certificate: &[u8],
     ) -> anyhow::Result<()> {
-        let mut state = self.epoch_history.write().await;
-        if state.tip_epoch() == Some(value.epoch) {
-            let tip = state.hot_entries().last().context("epoch-history tip lacks a hot entry")?;
+        let transition_digest = avss_transition_digest(transition)?;
+        let snapshot = {
+            let state = self.epoch_history.read().await;
+            state.clone()
+        };
+        if snapshot.tip_epoch() == Some(value.epoch) {
+            let tip =
+                snapshot.hot_entries().last().context("epoch-history tip lacks a hot entry")?;
             anyhow::ensure!(
                 tip.consensus_link() == value.history_link
-                    && tip.transition_digest() == avss_transition_digest(transition)?,
+                    && tip.transition_digest() == transition_digest,
                 "durable epoch-history tip conflicts with the activation retry"
             );
+            self.promote_receiver_keys_after_history_cas(value).await?;
             return Ok(());
         }
-        let expected_epoch = state.tip_epoch().map_or(Ok(0), |epoch| {
+        let expected_epoch = snapshot.tip_epoch().map_or(Ok(0), |epoch| {
             epoch.checked_add(1).context("epoch-history number exhausted")
         })?;
         anyhow::ensure!(
-            value.epoch == expected_epoch && transition.history_parent == state.parent()?,
+            value.epoch == expected_epoch && transition.history_parent == snapshot.parent()?,
             "activation does not immediately extend the durable epoch-history tip"
         );
 
-        let insertion_epoch = (state.hot_entries().len()
-            >= usize::from(state.policy().hot_entries()))
-        .then(|| state.cold_through().map_or(0, |epoch| epoch.saturating_add(1)));
-        let mut loaded = self.preload_epoch_history_reader(&state, insertion_epoch).await?;
+        let insertion_epoch = (snapshot.hot_entries().len()
+            >= usize::from(snapshot.policy().hot_entries()))
+        .then(|| snapshot.cold_through().map_or(0, |epoch| epoch.saturating_add(1)));
+        let mut loaded = self.preload_epoch_history_reader(&snapshot, insertion_epoch).await?;
 
         let predecessor_supersession = if value.epoch == 0 {
             None
         } else {
-            let predecessor = state
+            let predecessor = snapshot
                 .lookup(value.epoch - 1, &loaded)?
                 .context("epoch-history predecessor is unavailable")?;
             let predecessor_bytes = self
@@ -7555,20 +11765,19 @@ impl PartyServer {
             );
             let predecessor_session = predecessor_record.transition.session;
             let predecessor_transition = avss_transition_digest(&predecessor_record.transition)?;
-            let outbox_digests = self
-                .avss
-                .lock()
-                .await
-                .get(&predecessor_session)
-                .map(|run| {
-                    anyhow::ensure!(
-                        avss_transition_digest(&run.transition)? == predecessor_transition,
-                        "predecessor AVSS reducer belongs to another transition"
-                    );
-                    Ok(run.pending_avss.keys().map(|(_, digest)| *digest).collect::<Vec<_>>())
-                })
-                .transpose()?
-                .unwrap_or_default();
+            let outbox_digests = {
+                let runs = self.avss.lock().await;
+                runs.get(&predecessor_session)
+                    .map(|run| {
+                        anyhow::ensure!(
+                            avss_transition_digest(&run.transition)? == predecessor_transition,
+                            "predecessor AVSS reducer belongs to another transition"
+                        );
+                        Ok(run.pending_avss.keys().map(|(_, digest)| *digest).collect::<Vec<_>>())
+                    })
+                    .transpose()?
+                    .unwrap_or_default()
+            };
             Some(AvssSuccessorSupersession::new(
                 value.epoch - 1,
                 predecessor.root()?,
@@ -7587,13 +11796,36 @@ impl PartyServer {
             .get(&value.epoch)
             .map(|rotation| rotation.certificate.encode(&rotation.context))
             .transpose()?;
+        // The predecessor certificate and exact reducer outbox were authenticated without
+        // holding the history writer. Reacquire the writer only after releasing `avss`, then bind
+        // that snapshot to the unchanged history state before it can authorize a supersession.
+        // This preserves the absent-session serialization in
+        // `transition_has_terminal_avss_replay_state` without an `epoch_history -> avss` lock
+        // inversion.
+        let mut state = self.epoch_history.write().await;
+        if state.tip_epoch() == Some(value.epoch) {
+            let tip = state.hot_entries().last().context("epoch-history tip lacks a hot entry")?;
+            anyhow::ensure!(
+                tip.consensus_link() == value.history_link
+                    && tip.transition_digest() == transition_digest,
+                "durable epoch-history tip conflicts with the activation retry"
+            );
+            drop(state);
+            self.promote_receiver_keys_after_history_cas(value).await?;
+            return Ok(());
+        }
+        anyhow::ensure!(
+            *state == snapshot,
+            "epoch history changed while preparing its successor activation"
+        );
         let pending = state.prepare_append(
             EpochHistoryEntryInput {
                 epoch: value.epoch,
                 parent: transition.history_parent,
-                transition_digest: avss_transition_digest(transition)?,
+                transition_digest,
                 activation_digest: value.activation_digest,
                 avss_transcript_digest: value.avss_transcript_digest,
+                receiver_keys: value.history_link.receiver_keys(),
                 key_rotation_digest: value.history_link.key_rotation_digest(),
                 activation_certificate: activation_certificate.to_vec(),
                 key_rotation_certificate,
@@ -7654,6 +11886,7 @@ impl PartyServer {
         let cleanup = verified.authorize_cleanup(readback.state.as_bytes())?;
         *state = EpochHistoryState::from_bytes(readback.state.as_bytes())?;
         drop(state);
+        self.promote_receiver_keys_after_history_cas(value).await?;
 
         for closure in cleanup.superseded_avss() {
             self.close_superseded_avss_transition(*closure).await?;
@@ -7671,24 +11904,80 @@ impl PartyServer {
         closure: AvssSuccessorSupersession,
     ) -> anyhow::Result<()> {
         let session = SessionId(closure.predecessor_session());
-        let normal_purpose = {
-            let mut purpose = b"avss-finalized/v2/".to_vec();
-            purpose.extend_from_slice(&closure.predecessor_transition());
-            purpose
-        };
+        let context = closure.predecessor_transition();
+        // Serialize the tombstone CAS with reducer checkpoints and outbox ACKs. Publishing the
+        // supersession tombstone before taking this lock leaves a window where an ACK observes the
+        // new tombstone beside the old in-memory run and tries to rewrite it with the ordinary
+        // finalization purpose.
+        let mut runs = self.avss.lock().await;
+        let normal_purpose = avss_tombstone_purpose_for_digest(context);
+        let superseded_purpose = superseded_avss_tombstone_purpose(closure)?;
         let path = self.protocol_store.session_tombstone_path(session);
         if tokio::fs::try_exists(&path).await? {
             let existing = self.protocol_store.load_session_tombstone(session).await?;
             if existing.purpose() == normal_purpose {
-                self.avss.lock().await.remove(&session);
+                self.protocol_store
+                    .close_session_state(session, context, &normal_purpose, &mut OsRng)
+                    .await?;
+                runs.remove(&session);
+                return Ok(());
+            }
+            anyhow::ensure!(
+                existing.purpose() == superseded_purpose,
+                "AVSS supersession cleanup found another permanent tombstone"
+            );
+            self.protocol_store
+                .close_session_state(session, context, &superseded_purpose, &mut OsRng)
+                .await?;
+            runs.remove(&session);
+            return Ok(());
+        }
+
+        // A successor certificate is global finality, not proof that every honest member of the
+        // predecessor target reconstructed its own share. This cleanup can run while the reducer
+        // is live, or during certificate replay before durable session snapshots have been loaded
+        // into RAM. Classify the exact durable reducer in either ordering before publishing the
+        // permanent supersession tombstone.
+        let durable_run;
+        let run = if let Some(run) = runs.get(&session) {
+            Some(run)
+        } else {
+            let state_path = self.protocol_store.session_state_path(session, context);
+            if tokio::fs::try_exists(state_path).await? {
+                let bytes = self.protocol_store.load_session_state(session, context).await?;
+                let DurableSessionState::Avss(run) = decode_postcard_exact(bytes.as_bytes())?;
+                durable_run = run;
+                Some(&durable_run)
+            } else {
+                None
+            }
+        };
+        if let Some(run) = run {
+            anyhow::ensure!(
+                run.transition.session == session
+                    && avss_transition_digest(&run.transition)? == context
+                    && run.transition.target.epoch == closure.predecessor_epoch(),
+                "superseded AVSS reducer differs from its authenticated history closure"
+            );
+            validate_avss_transition(self, &run.transition)?;
+            validate_avss_secret_compaction(run)?;
+            validate_qual_witness_state(self, run)?;
+            if run.transition.target.member(self.party).is_ok() && run.finalized.is_none() {
+                anyhow::ensure!(
+                    !run.secret_compacted,
+                    "unfinalized local-target AVSS reducer was already secret-compacted"
+                );
+                // Keep both the snapshot and any live reducer. Once this party finalizes, the
+                // ordinary drain path or an idempotent cleanup retry can apply the already
+                // committed supersession and bound storage again.
                 return Ok(());
             }
         }
-        let purpose = superseded_avss_tombstone_purpose(closure)?;
+
         self.protocol_store
-            .close_session_state(session, closure.predecessor_transition(), &purpose, &mut OsRng)
+            .close_session_state(session, context, &superseded_purpose, &mut OsRng)
             .await?;
-        self.avss.lock().await.remove(&session);
+        runs.remove(&session);
         Ok(())
     }
 
@@ -7712,7 +12001,7 @@ impl PartyServer {
             Some(reference) => Some(self.load_epoch_history_object(reference, &mut loaded).await?),
             None => None,
         };
-        self.register_history_key_rotation(&record, rotation_bytes.as_deref(), true)?;
+        self.register_history_key_rotation(&record, rotation_bytes.as_deref(), true).await?;
         verify_activation_certificate(
             self,
             &record.transition,
@@ -7731,18 +12020,55 @@ impl PartyServer {
             .destroy_archived_activation_records(transition_key, record.value.activation_digest)
             .await?;
         if rotation_bytes.is_some() {
-            let context = self.history_key_rotation_context(&record, true)?;
+            let certificate = KeyRotationCertificate::decode_embedded(
+                rotation_bytes.as_deref().context("rotation bytes disappeared")?,
+            )?;
+            let context = self.history_key_rotation_context(
+                &record,
+                true,
+                Some(certificate.embedded_context()),
+            )?;
             self.protocol_store.destroy_archived_key_rotation_certificate(&context).await?;
         }
-        self.history_links
-            .write()
-            .map_err(|_| anyhow::anyhow!("epoch-history registry lock is poisoned"))?
-            .retain(|linked_epoch, _| *linked_epoch >= epoch);
-        self.certified_key_rotations
-            .write()
-            .map_err(|_| anyhow::anyhow!("key-rotation registry lock is poisoned"))?
-            .retain(|target_epoch, _| *target_epoch >= epoch);
+        // A history CAS may coldify the source after the live pacemaker authenticated it but
+        // before the caller derives/uses its next transition. Preserve exactly that durable
+        // source/link and immediate target rotation; all arbitrary cold reads remain stateless.
+        let schedule = self.proactive_refresh_schedule.lock().await.clone();
+        let scheduled_source = schedule.as_ref().map(|schedule| schedule.source_epoch);
+        let scheduled_target = schedule.as_ref().and_then(|schedule| schedule.target_epoch);
+        {
+            let mut links = self
+                .history_links
+                .write()
+                .map_err(|_| anyhow::anyhow!("epoch-history registry lock is poisoned"))?;
+            links.retain(|linked_epoch, _| {
+                *linked_epoch >= epoch || scheduled_source == Some(*linked_epoch)
+            });
+            anyhow::ensure!(
+                links.len() <= MAX_SCHEDULE_PINNED_EPOCH_RECORDS,
+                "epoch-history cleanup retained too many live schedule links"
+            );
+        }
+        {
+            let mut rotations = self
+                .certified_key_rotations
+                .write()
+                .map_err(|_| anyhow::anyhow!("key-rotation registry lock is poisoned"))?;
+            rotations.retain(|target_epoch, _| {
+                *target_epoch >= epoch
+                    || scheduled_source == Some(*target_epoch)
+                    || scheduled_target == Some(*target_epoch)
+            });
+            anyhow::ensure!(
+                rotations.len() <= MAX_SCHEDULE_PINNED_EPOCH_RECORDS,
+                "epoch-history cleanup retained too many live schedule rotations"
+            );
+        }
         self.certified_avss_sessions.write().await.remove(&record.transition.session);
+        self.activation_gossip_records
+            .write()
+            .await
+            .remove(&(record.value.epoch, record.value.activation_digest));
         Ok(())
     }
 
@@ -7751,16 +12077,76 @@ impl PartyServer {
         source: &EpochPublic,
         now_unix_ms: u64,
     ) -> anyhow::Result<ProactiveRefreshSchedule> {
+        let context = self.key_rotation_context_for_source(source)?;
+        self.proactive_refresh_schedule_for_context(source, context.as_ref(), now_unix_ms)
+    }
+
+    fn proactive_refresh_schedule_for_pending_activation(
+        &self,
+        value: &ActivationValue,
+        now_unix_ms: u64,
+    ) -> anyhow::Result<ProactiveRefreshSchedule> {
+        let mut schedule =
+            self.proactive_refresh_schedule_for_activation_value(value, now_unix_ms)?;
+        schedule.phase = ProactiveRefreshSchedulePhase::PendingActivation;
+        Ok(schedule)
+    }
+
+    fn proactive_refresh_schedule_for_activation_value(
+        &self,
+        value: &ActivationValue,
+        now_unix_ms: u64,
+    ) -> anyhow::Result<ProactiveRefreshSchedule> {
+        anyhow::ensure!(
+            value.epoch == value.public.committee.epoch
+                && value.history_link.epoch() == value.epoch
+                && value.history_link.key_id() == value.public.key_id
+                && value.history_link.activation_digest() == value.activation_digest
+                && value.public.activation_digest()? == value.activation_digest,
+            "pending activation history link differs from its public value"
+        );
+        let context = self.key_rotation_context_for_source_receiver_keys(
+            &value.public,
+            value.history_link.receiver_keys(),
+        )?;
+        self.proactive_refresh_schedule_for_context(&value.public, context.as_ref(), now_unix_ms)
+    }
+
+    fn proactive_refresh_schedule_for_authenticated_activation(
+        &self,
+        authenticated: &AuthenticatedEpochActivation,
+        now_unix_ms: u64,
+    ) -> anyhow::Result<ProactiveRefreshSchedule> {
+        let value = &authenticated.value;
+        anyhow::ensure!(
+            value.epoch == value.public.committee.epoch
+                && value.history_link.epoch() == value.epoch
+                && value.history_link.key_id() == value.public.key_id
+                && value.history_link.activation_digest() == value.activation_digest
+                && value.public.activation_digest()? == value.activation_digest,
+            "authenticated activation history link differs from its public value"
+        );
+        let context = self.key_rotation_context_for_authenticated_source(
+            &value.public,
+            value.history_link.receiver_keys(),
+            authenticated.fault_bound,
+        )?;
+        self.proactive_refresh_schedule_for_context(&value.public, context.as_ref(), now_unix_ms)
+    }
+
+    fn proactive_refresh_schedule_for_context(
+        &self,
+        source: &EpochPublic,
+        context: Option<&KeyRotationContext>,
+        now_unix_ms: u64,
+    ) -> anyhow::Result<ProactiveRefreshSchedule> {
         let interval_ms = self
             .scenario
             .proactive_refresh_interval_seconds
             .checked_mul(1_000)
             .context("proactive refresh interval overflow")?;
-        let context = self.key_rotation_context_for_source(source)?;
-        let target_epoch = context
-            .as_ref()
-            .filter(|context| context.is_participant(self.party))
-            .map(KeyRotationContext::target_epoch);
+        let participant_context = context.filter(|context| context.is_participant(self.party));
+        let target_epoch = participant_context.map(KeyRotationContext::target_epoch);
         let due_unix_ms = target_epoch
             .map(|_| {
                 if self.acceptance_proactive_refresh_hold_enabled {
@@ -7772,17 +12158,578 @@ impl PartyServer {
                 }
             })
             .transpose()?;
+        let selection_fallback_due_unix_ms = match (participant_context, due_unix_ms) {
+            (Some(_), Some(ACCEPTANCE_PROACTIVE_REFRESH_HELD_DUE_UNIX_MS)) => {
+                Some(ACCEPTANCE_PROACTIVE_REFRESH_HELD_DUE_UNIX_MS)
+            }
+            (Some(context), Some(due)) => Some(
+                due.checked_add(context.target_policy().selection_fallback_window_ms())
+                    .context("key-rotation selection fallback deadline overflow")?,
+            ),
+            (None, None) => None,
+            _ => anyhow::bail!("proactive refresh context/deadline presence differs"),
+        };
         Ok(ProactiveRefreshSchedule {
             version: PROACTIVE_REFRESH_SCHEDULE_VERSION,
+            phase: ProactiveRefreshSchedulePhase::Armed,
             source_epoch: source.committee.epoch,
             source_activation: source.activation_digest()?,
             target_epoch,
             due_unix_ms,
+            selection_fallback_due_unix_ms,
             rotation_view: None,
             rotation_view_started_unix_ms: None,
             rotation_timeout_exponent: 0,
             rotation_certificate_delivered_through: BTreeMap::new(),
+            deferred_observer: None,
         })
+    }
+
+    fn validate_fresh_passive_refresh_schedule(
+        schedule: &ProactiveRefreshSchedule,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            schedule.phase == ProactiveRefreshSchedulePhase::Armed
+                && schedule.rotation_view.is_none()
+                && schedule.rotation_view_started_unix_ms.is_none()
+                && schedule.rotation_timeout_exponent == 0
+                && schedule.rotation_certificate_delivered_through.is_empty()
+                && schedule.deferred_observer.is_none(),
+            "fresh passive observer schedule contains live pacemaker state"
+        );
+        Ok(())
+    }
+
+    async fn deferred_observer_from_schedule(
+        &self,
+        schedule: &ProactiveRefreshSchedule,
+    ) -> anyhow::Result<DeferredObserverRefreshSchedule> {
+        Self::validate_fresh_passive_refresh_schedule(schedule)?;
+        let authenticated =
+            self.authenticated_epoch_activation(schedule.source_epoch, false).await?;
+        let value = &authenticated.value;
+        let candidate = DeferredObserverRefreshSchedule {
+            source_epoch: schedule.source_epoch,
+            source_activation: schedule.source_activation,
+            source_history_root: value.history_link.root()?,
+            target_epoch: schedule.target_epoch,
+            due_unix_ms: schedule.due_unix_ms,
+            selection_fallback_due_unix_ms: schedule.selection_fallback_due_unix_ms,
+        };
+        self.validate_observer_candidate_against_activation(&candidate, &authenticated)?;
+        Ok(candidate)
+    }
+
+    fn promoted_observer_schedule(
+        &self,
+        candidate: DeferredObserverRefreshSchedule,
+        delivery_cursor: BTreeMap<PartyId, u64>,
+    ) -> ProactiveRefreshSchedule {
+        ProactiveRefreshSchedule {
+            version: PROACTIVE_REFRESH_SCHEDULE_VERSION,
+            phase: ProactiveRefreshSchedulePhase::Armed,
+            source_epoch: candidate.source_epoch,
+            source_activation: candidate.source_activation,
+            target_epoch: candidate.target_epoch,
+            due_unix_ms: candidate.due_unix_ms,
+            selection_fallback_due_unix_ms: candidate.selection_fallback_due_unix_ms,
+            rotation_view: None,
+            rotation_view_started_unix_ms: None,
+            rotation_timeout_exponent: 0,
+            rotation_certificate_delivered_through: delivery_cursor,
+            deferred_observer: None,
+        }
+    }
+
+    fn validate_deferred_observer_shape(
+        &self,
+        primary: &ProactiveRefreshSchedule,
+        candidate: &DeferredObserverRefreshSchedule,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            primary.phase == ProactiveRefreshSchedulePhase::Armed
+                && candidate.source_epoch > primary.source_epoch,
+            "deferred observer schedule does not follow the primary source"
+        );
+        anyhow::ensure!(
+            candidate.source_history_root != [0_u8; 32],
+            "deferred observer history root is zero"
+        );
+        anyhow::ensure!(
+            candidate.target_epoch.is_some() == candidate.due_unix_ms.is_some()
+                && candidate.target_epoch.is_some()
+                    == candidate.selection_fallback_due_unix_ms.is_some(),
+            "deferred observer target/deadline presence differs"
+        );
+        if let Some(target_epoch) = candidate.target_epoch {
+            anyhow::ensure!(
+                candidate.source_epoch.checked_add(1) == Some(target_epoch),
+                "deferred observer target is not the immediate successor"
+            );
+            let due = candidate.due_unix_ms.context("deferred observer deadline is absent")?;
+            let fallback = candidate
+                .selection_fallback_due_unix_ms
+                .context("deferred observer fallback deadline is absent")?;
+            anyhow::ensure!(due != 0 && fallback != 0, "deferred observer deadline is zero");
+            if due == ACCEPTANCE_PROACTIVE_REFRESH_HELD_DUE_UNIX_MS {
+                anyhow::ensure!(
+                    self.acceptance_proactive_refresh_hold_enabled
+                        && fallback == ACCEPTANCE_PROACTIVE_REFRESH_HELD_DUE_UNIX_MS,
+                    "deferred observer acceptance hold differs from its fallback deadline"
+                );
+            } else {
+                anyhow::ensure!(
+                    fallback > due,
+                    "deferred observer fallback deadline does not follow its primary deadline"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    fn preflight_passive_refresh_schedule(
+        &self,
+        existing: Option<&ProactiveRefreshSchedule>,
+        candidate: &ProactiveRefreshSchedule,
+    ) -> anyhow::Result<()> {
+        Self::validate_fresh_passive_refresh_schedule(candidate)?;
+        let Some(existing) = existing else {
+            anyhow::ensure!(
+                candidate.source_epoch == 0,
+                "first passive proactive schedule is not epoch zero"
+            );
+            return Ok(());
+        };
+        match candidate.source_epoch.cmp(&existing.source_epoch) {
+            std::cmp::Ordering::Less => Ok(()),
+            std::cmp::Ordering::Equal => {
+                anyhow::ensure!(
+                    existing.version == candidate.version
+                        && existing.phase == ProactiveRefreshSchedulePhase::Armed
+                        && existing.source_activation == candidate.source_activation
+                        && existing.target_epoch == candidate.target_epoch
+                        && existing.target_epoch.is_some() == existing.due_unix_ms.is_some()
+                        && existing.target_epoch.is_some()
+                            == existing.selection_fallback_due_unix_ms.is_some(),
+                    "passive certificate conflicts with the installed source schedule"
+                );
+                Ok(())
+            }
+            std::cmp::Ordering::Greater => {
+                anyhow::ensure!(
+                    existing.phase == ProactiveRefreshSchedulePhase::Armed,
+                    "passive certificate cannot advance a pending source schedule"
+                );
+                Ok(())
+            }
+        }
+    }
+
+    async fn local_refresh_signer_authority_is_retained(
+        &self,
+        primary: &ProactiveRefreshSchedule,
+    ) -> anyhow::Result<bool> {
+        if self.active_epoch.read().await.is_some() || !self.epochs.read().await.is_empty() {
+            return Ok(true);
+        }
+        if !self.staged.read().await.is_empty() {
+            return Ok(true);
+        }
+
+        // The live retirement path removes the in-memory share immediately before replacing its
+        // durable ciphertext with a retirement marker. Do not let a future refactor insert an
+        // await-and-promote cut between those operations: authenticate both records which can
+        // bound the primary schedule (the source itself and the one permitted predecessor) and
+        // treat either still-active secret as retained signer authority. Older records must
+        // already be authenticated retirement markers by the strict adjacent-schedule invariant.
+        let first = primary.source_epoch.saturating_sub(1);
+        for epoch in first..=primary.source_epoch {
+            let path = self.store.share_path(epoch);
+            if !tokio::fs::try_exists(&path).await? {
+                continue;
+            }
+            let source = self.authenticated_deposit_target(epoch).await?.0;
+            if self.store.load_if_active(epoch, source.committee.digest()).await?.is_some() {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    fn validate_observer_candidate_against_activation(
+        &self,
+        candidate: &DeferredObserverRefreshSchedule,
+        authenticated: &AuthenticatedEpochActivation,
+    ) -> anyhow::Result<()> {
+        let value = &authenticated.value;
+        let source = &value.public;
+        let source_history_root = value.history_link.root()?;
+        anyhow::ensure!(
+            source.committee.epoch == candidate.source_epoch
+                && source.activation_digest()? == candidate.source_activation
+                && source_history_root == candidate.source_history_root,
+            "deferred observer source differs from authenticated history"
+        );
+        let interval_ms = self
+            .scenario
+            .proactive_refresh_interval_seconds
+            .checked_mul(1_000)
+            .context("proactive refresh interval overflow")?;
+        let armed_at = match candidate.due_unix_ms {
+            None | Some(ACCEPTANCE_PROACTIVE_REFRESH_HELD_DUE_UNIX_MS) => 1,
+            Some(due) => due
+                .checked_sub(interval_ms)
+                .context("deferred observer deadline predates one refresh interval")?,
+        };
+        let expected =
+            self.proactive_refresh_schedule_for_authenticated_activation(authenticated, armed_at)?;
+        anyhow::ensure!(
+            expected.source_epoch == candidate.source_epoch
+                && expected.source_activation == candidate.source_activation
+                && expected.target_epoch == candidate.target_epoch
+                && expected.due_unix_ms == candidate.due_unix_ms
+                && expected.selection_fallback_due_unix_ms
+                    == candidate.selection_fallback_due_unix_ms,
+            "deferred observer schedule differs from its authenticated certified source"
+        );
+        Ok(())
+    }
+
+    /// Reauthenticate the sealed validation endpoint in constant work. The AEAD-protected
+    /// endpoint was advanced only after checking every intervening certified history entry, so
+    /// restart and promotion do not rewalk an unbounded lifetime prefix.
+    async fn authenticate_deferred_observer_schedule(
+        &self,
+        primary: &ProactiveRefreshSchedule,
+        candidate: &DeferredObserverRefreshSchedule,
+    ) -> anyhow::Result<EpochPublic> {
+        self.validate_deferred_observer_shape(primary, candidate)?;
+        let authenticated =
+            self.authenticated_epoch_activation(candidate.source_epoch, false).await?;
+        self.validate_observer_candidate_against_activation(candidate, &authenticated)?;
+        Ok(authenticated.value.public)
+    }
+
+    /// Return whether this process has classified and durably retained a usable share for one
+    /// selected history epoch. This is used only to distinguish an intentionally shareless (or
+    /// crash-orphaned, not-yet-restaged) genesis from an impossible missing-schedule state;
+    /// passive reconciliation never crosses any committee which selects this party.
+    async fn local_history_share_is_durably_retained(
+        &self,
+        source: &EpochPublic,
+    ) -> anyhow::Result<bool> {
+        if source.committee.member(self.party).is_err() {
+            return Ok(false);
+        }
+        let epoch = source.committee.epoch;
+        let active = self.epochs.read().await.get(&epoch).map(|share| share.public());
+        if let Some(active) = active.as_ref() {
+            anyhow::ensure!(
+                active == source,
+                "active local share differs from authenticated epoch history"
+            );
+        }
+        let staged = self.staged.read().await.get(&epoch).map(|staged| {
+            (
+                staged.share.public(),
+                staged.response.public.clone(),
+                staged.transition.target.clone(),
+            )
+        });
+        if let Some((share, response, target)) = staged.as_ref() {
+            anyhow::ensure!(
+                share == source && response == source && target == &source.committee,
+                "staged local share differs from authenticated epoch history"
+            );
+        }
+        anyhow::ensure!(
+            active.is_none() || staged.is_none(),
+            "authenticated history epoch is both active and staged"
+        );
+        let locally_classified = active.is_some() || staged.is_some();
+        let path = self.store.share_path(epoch);
+        if !tokio::fs::try_exists(path).await? {
+            anyhow::ensure!(
+                !locally_classified,
+                "active or staged local share is absent from durable storage"
+            );
+            return Ok(false);
+        }
+        let durable = self.store.load_if_active(epoch, source.committee.digest()).await?;
+        if let Some(share) = durable.as_ref() {
+            anyhow::ensure!(
+                share.public() == *source,
+                "durable local share differs from authenticated epoch history"
+            );
+        }
+        anyhow::ensure!(
+            !locally_classified || durable.is_some(),
+            "active or staged local share has already been durably retired"
+        );
+        Ok(locally_classified && durable.is_some())
+    }
+
+    /// Authenticate only the history suffix after the primary schedule's sealed endpoint and
+    /// return its latest safe passive source. Every epoch which selects this party is a hard
+    /// scheduling boundary: its normal activation owns a write-ahead schedule, so passive history
+    /// may remain public but must preserve the predecessor instead of skipping signer authority.
+    async fn latest_safe_passive_refresh_source(
+        &self,
+        primary: &ProactiveRefreshSchedule,
+        history_tip: u64,
+    ) -> anyhow::Result<Option<AuthenticatedEpochActivation>> {
+        let (mut source, cursor_epoch) = match primary.deferred_observer.as_ref() {
+            Some(existing) => {
+                let source =
+                    self.authenticate_deferred_observer_schedule(primary, existing).await?;
+                (source, existing.source_epoch)
+            }
+            None => {
+                let source = self.authenticated_deposit_target(primary.source_epoch).await?.0;
+                anyhow::ensure!(
+                    source.activation_digest()? == primary.source_activation,
+                    "primary observer source differs from authenticated history"
+                );
+                (source, primary.source_epoch)
+            }
+        };
+        if history_tip <= cursor_epoch {
+            return Ok(None);
+        }
+        let first_epoch =
+            cursor_epoch.checked_add(1).context("observer history epoch exhausted")?;
+        for epoch in first_epoch..=history_tip {
+            let successor = self.authenticated_deposit_target(epoch).await?.0;
+            anyhow::ensure!(
+                successor.committee.epoch == epoch
+                    && successor.key_id == source.key_id
+                    && successor.group_key_bytes() == source.group_key_bytes(),
+                "passive refresh history changes the threshold key"
+            );
+            if successor.committee.member(self.party).is_ok() {
+                break;
+            }
+            source = successor;
+        }
+        if source.committee.epoch == cursor_epoch {
+            return Ok(None);
+        }
+        let authenticated =
+            self.authenticated_epoch_activation(source.committee.epoch, false).await?;
+        anyhow::ensure!(
+            authenticated.value.public == source,
+            "safe passive refresh endpoint changed while loading its history link"
+        );
+        Ok(Some(authenticated))
+    }
+
+    /// Repair a crash after the authenticated history CAS but before its bounded passive schedule
+    /// update. Existing primary/deferred deadlines remain authoritative; only a newly observed
+    /// suffix endpoint samples `now_unix_ms`.
+    async fn reconcile_proactive_refresh_schedule_from_history(
+        &self,
+        now_unix_ms: u64,
+    ) -> anyhow::Result<()> {
+        let _epoch_transition = self.epoch_transition.lock().await;
+        let _schedule_mutation = self.proactive_refresh_schedule_mutation.lock().await;
+        let Some(history_tip) = self.epoch_history.read().await.tip_epoch() else {
+            return Ok(());
+        };
+        let restored_primary = { self.proactive_refresh_schedule.lock().await.clone() };
+        let primary = match restored_primary {
+            Some(primary) => primary,
+            None => {
+                let genesis = self.authenticated_epoch_activation_value(0).await?;
+                if genesis.public.committee.member(self.party).is_ok() {
+                    if self.local_history_share_is_durably_retained(&genesis.public).await? {
+                        anyhow::bail!(
+                            "durable genesis share lacks its write-ahead proactive schedule"
+                        );
+                    }
+                    // A selected party which never staged the certified share deliberately has
+                    // no local signer schedule. Public history remains available, but cannot
+                    // create that share or skip over its missing epoch.
+                    return Ok(());
+                }
+                let genesis_schedule =
+                    self.proactive_refresh_schedule_for_activation_value(&genesis, now_unix_ms)?;
+                self.defer_or_promote_passive_refresh_schedule_locked(genesis_schedule).await?;
+                self.proactive_refresh_schedule
+                    .lock()
+                    .await
+                    .clone()
+                    .context("genesis history reconciliation did not publish its schedule")?
+            }
+        };
+        if primary.phase == ProactiveRefreshSchedulePhase::PendingActivation {
+            return Ok(());
+        }
+        let cursor_epoch = primary
+            .deferred_observer
+            .as_ref()
+            .map_or(primary.source_epoch, |candidate| candidate.source_epoch);
+        if history_tip <= cursor_epoch {
+            return Ok(());
+        }
+        let Some(source) = self.latest_safe_passive_refresh_source(&primary, history_tip).await?
+        else {
+            return Ok(());
+        };
+        let candidate =
+            self.proactive_refresh_schedule_for_authenticated_activation(&source, now_unix_ms)?;
+        self.defer_or_promote_passive_refresh_schedule_locked(candidate).await
+    }
+
+    /// Advance the sealed validation cursor by only the newly observed certified suffix. A
+    /// crossed committee containing this party is rejected conservatively. A normal local
+    /// activation has already persisted its own schedule before publishing history, so passive
+    /// repair must never skip a selected epoch or conflict with a pending activation schedule.
+    async fn authenticate_deferred_observer_delta(
+        &self,
+        primary: &ProactiveRefreshSchedule,
+        candidate: &DeferredObserverRefreshSchedule,
+    ) -> anyhow::Result<()> {
+        self.validate_deferred_observer_shape(primary, candidate)?;
+        let (mut source, first_epoch) = match primary.deferred_observer.as_ref() {
+            Some(existing) => {
+                anyhow::ensure!(
+                    existing.source_epoch < candidate.source_epoch,
+                    "deferred observer delta does not advance its sealed endpoint"
+                );
+                let source =
+                    self.authenticate_deferred_observer_schedule(primary, existing).await?;
+                (source, existing.source_epoch.checked_add(1).context("observer epoch exhausted")?)
+            }
+            None => {
+                let source = self.authenticated_deposit_target(primary.source_epoch).await?.0;
+                anyhow::ensure!(
+                    source.activation_digest()? == primary.source_activation,
+                    "primary observer source differs from authenticated history"
+                );
+                (source, primary.source_epoch.checked_add(1).context("observer epoch exhausted")?)
+            }
+        };
+        let mut terminal_root = [0_u8; 32];
+        for epoch in first_epoch..=candidate.source_epoch {
+            let (successor, history_root) = self.authenticated_deposit_target(epoch).await?;
+            anyhow::ensure!(
+                successor.committee.epoch == epoch
+                    && successor.key_id == source.key_id
+                    && successor.group_key_bytes() == source.group_key_bytes(),
+                "deferred observer history changes the threshold key"
+            );
+            anyhow::ensure!(
+                successor.committee.member(self.party).is_err(),
+                "deferred observer history crosses a locally selected signer epoch"
+            );
+            source = successor;
+            terminal_root = history_root;
+        }
+        let authenticated =
+            self.authenticated_epoch_activation(candidate.source_epoch, false).await?;
+        anyhow::ensure!(
+            authenticated.value.public == source
+                && authenticated.value.history_link.root()? == terminal_root,
+            "deferred observer endpoint changed while loading its authenticated activation"
+        );
+        self.validate_observer_candidate_against_activation(candidate, &authenticated)
+    }
+
+    /// Promote the one bounded passive candidate only after every older local share has become
+    /// unusable. The caller holds `proactive_refresh_schedule_mutation`; live callers additionally
+    /// hold `epoch_transition`, while construction has not exposed this server to concurrency.
+    async fn promote_deferred_observer_schedule_locked(&self) -> anyhow::Result<bool> {
+        let primary = self
+            .proactive_refresh_schedule
+            .lock()
+            .await
+            .clone()
+            .context("passive observer promotion has no primary schedule")?;
+        let Some(candidate) = primary.deferred_observer else {
+            return Ok(false);
+        };
+        if self.local_refresh_signer_authority_is_retained(&primary).await? {
+            return Ok(false);
+        }
+        self.authenticate_deferred_observer_schedule(&primary, &candidate).await?;
+        let promoted = self
+            .promoted_observer_schedule(candidate, primary.rotation_certificate_delivered_through);
+        self.persist_proactive_refresh_schedule_locked(promoted).await?;
+        Ok(true)
+    }
+
+    async fn promote_deferred_observer_schedule(&self) -> anyhow::Result<bool> {
+        let _schedule_mutation = self.proactive_refresh_schedule_mutation.lock().await;
+        self.promote_deferred_observer_schedule_locked().await
+    }
+
+    /// Preserve passive observation without allowing public history to move the live dealer
+    /// pacemaker past an older retained share. The freshest candidate replaces only the bounded
+    /// deferred slot; equal/older certificate replays never move its original deadlines.
+    async fn defer_or_promote_passive_refresh_schedule_locked(
+        &self,
+        candidate: ProactiveRefreshSchedule,
+    ) -> anyhow::Result<()> {
+        let candidate = self.deferred_observer_from_schedule(&candidate).await?;
+        let Some(mut primary) = self.proactive_refresh_schedule.lock().await.clone() else {
+            anyhow::ensure!(
+                candidate.source_epoch == 0,
+                "first passive proactive schedule is not epoch zero"
+            );
+            let promoted = self.promoted_observer_schedule(candidate, BTreeMap::new());
+            return self.persist_proactive_refresh_schedule_locked(promoted).await;
+        };
+        if candidate.source_epoch <= primary.source_epoch {
+            if candidate.source_epoch == primary.source_epoch {
+                anyhow::ensure!(
+                    candidate.source_activation == primary.source_activation
+                        && candidate.target_epoch == primary.target_epoch,
+                    "passive certificate conflicts with the installed source schedule"
+                );
+            }
+            return Ok(());
+        }
+        match primary.deferred_observer {
+            Some(existing) if existing.source_epoch > candidate.source_epoch => return Ok(()),
+            Some(existing) if existing.source_epoch == candidate.source_epoch => {
+                anyhow::ensure!(
+                    existing.source_activation == candidate.source_activation
+                        && existing.source_history_root == candidate.source_history_root
+                        && existing.target_epoch == candidate.target_epoch,
+                    "passive certificate conflicts with the deferred observer schedule"
+                );
+                // Preserve the first locally sampled fixed deadline for an at-least-once replay.
+            }
+            _ => {
+                self.authenticate_deferred_observer_delta(&primary, &candidate).await?;
+                primary.deferred_observer = Some(candidate);
+                self.persist_proactive_refresh_schedule_locked(primary).await?;
+            }
+        }
+        self.promote_deferred_observer_schedule_locked().await?;
+        Ok(())
+    }
+
+    fn authenticate_selection_fallback_deadline(
+        schedule: &ProactiveRefreshSchedule,
+        context: &KeyRotationContext,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            schedule.target_epoch == Some(context.target_epoch()),
+            "key-rotation fallback deadline names another target epoch"
+        );
+        let due = schedule.due_unix_ms.context("key rotation has no primary deadline")?;
+        let expected = if due == ACCEPTANCE_PROACTIVE_REFRESH_HELD_DUE_UNIX_MS {
+            ACCEPTANCE_PROACTIVE_REFRESH_HELD_DUE_UNIX_MS
+        } else {
+            due.checked_add(context.target_policy().selection_fallback_window_ms())
+                .context("key-rotation fallback deadline overflow")?
+        };
+        anyhow::ensure!(
+            schedule.selection_fallback_due_unix_ms == Some(expected),
+            "key-rotation fallback deadline differs from its immutable policy window"
+        );
+        Ok(())
     }
 
     async fn persist_proactive_refresh_schedule(
@@ -7802,8 +12749,18 @@ impl PartyServer {
             "unsupported proactive refresh schedule version"
         );
         anyhow::ensure!(
+            schedule.target_epoch.is_some() == schedule.due_unix_ms.is_some()
+                && schedule.target_epoch.is_some()
+                    == schedule.selection_fallback_due_unix_ms.is_some(),
+            "persisted proactive refresh target/deadline presence differs"
+        );
+        anyhow::ensure!(
             schedule.target_epoch.is_some() == schedule.due_unix_ms.is_some(),
             "proactive refresh target/deadline presence differs"
+        );
+        anyhow::ensure!(
+            schedule.target_epoch.is_some() == schedule.selection_fallback_due_unix_ms.is_some(),
+            "proactive refresh target/fallback-deadline presence differs"
         );
         anyhow::ensure!(
             schedule.rotation_view.is_some() == schedule.rotation_view_started_unix_ms.is_some(),
@@ -7813,6 +12770,17 @@ impl PartyServer {
             schedule.rotation_view.is_some() || schedule.rotation_timeout_exponent == 0,
             "inactive key-rotation pacemaker has a timeout exponent"
         );
+        if schedule.phase == ProactiveRefreshSchedulePhase::PendingActivation {
+            anyhow::ensure!(
+                schedule.rotation_view.is_none()
+                    && schedule.rotation_view_started_unix_ms.is_none()
+                    && schedule.rotation_timeout_exponent == 0,
+                "pending activation schedule already started key rotation"
+            );
+        }
+        if let Some(candidate) = schedule.deferred_observer.as_ref() {
+            self.validate_deferred_observer_shape(&schedule, candidate)?;
+        }
         anyhow::ensure!(
             schedule.rotation_certificate_delivered_through.len() <= self.scenario.parties.len(),
             "key-rotation delivery cursor exceeds the configured party set"
@@ -7833,10 +12801,19 @@ impl PartyServer {
                 schedule.due_unix_ms.is_some_and(|deadline| deadline != 0),
                 "proactive refresh deadline must not be zero"
             );
+            anyhow::ensure!(
+                schedule.selection_fallback_due_unix_ms.is_some_and(|deadline| deadline != 0),
+                "key-rotation fallback deadline must not be zero"
+            );
             if schedule.due_unix_ms == Some(ACCEPTANCE_PROACTIVE_REFRESH_HELD_DUE_UNIX_MS) {
                 anyhow::ensure!(
                     self.acceptance_proactive_refresh_hold_enabled,
                     "acceptance-held proactive refresh schedule requires its demo-Regtest gate"
+                );
+                anyhow::ensure!(
+                    schedule.selection_fallback_due_unix_ms
+                        == Some(ACCEPTANCE_PROACTIVE_REFRESH_HELD_DUE_UNIX_MS),
+                    "acceptance-held fallback deadline differs from the proactive hold"
                 );
                 anyhow::ensure!(
                     schedule.rotation_view.is_none()
@@ -7844,13 +12821,110 @@ impl PartyServer {
                         && schedule.rotation_timeout_exponent == 0,
                     "acceptance-held proactive refresh schedule already started key rotation"
                 );
+            } else {
+                anyhow::ensure!(
+                    schedule
+                        .selection_fallback_due_unix_ms
+                        .zip(schedule.due_unix_ms)
+                        .is_some_and(|(fallback, due)| fallback > due),
+                    "key-rotation fallback deadline must follow the primary deadline"
+                );
             }
         }
         let encoded = postcard::to_allocvec(&schedule)?;
-        self.protocol_store
-            .save_proactive_refresh_schedule(self.scenario.quic_network_id()?, &encoded, &mut OsRng)
-            .await?;
-        *self.proactive_refresh_schedule.lock().await = Some(schedule);
+        let network = self.scenario.quic_network_id()?;
+        // Take the live slot before detaching the durable replacement. Every schedule derivation
+        // first reads this slot while holding `proactive_refresh_schedule_mutation`; therefore a
+        // caller cancelled at any point after spawn cannot release a stale in-memory image to the
+        // next writer. The detached task survives loss of its JoinHandle through the store's
+        // rename/directory-sync awaits and publishes RAM before releasing this owned guard. It
+        // also retains the process-wide state lease: dropping the last `PartyServer` Arc cannot
+        // let a replacement process write this directory while publication is still unresolved.
+        let mut live_schedule = Arc::clone(&self.proactive_refresh_schedule).lock_owned().await;
+        let protocol_store = Arc::clone(&self.protocol_store);
+        let state_lease = Arc::clone(&self._state_lease);
+        let party = self.party;
+        #[cfg(test)]
+        let publication_gate = Arc::clone(&self.proactive_refresh_schedule_publication_gate);
+        tokio::spawn(async move {
+            let mut retry_count = 0_u64;
+            let mut retry_delay_ms = PROACTIVE_REFRESH_SCHEDULE_SAVE_RETRY_INITIAL_MS;
+            loop {
+                // `atomic_replace` may have renamed the new file before a later directory sync
+                // reports an error. From this layer that failure is ambiguous: releasing the live
+                // slot would expose an older RAM image alongside possibly-new durable bytes. Keep
+                // both publication fences and retry these exact canonical schedule bytes. A
+                // permanent local-storage failure therefore fail-stops this party with a bounded
+                // retry cadence instead of allowing a stale successor mutation.
+                let save_result = protocol_store
+                    .save_proactive_refresh_schedule(network, &encoded, &mut OsRng)
+                    .await;
+                #[cfg(test)]
+                let injected_ambiguous_save_gate = if save_result.is_ok() {
+                    let mut slot = publication_gate.lock().await;
+                    if slot
+                        .as_ref()
+                        .is_some_and(|gate| gate.inject_ambiguous_save_error_once)
+                    {
+                        slot.take()
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+                #[cfg(test)]
+                let injected_ambiguous_save_error = injected_ambiguous_save_gate.is_some();
+                #[cfg(not(test))]
+                let injected_ambiguous_save_error = false;
+                #[cfg(test)]
+                if let Some(gate) = injected_ambiguous_save_gate {
+                    // Stop at the exact post-replacement/RAM-old cut. Cancelling the outer caller
+                    // here must leave this detached task alive to retry the same encoded value.
+                    let _ = gate.durable.send(());
+                    let _ = gate.release.await;
+                }
+
+                let save_error = match save_result {
+                    Ok(()) if !injected_ambiguous_save_error => break,
+                    Ok(()) => None,
+                    Err(error) => Some(error),
+                };
+                retry_count = retry_count.saturating_add(1);
+                if retry_count.is_power_of_two() {
+                    if let Some(error) = save_error.as_ref() {
+                        tracing::error!(
+                            party = %party,
+                            retry_count,
+                            retry_delay_ms,
+                            %error,
+                            "proactive refresh schedule save failed; publication remains fenced"
+                        );
+                    } else {
+                        tracing::warn!(
+                            party = %party,
+                            retry_count,
+                            retry_delay_ms,
+                            "injected ambiguous proactive refresh schedule save; publication remains fenced"
+                        );
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(retry_delay_ms)).await;
+                retry_delay_ms = retry_delay_ms
+                    .saturating_mul(2)
+                    .min(PROACTIVE_REFRESH_SCHEDULE_SAVE_RETRY_MAX_MS);
+            }
+            #[cfg(test)]
+            if let Some(gate) = publication_gate.lock().await.take() {
+                let _ = gate.durable.send(());
+                let _ = gate.release.await;
+            }
+            *live_schedule = Some(schedule);
+            drop(live_schedule);
+            drop(state_lease);
+        })
+        .await
+        .context("proactive refresh schedule durable publication task failed")?;
         Ok(())
     }
 
@@ -7860,23 +12934,289 @@ impl PartyServer {
         now_unix_ms: u64,
     ) -> anyhow::Result<()> {
         let _schedule_mutation = self.proactive_refresh_schedule_mutation.lock().await;
-        let mut schedule = self.proactive_refresh_schedule_for(source, now_unix_ms)?;
-        if let Some(existing) = self.proactive_refresh_schedule.lock().await.clone() {
-            schedule.rotation_certificate_delivered_through =
-                existing.rotation_certificate_delivered_through;
-        }
-        if self.proactive_refresh_schedule.lock().await.as_ref().is_some_and(|existing| {
-            existing.version == schedule.version
-                && existing.source_epoch == schedule.source_epoch
-                && existing.source_activation == schedule.source_activation
-                && existing.target_epoch == schedule.target_epoch
-                && existing.target_epoch.is_some() == existing.due_unix_ms.is_some()
-        }) {
-            // Activation/certificate delivery is at-least-once. Never move an already armed
-            // deadline forward when retrying the same certified activation after an I/O error.
+        let schedule = self.proactive_refresh_schedule_for(source, now_unix_ms)?;
+        self.arm_proactive_refresh_schedule_locked(schedule).await
+    }
+
+    async fn arm_proactive_refresh_for_pending_activation(
+        &self,
+        value: &ActivationValue,
+        now_unix_ms: u64,
+    ) -> anyhow::Result<()> {
+        // A cancelled activation can have crossed certificate durability and the one-time
+        // PendingActivation -> Armed schedule CAS without yet consuming its staged share. Its
+        // retry re-enters through this write-ahead step. Only the exact durable certificate may
+        // authorize treating that phase mismatch as an idempotent no-op.
+        let certified_armed_retry = self.exact_durable_activation_record(value).await?.is_some();
+        let _schedule_mutation = self.proactive_refresh_schedule_mutation.lock().await;
+        let schedule =
+            self.proactive_refresh_schedule_for_pending_activation(value, now_unix_ms)?;
+        if certified_armed_retry
+            && let Some(existing) = self.proactive_refresh_schedule.lock().await.clone()
+            && existing.source_epoch == schedule.source_epoch
+            && existing.phase == ProactiveRefreshSchedulePhase::Armed
+        {
+            anyhow::ensure!(
+                existing.version == schedule.version
+                    && existing.source_activation == schedule.source_activation
+                    && existing.target_epoch == schedule.target_epoch
+                    && existing.target_epoch.is_some() == existing.due_unix_ms.is_some()
+                    && existing.target_epoch.is_some()
+                        == existing.selection_fallback_due_unix_ms.is_some(),
+                "certified activation retry conflicts with the installed proactive schedule"
+            );
             return Ok(());
         }
+        self.arm_proactive_refresh_schedule_locked(schedule).await
+    }
+
+    async fn exact_durable_activation_record(
+        &self,
+        value: &ActivationValue,
+    ) -> anyhow::Result<Option<ActivationCertificateRecord>> {
+        let gossip_key = (value.epoch, value.activation_digest);
+        let Some(record) = self.activation_gossip_records.read().await.get(&gossip_key).cloned()
+        else {
+            return Ok(None);
+        };
+        anyhow::ensure!(
+            record.value == *value,
+            "proactive refresh activation differs from its durable certificate"
+        );
+        let durable = self
+            .durable_activation_record_for_transition(&record.transition)
+            .await?
+            .context("proactive refresh activation certificate disappeared")?;
+        anyhow::ensure!(
+            durable == record,
+            "proactive refresh activation differs from stable certificate storage"
+        );
+        Ok(Some(record))
+    }
+
+    /// Complete the write-ahead schedule transition after the matching activation certificate and
+    /// history link are durable, but before the successor share becomes visible to signers.
+    ///
+    /// The pending deadline only protects the pre-certificate crash cut. Potentially slow
+    /// handoff/certificate persistence must not consume the newly active epoch's refresh
+    /// interval, so this transition re-arms once from a trusted local completion time. The phase
+    /// bit makes retries and restart recovery idempotent: an already armed schedule is validated
+    /// but never moved.
+    async fn complete_proactive_refresh_activation(
+        &self,
+        value: &ActivationValue,
+        now_unix_ms: u64,
+    ) -> anyhow::Result<()> {
+        self.exact_durable_activation_record(value)
+            .await?
+            .context("proactive refresh activation lacks its durable certificate")?;
+
+        let armed = self.proactive_refresh_schedule_for(&value.public, now_unix_ms)?;
+        let _schedule_mutation = self.proactive_refresh_schedule_mutation.lock().await;
+        let pending = self
+            .proactive_refresh_schedule
+            .lock()
+            .await
+            .clone()
+            .context("proactive refresh activation has no write-ahead schedule")?;
+        anyhow::ensure!(
+            pending.version == PROACTIVE_REFRESH_SCHEDULE_VERSION
+                && pending.source_epoch == armed.source_epoch
+                && pending.source_activation == armed.source_activation
+                && pending.target_epoch == armed.target_epoch
+                && pending.target_epoch.is_some() == pending.due_unix_ms.is_some()
+                && pending.target_epoch.is_some()
+                    == pending.selection_fallback_due_unix_ms.is_some(),
+            "proactive refresh activation differs from its write-ahead schedule"
+        );
+        if pending.phase == ProactiveRefreshSchedulePhase::Armed {
+            // Certificate retries and startup reconciliation must not extend an already running
+            // epoch's interval or reset a live receiver-key pacemaker.
+            return Ok(());
+        }
+        anyhow::ensure!(
+            pending.rotation_view.is_none()
+                && pending.rotation_view_started_unix_ms.is_none()
+                && pending.rotation_timeout_exponent == 0,
+            "pending activation schedule already started key rotation"
+        );
+
+        let mut armed = armed;
+        if let Some(provisional_due) = pending.due_unix_ms {
+            if provisional_due == ACCEPTANCE_PROACTIVE_REFRESH_HELD_DUE_UNIX_MS {
+                anyhow::ensure!(
+                    self.acceptance_proactive_refresh_hold_enabled
+                        && armed.due_unix_ms == Some(ACCEPTANCE_PROACTIVE_REFRESH_HELD_DUE_UNIX_MS),
+                    "pending activation hold differs from the armed schedule"
+                );
+            } else {
+                let locally_rearmed_due =
+                    armed.due_unix_ms.context("armed activation omitted its deadline")?;
+                // A backwards wall-clock adjustment cannot make the completed schedule earlier
+                // than its authenticated provisional deadline. Under an ordinary monotonic clock,
+                // `locally_rearmed_due` is strictly later because it is sampled after certificate
+                // durability.
+                armed.due_unix_ms = Some(locally_rearmed_due.max(provisional_due));
+                let context = self
+                    .key_rotation_context_for_source(&value.public)?
+                    .context("armed proactive refresh omitted its key-rotation context")?;
+                armed.selection_fallback_due_unix_ms = Some(
+                    armed
+                        .due_unix_ms
+                        .expect("armed deadline was installed above")
+                        .checked_add(context.target_policy().selection_fallback_window_ms())
+                        .context("armed key-rotation fallback deadline overflow")?,
+                );
+            }
+        }
+        armed.rotation_certificate_delivered_through =
+            pending.rotation_certificate_delivered_through;
+        armed.deferred_observer = pending.deferred_observer;
+        self.persist_proactive_refresh_schedule_locked(armed).await
+    }
+
+    async fn arm_proactive_refresh_schedule_locked(
+        &self,
+        mut schedule: ProactiveRefreshSchedule,
+    ) -> anyhow::Result<()> {
+        // Publication reacquires the live slot; the outer mutation lock protects this snapshot.
+        let existing = self.proactive_refresh_schedule.lock().await.clone();
+        if let Some(existing) = existing {
+            if existing.source_epoch > schedule.source_epoch {
+                // Activation and retirement certificates are permanently replayable. An old
+                // certificate must therefore be an authenticated no-op after this replica has
+                // already advanced its one live pacemaker to a newer source.
+                return Ok(());
+            }
+            if existing.source_epoch == schedule.source_epoch {
+                anyhow::ensure!(
+                    existing.version == schedule.version
+                        && existing.phase == schedule.phase
+                        && existing.source_activation == schedule.source_activation
+                        && existing.target_epoch == schedule.target_epoch
+                        && existing.target_epoch.is_some() == existing.due_unix_ms.is_some()
+                        && existing.target_epoch.is_some()
+                            == existing.selection_fallback_due_unix_ms.is_some(),
+                    "proactive refresh schedule conflicts with the installed source epoch"
+                );
+                // At-least-once certificate delivery must never move an existing deadline or
+                // reset a live key-rotation view. The installed schedule is already the canonical
+                // local representation for this source activation.
+                return Ok(());
+            }
+            anyhow::ensure!(
+                existing.phase == ProactiveRefreshSchedulePhase::Armed,
+                "proactive refresh schedule cannot advance beyond a pending activation"
+            );
+            anyhow::ensure!(
+                existing.source_epoch.checked_add(1) == Some(schedule.source_epoch),
+                "proactive refresh schedule skipped a certified source epoch"
+            );
+            let delivery_cursor = existing.rotation_certificate_delivered_through;
+            if let Some(deferred) = existing.deferred_observer {
+                match deferred.source_epoch.cmp(&schedule.source_epoch) {
+                    std::cmp::Ordering::Greater => {
+                        schedule.deferred_observer = Some(deferred);
+                    }
+                    std::cmp::Ordering::Equal => {
+                        anyhow::ensure!(
+                            schedule.phase == ProactiveRefreshSchedulePhase::Armed
+                                && deferred.source_activation == schedule.source_activation
+                                && deferred.target_epoch == schedule.target_epoch,
+                            "certified successor schedule conflicts with its passive observation"
+                        );
+                        schedule = self.promoted_observer_schedule(deferred, delivery_cursor);
+                        return self.persist_proactive_refresh_schedule_locked(schedule).await;
+                    }
+                    std::cmp::Ordering::Less => {}
+                }
+            }
+            schedule.rotation_certificate_delivered_through = delivery_cursor;
+        }
         self.persist_proactive_refresh_schedule_locked(schedule).await
+    }
+
+    /// Authenticate the only adjacent schedule write which has a certified successor but no
+    /// staged local successor share.
+    ///
+    /// A source-only member receives the successor certificate through `Retire`. It persists the
+    /// successor's next fixed deadline before erasing its old share, so a crash can expose
+    /// `active = predecessor` beside `schedule.source = predecessor + 1`. Unlike the local target
+    /// activation crash window, this party must not have a staged successor: the exact durable
+    /// activation certificate proves it was deliberately removed from the target committee.
+    async fn authenticate_pending_source_retirement_schedule(
+        &self,
+        predecessor: &EpochPublic,
+        schedule: &ProactiveRefreshSchedule,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            schedule.phase == ProactiveRefreshSchedulePhase::Armed,
+            "pending source retirement carries an uncompleted activation schedule"
+        );
+        let active_epoch = {
+            let active = self.active_epoch.read().await;
+            *active
+        };
+        let activation_matches = self
+            .activations
+            .read()
+            .await
+            .get(&predecessor.committee.epoch)
+            .is_some_and(|activation| activation.public == *predecessor);
+        anyhow::ensure!(
+            predecessor.committee.member(self.party).is_ok()
+                && active_epoch == Some(predecessor.committee.epoch)
+                && activation_matches,
+            "pending source retirement schedule lacks its exact active predecessor"
+        );
+        anyhow::ensure!(
+            predecessor.committee.epoch.checked_add(1) == Some(schedule.source_epoch),
+            "pending source retirement schedule is not the immediate successor"
+        );
+        let record = self
+            .activation_gossip_records
+            .read()
+            .await
+            .get(&(schedule.source_epoch, schedule.source_activation))
+            .cloned()
+            .context(
+                "pending source retirement schedule lacks its durable successor certificate",
+            )?;
+        let durable = self
+            .durable_activation_record_for_transition(&record.transition)
+            .await?
+            .context("pending source retirement successor certificate disappeared")?;
+        anyhow::ensure!(
+            durable == record
+                && record.transition.old.as_ref() == Some(predecessor)
+                && record.transition.target.member(self.party).is_err()
+                && record.value.public.committee == record.transition.target
+                && record.value.activation_digest == schedule.source_activation
+                && record.value.public.activation_digest()? == schedule.source_activation,
+            "pending source retirement schedule differs from its certified removed-member successor"
+        );
+
+        let interval_ms = self
+            .scenario
+            .proactive_refresh_interval_seconds
+            .checked_mul(1_000)
+            .context("proactive refresh interval overflow")?;
+        let armed_at = match schedule.due_unix_ms {
+            Some(ACCEPTANCE_PROACTIVE_REFRESH_HELD_DUE_UNIX_MS) | None => 1,
+            Some(due) => due
+                .checked_sub(interval_ms)
+                .context("pending source retirement deadline predates one refresh interval")?,
+        };
+        let mut expected =
+            self.proactive_refresh_schedule_for_activation_value(&record.value, armed_at)?;
+        expected.rotation_certificate_delivered_through =
+            schedule.rotation_certificate_delivered_through.clone();
+        expected.deferred_observer = schedule.deferred_observer;
+        anyhow::ensure!(
+            *schedule == expected,
+            "pending source retirement schedule differs from its exact certified successor deadline"
+        );
+        Ok(())
     }
 
     /// Authenticate the one write-order state in which the successor's schedule reached stable
@@ -7884,19 +13224,21 @@ impl PartyServer {
     /// already staged successor and must survive restart unchanged; accepting only the adjacent
     /// epoch number would let an unrelated authenticated local blob suppress or move the active
     /// predecessor's refresh clock.
-    async fn authenticate_pending_successor_schedule(
+    async fn authenticate_pending_activation_schedule(
         &self,
-        predecessor: &EpochPublic,
+        predecessor: Option<&EpochPublic>,
         schedule: &ProactiveRefreshSchedule,
     ) -> anyhow::Result<()> {
-        let successor_epoch = predecessor
-            .committee
-            .epoch
-            .checked_add(1)
-            .context("pending successor epoch exhausted")?;
+        anyhow::ensure!(
+            schedule.phase == ProactiveRefreshSchedulePhase::PendingActivation,
+            "pending activation carries an already armed schedule"
+        );
+        let successor_epoch = predecessor.map_or(Ok(0), |predecessor| {
+            predecessor.committee.epoch.checked_add(1).context("pending successor epoch exhausted")
+        })?;
         anyhow::ensure!(
             schedule.source_epoch == successor_epoch,
-            "pending successor schedule is not adjacent to the active epoch"
+            "pending activation schedule has another source epoch"
         );
 
         let (transition, response) = {
@@ -7910,8 +13252,8 @@ impl PartyServer {
                 "pending successor staged share differs from its finalized public value"
             );
             anyhow::ensure!(
-                staged.transition.old.as_ref() == Some(predecessor),
-                "pending successor transition differs from the active predecessor"
+                staged.transition.old.as_ref() == predecessor,
+                "pending activation transition differs from its certified predecessor"
             );
             anyhow::ensure!(
                 staged.response.epoch == successor_epoch
@@ -7919,20 +13261,61 @@ impl PartyServer {
                     && staged.response.public.activation_digest()? == schedule.source_activation,
                 "pending successor schedule differs from its staged activation"
             );
-            anyhow::ensure!(
-                staged.response.public.key_id == predecessor.key_id
-                    && staged.response.public.group_key_bytes() == predecessor.group_key_bytes(),
-                "pending successor staged value changes the threshold key"
-            );
+            if let Some(predecessor) = predecessor {
+                anyhow::ensure!(
+                    staged.response.public.key_id == predecessor.key_id
+                        && staged.response.public.group_key_bytes()
+                            == predecessor.group_key_bytes(),
+                    "pending successor staged value changes the threshold key"
+                );
+            }
             (staged.transition.clone(), staged.response.clone())
         };
-        let expected_transition = self
-            .configured_proactive_refresh_transition(predecessor)?
-            .context("pending successor schedule lacks its certified transition")?;
+        let expected_transition = match predecessor {
+            Some(predecessor) => self
+                .configured_proactive_refresh_transition(predecessor)?
+                .context("pending successor schedule lacks its certified transition")?,
+            None => canonical_dkg_transition(&self.scenario)?,
+        };
         anyhow::ensure!(
             transition == expected_transition,
             "pending successor schedule is bound to another certified transition"
         );
+        anyhow::ensure!(
+            transition.history_parent == self.epoch_history.read().await.parent()?,
+            "pending activation schedule does not extend the current authenticated history tip"
+        );
+        let active_epoch = *self.active_epoch.read().await;
+        match predecessor {
+            None => anyhow::ensure!(
+                active_epoch.is_none(),
+                "pending genesis schedule exists beside an active epoch"
+            ),
+            Some(predecessor) if predecessor.committee.member(self.party).is_ok() => {
+                anyhow::ensure!(
+                    active_epoch == Some(predecessor.committee.epoch)
+                        && self
+                            .activations
+                            .read()
+                            .await
+                            .get(&predecessor.committee.epoch)
+                            .is_some_and(|activation| activation.public == *predecessor),
+                    "pending successor schedule lacks its exact active predecessor"
+                );
+            }
+            Some(predecessor) => {
+                anyhow::ensure!(
+                    active_epoch.is_none()
+                        && self
+                            .deposit_targets
+                            .read()
+                            .await
+                            .get(&predecessor.committee.epoch)
+                            .is_some_and(|known| known == predecessor),
+                    "pending joiner schedule lacks its certified predecessor"
+                );
+            }
+        }
 
         {
             let runs = self.avss.lock().await;
@@ -7973,9 +13356,13 @@ impl PartyServer {
         let armed_at = due
             .checked_sub(interval_ms)
             .context("pending successor deadline predates one refresh interval")?;
-        let mut expected = self.proactive_refresh_schedule_for(&response.public, armed_at)?;
+        let mut expected = self.proactive_refresh_schedule_for_pending_activation(
+            &activation_value(&response),
+            armed_at,
+        )?;
         expected.rotation_certificate_delivered_through =
             schedule.rotation_certificate_delivered_through.clone();
+        expected.deferred_observer = schedule.deferred_observer;
         anyhow::ensure!(
             *schedule == expected,
             "pending successor schedule differs from its exact staged activation deadline"
@@ -7984,18 +13371,23 @@ impl PartyServer {
     }
 
     async fn restore_proactive_refresh_schedule(&self, now_unix_ms: u64) -> anyhow::Result<()> {
-        let active_source = if let Some(active_epoch) = *self.active_epoch.read().await {
+        let active_epoch = {
+            let active = self.active_epoch.read().await;
+            *active
+        };
+        let active_activation = if let Some(active_epoch) = active_epoch {
             Some(
                 self.activations
                     .read()
                     .await
                     .get(&active_epoch)
-                    .map(|activation| activation.public.clone())
+                    .cloned()
                     .context("active epoch lacks activation metadata")?,
             )
         } else {
             None
         };
+        let active_source = active_activation.as_ref().map(|activation| activation.public.clone());
         let network_id = self.scenario.quic_network_id()?;
         let Some(encoded) = self.protocol_store.load_proactive_refresh_schedule(network_id).await?
         else {
@@ -8003,27 +13395,10 @@ impl PartyServer {
                 active_source.is_none(),
                 "active certified epoch lacks its durable proactive-refresh schedule"
             );
-            // A target-only joiner persists the observed source certificate before arming its
-            // first local schedule. If the process stops in that narrow window, reconstruct the
-            // only still-pending certified source instead of silently losing autonomous join
-            // progress forever.
-            let observed = self.deposit_targets.read().await.values().cloned().collect::<Vec<_>>();
-            let mut joining_source = None;
-            for source in observed.iter().rev() {
-                let Some(context) = self.key_rotation_context_for_source(source)? else {
-                    continue;
-                };
-                if context.target_policy().eligible().member(self.party).is_ok()
-                    && !observed.iter().any(|known| known.committee.epoch == context.target_epoch())
-                {
-                    joining_source = Some(source.clone());
-                    break;
-                }
-            }
-            if let Some(source) = joining_source {
-                let schedule = self.proactive_refresh_schedule_for(&source, now_unix_ms)?;
-                return self.persist_proactive_refresh_schedule(schedule).await;
-            }
+            // Schedule-less startup has one canonical owner: authenticated history
+            // reconciliation. It reconstructs non-member genesis exactly and stops at every
+            // locally selected/shareless boundary; a bounded hot-cache heuristic here could skip
+            // that boundary after cold compaction.
             *self.proactive_refresh_schedule.lock().await = None;
             return Ok(());
         };
@@ -8033,6 +13408,18 @@ impl PartyServer {
             "proactive refresh schedule is not canonical"
         );
         anyhow::ensure!(
+            schedule.version == PROACTIVE_REFRESH_SCHEDULE_VERSION,
+            "unsupported proactive refresh schedule version"
+        );
+        if schedule.phase == ProactiveRefreshSchedulePhase::PendingActivation {
+            anyhow::ensure!(
+                schedule.rotation_view.is_none()
+                    && schedule.rotation_view_started_unix_ms.is_none()
+                    && schedule.rotation_timeout_exponent == 0,
+                "persisted pending activation schedule already started key rotation"
+            );
+        }
+        anyhow::ensure!(
             schedule.rotation_certificate_delivered_through.len() <= self.scenario.parties.len(),
             "persisted key-rotation delivery cursor exceeds the configured party set"
         );
@@ -8040,6 +13427,11 @@ impl PartyServer {
             anyhow::ensure!(
                 self.acceptance_proactive_refresh_hold_enabled,
                 "persisted acceptance-held proactive refresh schedule requires its demo-Regtest gate"
+            );
+            anyhow::ensure!(
+                schedule.selection_fallback_due_unix_ms
+                    == Some(ACCEPTANCE_PROACTIVE_REFRESH_HELD_DUE_UNIX_MS),
+                "persisted acceptance hold has another fallback deadline"
             );
         }
         for recipient in schedule.rotation_certificate_delivered_through.keys() {
@@ -8049,52 +13441,170 @@ impl PartyServer {
                 "persisted key-rotation delivery cursor contains the local party"
             );
         }
-        let source = match active_source.as_ref() {
-            Some(source) => source.clone(),
+        if let Some(candidate) = schedule.deferred_observer.as_ref() {
+            self.validate_deferred_observer_shape(&schedule, candidate)?;
+            self.authenticate_deferred_observer_schedule(&schedule, candidate).await?;
+            // Construction has not published this server to any protocol task, but use the same
+            // mutation discipline as the live path. If certificate replay already retired every
+            // older share, promote the exact stored deadline now; otherwise retain the bounded
+            // candidate beside the adjacent primary schedule.
+            let _schedule_mutation = self.proactive_refresh_schedule_mutation.lock().await;
+            *self.proactive_refresh_schedule.lock().await = Some(schedule.clone());
+            if self.promote_deferred_observer_schedule_locked().await? {
+                return Ok(());
+            }
+        }
+        let pending_predecessor = {
+            let staged = self.staged.read().await;
+            staged.get(&schedule.source_epoch).map(|staged| staged.transition.old.clone())
+        };
+        if let Some(predecessor) = pending_predecessor
+            && !self.activations.read().await.contains_key(&schedule.source_epoch)
+        {
+            // Activation writes its verified `n-f` evidence into the finalized AVSS reducer, then
+            // persists this fixed deadline, and only afterward publishes the activation
+            // certificate/history CAS. Authenticate and preserve that exact intermediate state
+            // for genesis, overlapping successors, and target-only joiners.
+            self.authenticate_pending_activation_schedule(predecessor.as_ref(), &schedule).await?;
+            *self.proactive_refresh_schedule.lock().await = Some(schedule);
+            return Ok(());
+        }
+        if schedule.phase == ProactiveRefreshSchedulePhase::PendingActivation {
+            let activation = active_activation
+                .as_ref()
+                .filter(|activation| {
+                    activation.epoch == schedule.source_epoch
+                        && activation.activation_digest == schedule.source_activation
+                })
+                .context(
+                    "certified pending activation schedule lacks its reconstructed active share",
+                )?;
+            // The certificate/share replay above is authoritative, but the process stopped before
+            // the live path could persist its one-time local completion timestamp. Finish that
+            // phase transition before construction returns and before any protocol pacemaker can
+            // observe the successor as overdue.
+            *self.proactive_refresh_schedule.lock().await = Some(schedule);
+            self.complete_proactive_refresh_activation(&activation_value(activation), now_unix_ms)
+                .await?;
+            return Ok(());
+        }
+        let (source_value, source_context, expected) = match active_activation.as_ref() {
+            Some(activation) => {
+                let source_value = activation_value(activation);
+                let source_context = self.key_rotation_context_for_source_receiver_keys(
+                    &source_value.public,
+                    source_value.history_link.receiver_keys(),
+                )?;
+                let expected = self.proactive_refresh_schedule_for_context(
+                    &source_value.public,
+                    source_context.as_ref(),
+                    now_unix_ms,
+                )?;
+                (source_value, source_context, expected)
+            }
             None => {
                 let targets = self.deposit_targets.read().await;
-                if schedule
-                    .target_epoch
-                    .is_some_and(|target_epoch| targets.contains_key(&target_epoch))
-                {
-                    // A source-only removed party, or a joiner which never obtained the target
-                    // share, retains no authority after the successor certificate is observed.
-                    *self.proactive_refresh_schedule.lock().await = None;
+                let mut recovered = schedule.clone();
+                if recovered.deferred_observer.is_none() {
+                    while let Some(next_epoch) = recovered.source_epoch.checked_add(1)
+                        && let Some(successor) = targets.get(&next_epoch)
+                    {
+                        if successor.committee.member(self.party).is_ok() {
+                            // A normal selected-party activation persisted its own pending
+                            // schedule before publishing this history entry. Passive recovery
+                            // must retain the predecessor here; staged recovery will activate
+                            // through that write-ahead schedule instead of being skipped.
+                            break;
+                        }
+                        // A process may stop after the successor certificate/history CAS but
+                        // before the source-only Retire or passive Observe path advances this one
+                        // live pacemaker. With no stored passive candidate, rebuild every
+                        // already-observed successor in order. A durable candidate is handled
+                        // above and its originally sampled deadlines are never recomputed here.
+                        let mut next =
+                            self.proactive_refresh_schedule_for(successor, now_unix_ms)?;
+                        next.rotation_certificate_delivered_through =
+                            recovered.rotation_certificate_delivered_through;
+                        recovered = next;
+                    }
+                }
+                if recovered.source_epoch != schedule.source_epoch {
+                    drop(targets);
+                    self.persist_proactive_refresh_schedule(recovered).await?;
                     return Ok(());
                 }
-                let source = targets
-                    .get(&schedule.source_epoch)
-                    .cloned()
-                    .context("observer refresh schedule lacks its certified source epoch")?;
-                let context = self
-                    .key_rotation_context_for_source(&source)?
-                    .context("observer refresh schedule has no successor policy")?;
-                anyhow::ensure!(
-                    context.target_policy().eligible().member(self.party).is_ok(),
-                    "party without an active share is not a joining target member"
-                );
-                source
+                drop(targets);
+                let authenticated =
+                    self.authenticated_epoch_activation(schedule.source_epoch, false).await?;
+                let source_context = self.key_rotation_context_for_authenticated_source(
+                    &authenticated.value.public,
+                    authenticated.value.history_link.receiver_keys(),
+                    authenticated.fault_bound,
+                )?;
+                let expected = self.proactive_refresh_schedule_for_authenticated_activation(
+                    &authenticated,
+                    now_unix_ms,
+                )?;
+                (authenticated.value, source_context, expected)
             }
         };
-        let expected = self.proactive_refresh_schedule_for(&source, now_unix_ms)?;
+        let source = source_value.public.clone();
+        if schedule.source_epoch == source.committee.epoch {
+            match source_context.as_ref() {
+                Some(context) if context.is_participant(self.party) => {
+                    Self::authenticate_selection_fallback_deadline(&schedule, &context)?;
+                }
+                _ => anyhow::ensure!(
+                    schedule.target_epoch.is_none()
+                        && schedule.due_unix_ms.is_none()
+                        && schedule.selection_fallback_due_unix_ms.is_none(),
+                    "inactive key-rotation policy retained a fallback deadline"
+                ),
+            }
+        }
         let matches_active = schedule.version == PROACTIVE_REFRESH_SCHEDULE_VERSION
+            && schedule.phase == ProactiveRefreshSchedulePhase::Armed
             && schedule.source_epoch == expected.source_epoch
             && schedule.source_activation == expected.source_activation
             && schedule.target_epoch == expected.target_epoch
-            && schedule.target_epoch.is_some() == schedule.due_unix_ms.is_some();
+            && schedule.target_epoch.is_some() == schedule.due_unix_ms.is_some()
+            && schedule.target_epoch.is_some() == schedule.selection_fallback_due_unix_ms.is_some();
         if !matches_active {
-            // Current-version activation writes the successor schedule before publishing the
-            // activation certificate. A crash in that narrow window leaves an authenticated
-            // schedule for active+1 while the predecessor remains active. Preserve that exact
-            // deadline only when the restored finalized AVSS run, staged share, and activation
-            // quorum authenticate the successor; reject every other mismatch.
+            // Both local activation and source-only retirement write the successor schedule before
+            // erasing the predecessor authority. A crash in either narrow window leaves an exact
+            // schedule for active+1 beside the active predecessor. Local targets authenticate the
+            // staged share/finalized AVSS quorum; removed old members authenticate the permanent
+            // successor certificate which explicitly excludes them.
             let adjacent_current_write = active_source.is_some()
                 && expected.source_epoch.checked_add(1) == Some(schedule.source_epoch);
-            anyhow::ensure!(
-                adjacent_current_write,
-                "proactive refresh schedule differs from the active certified epoch"
-            );
-            self.authenticate_pending_successor_schedule(&source, &schedule).await?;
+            if !adjacent_current_write {
+                anyhow::bail!(
+                    "proactive refresh schedule differs from the active certified epoch: \
+                     party={}, active_epoch={:?}, expected_source={}, persisted_source={}, \
+                     persisted_target={:?}, persisted_phase={:?}, deferred_source={:?}",
+                    self.party,
+                    active_epoch,
+                    expected.source_epoch,
+                    schedule.source_epoch,
+                    schedule.target_epoch,
+                    schedule.phase,
+                    schedule.deferred_observer.map(|candidate| candidate.source_epoch),
+                );
+            }
+            let certified_removed_successor = self
+                .activation_gossip_records
+                .read()
+                .await
+                .get(&(schedule.source_epoch, schedule.source_activation))
+                .is_some_and(|record| {
+                    record.transition.old.as_ref() == Some(&source)
+                        && record.transition.target.member(self.party).is_err()
+                });
+            if certified_removed_successor {
+                self.authenticate_pending_source_retirement_schedule(&source, &schedule).await?;
+            } else {
+                self.authenticate_pending_activation_schedule(Some(&source), &schedule).await?;
+            }
             *self.proactive_refresh_schedule.lock().await = Some(schedule);
             return Ok(());
         }
@@ -8147,7 +13657,8 @@ impl PartyServer {
             .clone()
             .context("acceptance proactive-refresh release has no durable schedule")?;
         anyhow::ensure!(
-            schedule.source_epoch == source_epoch,
+            schedule.phase == ProactiveRefreshSchedulePhase::Armed
+                && schedule.source_epoch == source_epoch,
             "acceptance proactive-refresh release names stale source epoch {source_epoch}; current source is {}",
             schedule.source_epoch
         );
@@ -8192,6 +13703,11 @@ impl PartyServer {
                 "released proactive refresh deadline collides with the held marker"
             );
             schedule.due_unix_ms = Some(released_due);
+            schedule.selection_fallback_due_unix_ms = Some(
+                released_due
+                    .checked_add(context.target_policy().selection_fallback_window_ms())
+                    .context("released key-rotation fallback deadline overflow")?,
+            );
             self.persist_proactive_refresh_schedule_locked(schedule.clone()).await?;
         }
         let due_unix_ms =
@@ -8205,9 +13721,16 @@ impl PartyServer {
     }
 
     async fn start_due_proactive_refresh(self: &Arc<Self>, now_unix_ms: u64) -> anyhow::Result<()> {
+        self.reconcile_proactive_refresh_schedule_from_history(now_unix_ms).await?;
         let Some(schedule) = self.proactive_refresh_schedule.lock().await.clone() else {
             return Ok(());
         };
+        if schedule.phase == ProactiveRefreshSchedulePhase::PendingActivation {
+            // `recover_certified_staged_activations` runs before this method. If the certificate
+            // is not durable yet, the write-ahead schedule must remain inert; if it is durable,
+            // recovery completes the one-way phase transition before returning here.
+            return Ok(());
+        }
         let (Some(target_epoch), Some(due_unix_ms)) = (schedule.target_epoch, schedule.due_unix_ms)
         else {
             return Ok(());
@@ -8222,7 +13745,23 @@ impl PartyServer {
         if now_unix_ms < due_unix_ms {
             return Ok(());
         }
-        if let Some(active_epoch) = *self.active_epoch.read().await
+        let pending_predecessor = {
+            let staged = self.staged.read().await;
+            staged.get(&schedule.source_epoch).map(|staged| staged.transition.old.clone())
+        };
+        if let Some(predecessor) = pending_predecessor
+            && !self.activations.read().await.contains_key(&schedule.source_epoch)
+        {
+            self.authenticate_pending_activation_schedule(predecessor.as_ref(), &schedule).await?;
+            // The finalized AVSS run below will retry activation in this same progress pass. Do
+            // not start the pending epoch's next key rotation until that share is actually active.
+            return Ok(());
+        }
+        let active_epoch = {
+            let active = self.active_epoch.read().await;
+            *active
+        };
+        if let Some(active_epoch) = active_epoch
             && active_epoch != schedule.source_epoch
         {
             anyhow::ensure!(
@@ -8236,9 +13775,25 @@ impl PartyServer {
                 .get(&active_epoch)
                 .map(|activation| activation.public.clone())
                 .context("pending successor schedule lacks active predecessor metadata")?;
-            self.authenticate_pending_successor_schedule(&predecessor, &schedule).await?;
-            // The finalized AVSS run below will retry activation in this same progress pass. Do
-            // not start the successor's next key rotation until that share is actually active.
+            let certified_removed_successor = self
+                .activation_gossip_records
+                .read()
+                .await
+                .get(&(schedule.source_epoch, schedule.source_activation))
+                .is_some_and(|record| {
+                    record.transition.old.as_ref() == Some(&predecessor)
+                        && record.transition.target.member(self.party).is_err()
+                });
+            if certified_removed_successor {
+                self.authenticate_pending_source_retirement_schedule(&predecessor, &schedule)
+                    .await?;
+            } else {
+                self.authenticate_pending_activation_schedule(Some(&predecessor), &schedule)
+                    .await?;
+            }
+            // The finalized activation or retirement replay below will finish this same certified
+            // handoff. Do not start the successor's next key rotation while the predecessor share
+            // is still active.
             return Ok(());
         }
         let source = self.scheduled_key_rotation_source().await?;
@@ -8246,6 +13801,11 @@ impl PartyServer {
             source.activation_digest()? == schedule.source_activation,
             "proactive refresh source activation differs from its schedule"
         );
+        // Activation normally retires the receiver-key round which selected this source before
+        // returning. A cancelled response stream or crash can leave the public activation and its
+        // successor schedule durable while that transport-only cleanup is still pending. Repair
+        // the exact certified predecessor here before trying to start the next rotation.
+        self.retire_key_rotation_after_activation(&source).await?;
         let context = self
             .key_rotation_context_for_source(&source)?
             .context("scheduled proactive refresh target is no longer configured")?;
@@ -8259,6 +13819,13 @@ impl PartyServer {
                 "source-member refresh deadline belongs to a stale active epoch"
             );
         }
+        self.record_acceptance_proactive_deadline_event(
+            schedule.source_epoch,
+            target_epoch,
+            due_unix_ms,
+            now_unix_ms,
+        )
+        .await?;
         let transition = self.configured_proactive_refresh_transition(&source)?;
         if transition.is_none() {
             self.ensure_key_rotation_started(&source, now_unix_ms).await?;
@@ -8294,15 +13861,50 @@ impl PartyServer {
         Ok(())
     }
 
-    /// Reject early or stale zero-refresh traffic before it can allocate a reducer or elicit an
-    /// honest vote. Immutable traffic for an already certified transition remains replayable
-    /// after the schedule advances to the successor.
+    /// Reject proactive traffic which could consume a local source share before that source is
+    /// both active and durably armed. Immutable traffic for an already certified transition
+    /// remains replayable after the schedule advances to the successor.
+    async fn transition_has_exact_durable_key_rotation(
+        &self,
+        transition: &AvssTransition,
+    ) -> anyhow::Result<bool> {
+        let old = transition.old.as_ref().context("proactive AVSS omitted its source epoch")?;
+        let rotation = self
+            .certified_key_rotations
+            .read()
+            .map_err(|_| anyhow::anyhow!("key-rotation registry lock is poisoned"))?
+            .get(&transition.target.epoch)
+            .cloned();
+        let Some(rotation) = rotation else {
+            return Ok(false);
+        };
+        if rotation.context.source() != &old.committee
+            || rotation.context.source_activation() != old.activation_digest()?
+            || rotation.target != transition.target
+        {
+            return Ok(false);
+        }
+        let Some(durable) =
+            self.protocol_store.load_key_rotation_certificate(&rotation.context).await?
+        else {
+            return Ok(false);
+        };
+        anyhow::ensure!(
+            durable == rotation.certificate
+                && durable.verify(&rotation.context)? == transition.target,
+            "registered key rotation differs from its durable certificate"
+        );
+        Ok(self
+            .configured_proactive_refresh_transition(old)?
+            .is_some_and(|expected| expected == *transition))
+    }
+
     async fn ensure_refresh_due_for_live_ingress(
         &self,
         transition: &AvssTransition,
         now_unix_ms: u64,
     ) -> anyhow::Result<()> {
-        if transition.purpose != DealPurpose::Refresh {
+        if transition.purpose == DealPurpose::Dkg {
             return Ok(());
         }
         if let Some(expected) =
@@ -8314,28 +13916,45 @@ impl PartyServer {
             );
             return Ok(());
         }
-        let old = transition.old.as_ref().context("zero refresh omitted its source epoch")?;
+        let old = transition.old.as_ref().context("proactive AVSS omitted its source epoch")?;
+        if transition.purpose == DealPurpose::Reshare && old.committee.member(self.party).is_err() {
+            // A target-only joiner has no predecessor share to expose or consume. It may receive
+            // the certified source dealers' resharing traffic while its own active epoch remains
+            // absent.
+            return Ok(());
+        }
         let schedule = self
             .proactive_refresh_schedule
             .lock()
             .await
             .clone()
-            .context("zero refresh has no durable fixed-interval schedule")?;
+            .context("proactive AVSS has no durable source schedule")?;
         anyhow::ensure!(
-            schedule.source_epoch == old.committee.epoch
+            schedule.phase == ProactiveRefreshSchedulePhase::Armed
+                && schedule.source_epoch == old.committee.epoch
                 && schedule.source_activation == old.activation_digest()?
                 && schedule.target_epoch == Some(transition.target.epoch),
-            "zero refresh differs from the active durable schedule"
+            "proactive AVSS differs from the active durable schedule"
         );
-        let due = schedule.due_unix_ms.context("zero refresh schedule has no deadline")?;
-        anyhow::ensure!(now_unix_ms >= due, "zero refresh is not due yet");
-        if old.committee.member(self.party).is_ok() {
+        anyhow::ensure!(
+            *self.active_epoch.read().await == Some(old.committee.epoch),
+            "proactive AVSS source share is not active"
+        );
+        let due = schedule.due_unix_ms.context("proactive AVSS schedule has no deadline")?;
+        anyhow::ensure!(
+            due != ACCEPTANCE_PROACTIVE_REFRESH_HELD_DUE_UNIX_MS,
+            "proactive refresh is held for exact-epoch acceptance"
+        );
+        if transition.purpose == DealPurpose::Reshare {
+            // Governance may explicitly begin a certified committee change before the autonomous
+            // fallback deadline. The active/Armed checks above are the source-share safety gate.
+            return Ok(());
+        }
+        if now_unix_ms < due {
             anyhow::ensure!(
-                *self.active_epoch.read().await == Some(old.committee.epoch),
-                "zero refresh source is not the active epoch"
+                self.transition_has_exact_durable_key_rotation(transition).await?,
+                "zero refresh is not due yet"
             );
-        } else {
-            transition.target.member(self.party)?;
         }
         Ok(())
     }
@@ -8346,6 +13965,7 @@ impl PartyServer {
         base_timeout_ms: u64,
     ) -> anyhow::Result<()> {
         let _schedule_mutation = self.proactive_refresh_schedule_mutation.lock().await;
+        let round_mutation = Arc::clone(&self.key_rotation_mutation).lock_owned().await;
         let Some(schedule) = self.proactive_refresh_schedule.lock().await.clone() else {
             return Ok(());
         };
@@ -8354,9 +13974,12 @@ impl PartyServer {
         else {
             return Ok(());
         };
-        let mut live = self.key_rotation.lock().await;
-        let Some(runtime) = live.as_mut() else {
-            return Ok(());
+        let runtime = {
+            let live = self.key_rotation.lock().await;
+            let Some(runtime) = live.as_ref() else {
+                return Ok(());
+            };
+            runtime.clone()
         };
         if runtime.round.certificate().is_some() {
             return Ok(());
@@ -8385,14 +14008,14 @@ impl PartyServer {
             return Ok(());
         }
         let identity = self.identity(context.source().epoch)?;
-        let before = runtime.round.clone();
-        if let Err(error) = runtime.round.request_view_change(&identity) {
+        let mut next_round = runtime.round.clone();
+        if let Err(error) = next_round.request_view_change(&identity) {
             if error == KeyRotationError::ConsensusNotReady {
                 return Ok(());
             }
             return Err(error.into());
         }
-        if runtime.round == before {
+        if next_round == runtime.round {
             return Ok(());
         }
         let revision =
@@ -8409,18 +14032,190 @@ impl PartyServer {
             )
             .await
         {
-            runtime.round = before;
             return Err(error);
         }
-        if let Err(error) = self
-            .protocol_store
-            .save_key_rotation_round(&context, revision, &runtime.round, &mut OsRng)
-            .await
-        {
-            runtime.round = before;
-            return Err(error.into());
+        let server = Arc::clone(self);
+        tokio::spawn(async move {
+            let _round_mutation = round_mutation;
+            let metadata = server
+                .protocol_store
+                .save_key_rotation_round(&context, revision, &next_round, &mut OsRng)
+                .await?;
+            anyhow::ensure!(
+                metadata.revision == revision,
+                "key-rotation view-change durable CAS returned another revision"
+            );
+            #[cfg(test)]
+            if let Some(gate) = server.key_rotation_view_publication_gate.lock().await.take() {
+                let _ = gate.durable.send(());
+                let _ = gate.release.await;
+            }
+            // The detached task owns the mutation fence. Aborting the pacemaker after the durable
+            // CAS therefore cannot leave revision N in RAM beside revision N+1 on disk.
+            let mut live = server.key_rotation.lock().await;
+            let current =
+                live.as_mut().context("key rotation disappeared after view-change durable CAS")?;
+            anyhow::ensure!(
+                current.round.context() == &context,
+                "key-rotation context changed during view-change durable CAS"
+            );
+            if current.revision == runtime.revision {
+                current.round = next_round;
+                current.revision = revision;
+            } else {
+                anyhow::ensure!(
+                    current.revision == revision && current.round == next_round,
+                    "key-rotation view change raced another durable reducer transition"
+                );
+            }
+            Ok::<_, anyhow::Error>(())
+        })
+        .await
+        .context("key-rotation view-change durable publication task failed")??;
+        Ok(())
+    }
+
+    /// Release this source party's single selection-fallback vote after the immutable primary
+    /// membership window. Remote ingress can store peer votes, but only this local pacemaker path
+    /// may create the local signature.
+    async fn progress_key_rotation_selection_fallback(
+        self: &Arc<Self>,
+        now_unix_ms: u64,
+    ) -> anyhow::Result<()> {
+        let schedule = self.proactive_refresh_schedule.lock().await.clone();
+        let Some(schedule) = schedule else {
+            return Ok(());
+        };
+        if schedule.phase != ProactiveRefreshSchedulePhase::Armed {
+            return Ok(());
         }
-        runtime.revision = revision;
+        let Some(fallback_due) = schedule.selection_fallback_due_unix_ms else {
+            return Ok(());
+        };
+        if fallback_due == ACCEPTANCE_PROACTIVE_REFRESH_HELD_DUE_UNIX_MS
+            || now_unix_ms < fallback_due
+        {
+            return Ok(());
+        }
+
+        let source = self.scheduled_key_rotation_source().await?;
+        let context = self
+            .key_rotation_context_for_source(&source)?
+            .context("scheduled selection fallback has no key-rotation policy")?;
+        if context.source().member(self.party).is_err() {
+            // Target-only participants verify any authorization embedded in a terminal value but
+            // never own source-vote authority.
+            return Ok(());
+        }
+        anyhow::ensure!(
+            schedule.source_epoch == source.committee.epoch
+                && schedule.source_activation == source.activation_digest()?
+                && schedule.target_epoch == Some(context.target_epoch()),
+            "selection fallback differs from its proactive schedule"
+        );
+        Self::authenticate_selection_fallback_deadline(&schedule, &context)?;
+        self.ensure_key_rotation_started(
+            &source,
+            now_unix_ms.max(schedule.due_unix_ms.context("key rotation has no due time")?),
+        )
+        .await?;
+        {
+            let rotations = self
+                .certified_key_rotations
+                .read()
+                .map_err(|_| anyhow::anyhow!("key-rotation registry lock is poisoned"))?;
+            if let Some(certified) = rotations.get(&context.target_epoch()) {
+                anyhow::ensure!(
+                    certified.context == context,
+                    "selection fallback found another certified key-rotation decision"
+                );
+                // The immutable receiver-key decision already exists. Its source-retention
+                // authorization (if needed) is part of the certificate, so no later local
+                // fallback vote or volatile reducer is required.
+                return Ok(());
+            }
+        }
+
+        let identity = self.identity(context.source().epoch)?;
+        let round_mutation = Arc::clone(&self.key_rotation_mutation).lock_owned().await;
+        let blocking_permit =
+            try_acquire_key_rotation_blocking_permit(&self.key_rotation_blocking_permits)?;
+        let runtime = {
+            let live = self.key_rotation.lock().await;
+            let runtime = live.as_ref().context("key rotation is not initialized")?;
+            anyhow::ensure!(
+                runtime.round.context() == &context,
+                "selection fallback key-rotation context changed"
+            );
+            runtime.clone()
+        };
+        if runtime.round.certificate().is_some() {
+            return Ok(());
+        }
+        let base_revision = runtime.revision;
+        let receiver_keys = Arc::clone(&self.receiver_keys);
+        let (next_round, changed, certificate, blocking_permit) =
+            tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+                let mut round = runtime.round;
+                let receiver_keys = receiver_keys
+                    .read()
+                    .map_err(|_| anyhow::anyhow!("receiver-key accumulator lock is poisoned"))?;
+                let step = round.authorize_fallback(identity.as_ref(), &receiver_keys)?;
+                let certificate = step.committed.or_else(|| round.certificate());
+                Ok((round, step.changed, certificate, blocking_permit))
+            })
+            .await
+            .context("key-rotation fallback reducer task failed")??;
+        if changed {
+            let revision =
+                base_revision.checked_add(1).context("key-rotation revision exhausted")?;
+            let server = Arc::clone(self);
+            let persistence_context = context.clone();
+            tokio::spawn(async move {
+                let _round_mutation = round_mutation;
+                let _blocking_permit = blocking_permit;
+                let metadata = server
+                    .protocol_store
+                    .save_key_rotation_round(
+                        &persistence_context,
+                        revision,
+                        &next_round,
+                        &mut OsRng,
+                    )
+                    .await?;
+                anyhow::ensure!(
+                    metadata.revision == revision,
+                    "key-rotation fallback durable CAS returned another revision"
+                );
+                // Publish only after the signed vote and retry outbox are stable. Shielding this
+                // cut from caller cancellation keeps a live process aligned with its durable CAS.
+                let mut live = server.key_rotation.lock().await;
+                let runtime =
+                    live.as_mut().context("key rotation disappeared after fallback CAS")?;
+                anyhow::ensure!(
+                    runtime.round.context() == &persistence_context,
+                    "key-rotation context changed during fallback CAS"
+                );
+                if runtime.revision == base_revision {
+                    runtime.round = next_round;
+                    runtime.revision = revision;
+                } else {
+                    anyhow::ensure!(
+                        runtime.revision == revision && runtime.round == next_round,
+                        "key-rotation fallback raced another durable reducer transition"
+                    );
+                }
+                Ok::<_, anyhow::Error>(())
+            })
+            .await
+            .context("key-rotation fallback durable publication task failed")??;
+        } else {
+            drop(blocking_permit);
+            drop(round_mutation);
+        }
+        if let Some(certificate) = certificate {
+            self.finalize_certified_key_rotation(context, certificate, true).await?;
+        }
         Ok(())
     }
 
@@ -8429,22 +14224,36 @@ impl PartyServer {
     /// The clock controls only leader rotation; all safety decisions remain certificate-based.
     /// A decided QUAL value is finalized from local AVSS outputs, staged durably, and followed by
     /// a signed activation acknowledgement in the same durable outbox checkpoint.
+    ///
+    /// A certificate can arrive through authenticated history catch-up, or the process can lose
+    /// the volatile tail of the publisher's activation call after the certificate CAS. In either
+    /// case the certificate compacts the AVSS reducer and removes it from ordinary QUAL progress.
+    /// Recover that exact write window before considering new protocol work: the already-staged
+    /// local share plus the durable n-f certificate are sufficient to finish activation without
+    /// waiting for each acknowledgement to be relayed again.
     pub async fn progress_protocols(
         self: &Arc<Self>,
         now_unix_ms: u64,
         qual_round_timeout: std::time::Duration,
     ) -> anyhow::Result<()> {
         anyhow::ensure!(!qual_round_timeout.is_zero(), "QUAL round timeout must be positive");
+        self.recover_certified_staged_activations().await?;
+        if self.deposit.is_none()
+            && let Err(error) = self.retry_local_share_retirements().await
+        {
+            tracing::debug!(party = %self.party, %error, "core predecessor retirement will retry");
+        }
         self.start_due_proactive_refresh(now_unix_ms).await?;
         let base_timeout_ms = u64::try_from(qual_round_timeout.as_millis())
             .context("QUAL round timeout does not fit u64 milliseconds")?;
+        self.progress_key_rotation_selection_fallback(now_unix_ms).await?;
         self.progress_key_rotation_view_change(now_unix_ms, base_timeout_ms).await?;
         let certified = self.certified_avss_sessions.read().await.clone();
         let sessions = {
             let runs = self.avss.lock().await;
             let mut live = Vec::new();
             for (session, run) in runs.iter() {
-                if !avss_run_is_certified(*session, run, &certified)? {
+                if !avss_run_is_certificate_terminal(self.party, *session, run, &certified)? {
                     live.push(*session);
                 }
             }
@@ -8604,6 +14413,115 @@ impl PartyServer {
         Ok(())
     }
 
+    /// Finish a certificate-first activation only when this process already owns the exact staged
+    /// target share.
+    ///
+    /// Epoch-history observers deliberately remain passive: without a staged share this method
+    /// has no candidate. The durable certificate loader reauthenticates the transition, value, and
+    /// n-f acknowledgement set before [`activate_epoch`] applies the normal ordering, handoff, and
+    /// persistence checks.
+    async fn recover_certified_staged_activations(self: &Arc<Self>) -> anyhow::Result<()> {
+        let certified = self.certified_avss_sessions.read().await.clone();
+        if certified.is_empty() {
+            return Ok(());
+        }
+        let candidates = {
+            let staged = self.staged.read().await;
+            staged
+                .values()
+                .filter_map(|staged| {
+                    let expected = certified.get(&staged.transition.session)?;
+                    Some((staged.transition.clone(), staged.response.clone(), *expected))
+                })
+                .collect::<Vec<_>>()
+        };
+
+        for (transition, response, certified_digest) in candidates {
+            if self.activations.read().await.contains_key(&response.epoch) {
+                continue;
+            }
+            transition.target.member(self.party)?;
+            anyhow::ensure!(
+                avss_transition_digest(&transition)? == certified_digest,
+                "certified AVSS session is bound to another staged transition"
+            );
+            let record = self
+                .durable_activation_record_for_transition(&transition)
+                .await?
+                .context("certified staged transition lacks its durable activation certificate")?;
+            anyhow::ensure!(
+                record.value == activation_value(&response),
+                "durable activation certificate differs from the staged local share"
+            );
+            let _installed = activate_epoch(
+                State(self.clone()),
+                Json(ActivateEpochRequest {
+                    transition: record.transition,
+                    value: record.value,
+                    acknowledgements: record.acknowledgements,
+                }),
+            )
+            .await
+            .map_err(|error| error.0)?;
+        }
+        Ok(())
+    }
+
+    /// Write-ahead authentication for the schedule-before-certificate activation boundary.
+    ///
+    /// The fixed successor deadline must reach stable storage before the public activation
+    /// certificate/history CAS, otherwise a crash could reset the refresh clock. Persist the exact
+    /// verified `n-f` acknowledgement set in the already-finalized AVSS reducer first, so restart
+    /// can authenticate a schedule whose activation certificate has not reached its later CAS yet.
+    /// If the certificate is already durable (certificate-first recovery), that permanent record
+    /// is the authority and the compacted reducer need not be rewritten.
+    async fn persist_pending_activation_authority(
+        &self,
+        request: &ActivateEpochRequest,
+    ) -> anyhow::Result<()> {
+        if self.transition_has_durable_activation_certificate(&request.transition).await? {
+            return Ok(());
+        }
+        let mut runs = self.avss.lock().await;
+        let run = runs
+            .get_mut(&request.transition.session)
+            .context("pending activation lacks its durable finalized AVSS reducer")?;
+        anyhow::ensure!(
+            run.transition == request.transition
+                && run.finalized.as_ref().map(activation_value) == Some(request.value.clone()),
+            "pending activation authority differs from its finalized AVSS result"
+        );
+        anyhow::ensure!(
+            !run.secret_compacted,
+            "uncertified pending activation reducer was already compacted"
+        );
+        let before = run.clone();
+        for acknowledgement in &request.acknowledgements {
+            if let Some(existing) = run.activation_acknowledgements.get(&acknowledgement.from) {
+                anyhow::ensure!(
+                    existing == acknowledgement,
+                    "pending activation signer equivocated across certificate representations"
+                );
+            } else {
+                run.activation_acknowledgements
+                    .insert(acknowledgement.from, acknowledgement.clone());
+            }
+        }
+        let durable_acknowledgements =
+            run.activation_acknowledgements.values().cloned().collect::<Vec<_>>();
+        verify_activation_certificate(
+            self,
+            &run.transition,
+            &request.value,
+            &durable_acknowledgements,
+        )?;
+        if let Err(error) = self.persist_avss_run(run).await {
+            *run = before;
+            return Err(error.context("cannot checkpoint pending activation authority"));
+        }
+        Ok(())
+    }
+
     async fn persist_activation_certificate(
         &self,
         transition: &AvssTransition,
@@ -8614,7 +14532,7 @@ impl PartyServer {
         verify_activation_certificate(self, transition, value, acknowledgements)?;
         let history = self.epoch_history.read().await.clone();
         if history.tip_epoch().is_some_and(|tip| value.epoch <= tip) {
-            let (entry, _) = self
+            let (entry, mut loaded) = self
                 .epoch_history_entry(&history, value.epoch)
                 .await?
                 .context("certified historical epoch is absent from epoch history")?;
@@ -8624,6 +14542,33 @@ impl PartyServer {
                     && entry.activation_digest() == value.activation_digest,
                 "activation retry conflicts with authenticated epoch history"
             );
+            let gossip_key = (value.epoch, value.activation_digest);
+            if history.cold_through().is_none_or(|cold| value.epoch > cold)
+                && !self.activation_gossip_records.read().await.contains_key(&gossip_key)
+            {
+                let bytes = self
+                    .load_epoch_history_object(entry.activation_certificate(), &mut loaded)
+                    .await?;
+                let durable_record: ActivationCertificateRecord = decode_postcard_exact(&bytes)?;
+                anyhow::ensure!(
+                    durable_record.transition == *transition && durable_record.value == *value,
+                    "hot epoch-history activation differs from its certified retry"
+                );
+                validate_avss_transition(self, &durable_record.transition)?;
+                verify_activation_certificate(
+                    self,
+                    &durable_record.transition,
+                    &durable_record.value,
+                    &durable_record.acknowledgements,
+                )?;
+                self.remember_activation_gossip_record(durable_record).await?;
+            }
+            if history.cold_through().is_none_or(|cold| value.epoch > cold) {
+                // Another authenticated ingress can observe the history CAS before the task which
+                // appended it publishes this process-local lookup. Republish the exact verified
+                // link before allowing a duplicate activation caller to make the share visible.
+                self.remember_certified_history_link(value.history_link)?;
+            }
             return Ok(());
         }
         let mut acknowledgements = acknowledgements.to_vec();
@@ -8638,13 +14583,13 @@ impl PartyServer {
             epoch: value.epoch,
             transition_digest: avss_transition_digest(transition)?,
         };
-        if self.accept_existing_activation_certificate(transition_key, transition, value).await? {
-            let durable = self
-                .protocol_store
-                .load_activation_certificate(value.epoch, value.activation_digest)
-                .await?;
-            self.persist_epoch_history_activation(transition, value, durable.as_bytes()).await?;
+        if let Some(durable_record) =
+            self.accept_existing_activation_certificate(transition_key, transition, value).await?
+        {
+            let durable = postcard::to_allocvec(&durable_record)?;
+            self.persist_epoch_history_activation(transition, value, &durable).await?;
             self.remember_certified_history_link(value.history_link)?;
+            self.remember_activation_gossip_record(durable_record).await?;
             self.remember_certified_avss_transition(transition).await?;
             return Ok(());
         }
@@ -8662,25 +14607,55 @@ impl PartyServer {
             Ok(()) => {
                 self.persist_epoch_history_activation(transition, value, &encoded).await?;
                 self.remember_certified_history_link(value.history_link)?;
+                self.remember_activation_gossip_record(record).await?;
                 self.remember_certified_avss_transition(transition).await
             }
             Err(StoreError::ActivationCertificateConflict { .. }) => {
-                anyhow::ensure!(
-                    self.accept_existing_activation_certificate(transition_key, transition, value)
-                        .await?,
-                    "activation certificate publication raced without a durable winner"
-                );
-                let durable = self
-                    .protocol_store
-                    .load_activation_certificate(value.epoch, value.activation_digest)
-                    .await?;
-                self.persist_epoch_history_activation(transition, value, durable.as_bytes())
-                    .await?;
+                let durable_record = self
+                    .accept_existing_activation_certificate(transition_key, transition, value)
+                    .await?
+                    .context("activation certificate publication raced without a durable winner")?;
+                let durable = postcard::to_allocvec(&durable_record)?;
+                self.persist_epoch_history_activation(transition, value, &durable).await?;
                 self.remember_certified_history_link(value.history_link)?;
+                self.remember_activation_gossip_record(durable_record).await?;
                 self.remember_certified_avss_transition(transition).await
             }
             Err(error) => Err(error.into()),
         }
+    }
+
+    /// Publish one already-authenticated durable certificate into the bounded relay cache.
+    async fn remember_activation_gossip_record(
+        &self,
+        record: ActivationCertificateRecord,
+    ) -> anyhow::Result<()> {
+        let key = (record.value.epoch, record.value.activation_digest);
+        anyhow::ensure!(
+            record.transition.target.epoch == key.0,
+            "activation gossip record epoch differs from its transition"
+        );
+        let history = self.epoch_history.read().await;
+        if history.cold_through().is_some_and(|cold| key.0 <= cold) {
+            drop(history);
+            self.activation_gossip_records.write().await.remove(&key);
+            return Ok(());
+        }
+        drop(history);
+        let mut records = self.activation_gossip_records.write().await;
+        if let Some(existing) = records.get(&key) {
+            anyhow::ensure!(
+                existing == &record,
+                "activation gossip key is bound to another durable certificate representation"
+            );
+            return Ok(());
+        }
+        anyhow::ensure!(
+            records.len() < MAX_CURRENT_EPOCH_RECORDS,
+            "activation gossip cache exceeds the authenticated hot-history bound"
+        );
+        records.insert(key, record);
+        Ok(())
     }
 
     /// Cache only the exact transition digest whose activation certificate is already durable
@@ -8732,6 +14707,17 @@ impl PartyServer {
             anyhow::ensure!(run.transition == *transition, "certified AVSS snapshot changed");
             run
         };
+        if transition.target.member(self.party).is_ok() && candidate.finalized.is_none() {
+            anyhow::ensure!(
+                !candidate.secret_compacted,
+                "unfinalized local-target AVSS reducer was already secret-compacted"
+            );
+            // A certificate produced by the first n-f targets does not prove that every honest
+            // target reconstructed its own share. Preserve this replica's AVSS and QUAL state
+            // until it independently finalizes; otherwise a faster quorum can permanently omit a
+            // slower honest member from the newly certified epoch.
+            return Ok(false);
+        }
         if !candidate.secret_compacted {
             compact_avss_secret_state(&mut candidate);
         }
@@ -8778,23 +14764,13 @@ impl PartyServer {
             }
         }
 
-        let (gate_session, gate_context) = acceptance_consolidation_gate_storage_key(
-            self.scenario.quic_network_id()?,
-            self.party,
-        )?;
-        let (bootstrap_session, bootstrap_context) =
-            acceptance_consolidation_bootstrap_gate_storage_key(
-                self.scenario.quic_network_id()?,
-                self.party,
-            )?;
+        let acceptance_keys =
+            acceptance_control_storage_keys(self.scenario.quic_network_id()?, self.party)?;
         for key in self.protocol_store.session_states().await? {
-            if (key.session == gate_session && key.context_digest == gate_context)
-                || (key.session == bootstrap_session && key.context_digest == bootstrap_context)
-            {
+            if acceptance_keys.contains(&(key.session, key.context_digest)) {
                 continue;
             }
-            let bytes =
-                self.protocol_store.load_session_state(key.session, key.context_digest).await?;
+            let bytes = key.state;
             let DurableSessionState::Avss(run) = decode_postcard_exact(bytes.as_bytes())?;
             if !references_epoch(&run) {
                 continue;
@@ -8819,11 +14795,11 @@ impl PartyServer {
         transition_key: ActivationTransitionKey,
         transition: &AvssTransition,
         value: &ActivationValue,
-    ) -> anyhow::Result<bool> {
+    ) -> anyhow::Result<Option<ActivationCertificateRecord>> {
         let path =
             self.protocol_store.activation_certificate_path(value.epoch, value.activation_digest);
         if !tokio::fs::try_exists(path).await? {
-            return Ok(false);
+            return Ok(None);
         }
         let bytes = self
             .protocol_store
@@ -8844,7 +14820,7 @@ impl PartyServer {
         self.protocol_store
             .ensure_activation_transition_index(transition_key, value.activation_digest, &mut OsRng)
             .await?;
-        Ok(true)
+        Ok(Some(existing))
     }
 
     async fn stage(
@@ -8863,6 +14839,7 @@ impl PartyServer {
             avss_transition_digest(&transition)?,
             activation_digest,
             avss_transcript_digest,
+            self.receiver_key_commitment_for_epoch(share.committee.epoch)?,
             self.key_rotation_semantic_digest(share.committee.epoch)?,
         )?;
         let response = InstallResponse {
@@ -8935,8 +14912,49 @@ fn is_expected_deposit_reconciliation_gap(error: &anyhow::Error) -> bool {
             error,
             DepositServiceError::CertifiedHandoffUnavailable(_)
                 | DepositServiceError::NotInitialized
+                | DepositServiceError::CertifiedLedgerRouteUnavailable
         )
     })
+}
+
+fn is_target_only_deposit_handoff_member(
+    party: PartyId,
+    source: &Committee,
+    target: &Committee,
+) -> bool {
+    source.member(party).is_err() && target.member(party).is_ok()
+}
+
+fn try_acquire_key_rotation_blocking_permit(
+    permits: &Arc<Semaphore>,
+) -> anyhow::Result<tokio::sync::OwnedSemaphorePermit> {
+    permits
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| anyhow::anyhow!("key-rotation blocking capacity exhausted"))
+}
+
+/// Preserve fail-closed validation while distinguishing a source's transiently incoherent local
+/// snapshot read from malformed peer input. Only the compact-sync dispatcher's locally derived
+/// state traversals call these adapters; the same errors reached through mutating peer reducers
+/// remain terminal.
+fn retryable_local_deposit_sync_read(error: DepositServiceError) -> DepositServiceError {
+    match error {
+        error @ (DepositServiceError::InvalidDepositIndexCheckpoint
+        | DepositServiceError::InvalidCompactRegistryCheckpoint
+        | DepositServiceError::InvalidArchiveHead
+        | DepositServiceError::CertifiedLedgerRouteUnavailable) => {
+            DepositServiceError::DepositSyncLocalRead(error.to_string())
+        }
+        error => error,
+    }
+}
+
+fn retryable_local_deposit_sync_error(error: anyhow::Error) -> anyhow::Error {
+    match error.downcast::<DepositServiceError>() {
+        Ok(error) => retryable_local_deposit_sync_read(error).into(),
+        Err(error) => error,
+    }
 }
 
 fn quic_peer_rejection(error: anyhow::Error) -> PeerResponse {
@@ -8966,9 +14984,12 @@ fn quic_peer_rejection(error: anyhow::Error) -> PeerResponse {
         classification
     } else if rotation_retryable {
         (RejectionCode::Unavailable, true)
-    } else if lower.contains("too many live") {
+    } else if lower.contains("too many live")
+        || lower.contains("key-rotation blocking capacity exhausted")
+    {
         (RejectionCode::ResourceExhausted, true)
     } else if lower.contains("unknown avss session")
+        || lower.contains("typed v7 ") && lower.contains(" reducer is unavailable")
         || lower.contains("not started")
         || lower.contains("future round")
         || lower.contains("round differs")
@@ -8977,6 +14998,9 @@ fn quic_peer_rejection(error: anyhow::Error) -> PeerResponse {
         || lower.contains("not staged")
         || lower.contains("neither staged nor active")
         || lower.contains("must activate the successor")
+        || lower.contains("locally staged predecessor")
+        || lower.contains("staged predecessor activation")
+        || lower.contains("source share is not active")
         || lower.contains("does not extend the active epoch")
         || lower.contains("live predecessor epoch shares remain")
         || lower.contains("source epoch lacks a locally durable authenticated activation")
@@ -8985,7 +15009,11 @@ fn quic_peer_rejection(error: anyhow::Error) -> PeerResponse {
         || lower.contains("zero refresh is not due yet")
         || lower.contains("key rotation is not due yet")
         || lower.contains("key rotation has no durable proactive schedule")
+        || lower.contains("proactive refresh is held")
         || lower.contains("acceptance protocol fault gate is held")
+        || lower.contains("deposit genesis preparation crossed an epoch activation")
+        || lower.contains("certified epoch history changed during deposit genesis preparation")
+        || lower.contains("durable deposit registry changed during genesis preparation")
     {
         (RejectionCode::Unavailable, true)
     } else if lower.contains("i/o")
@@ -9007,12 +15035,21 @@ fn quic_peer_rejection(error: anyhow::Error) -> PeerResponse {
 
 fn classify_deposit_rejection(error: &DepositServiceError) -> (RejectionCode, bool) {
     match error {
+        DepositServiceError::DepositIndexStore(error) => {
+            classify_deposit_index_store_rejection(error)
+        }
+        DepositServiceError::DepositIndex(DepositIndexError::MissingObject(_))
+        | DepositServiceError::DepositIndexCheckpoint(DepositIndexCheckpointError::DepositIndex(
+            DepositIndexError::MissingObject(_),
+        )) => (RejectionCode::Internal, true),
         DepositServiceError::NotInitialized
+        | DepositServiceError::ColdImportAwaitingCertificate
         | DepositServiceError::MissingScannerAnchor
         | DepositServiceError::WrongEpoch
         | DepositServiceError::CertifiedHandoffUnavailable(_)
         | DepositServiceError::WrongRegistry
         | DepositServiceError::UnknownSlot(_)
+        | DepositServiceError::DepositObservationAheadOfPortableIndex { .. }
         | DepositServiceError::StaleConsolidationCandidate
         | DepositServiceError::HandoffPending
         | DepositServiceError::ConsolidationNotPortable
@@ -9029,6 +15066,7 @@ fn classify_deposit_rejection(error: &DepositServiceError) -> (RejectionCode, bo
             DepositWorkerError::StaleSweepPlan
             | DepositWorkerError::PendingEvents(_)
             | DepositWorkerError::AllocationBackfillRequired
+            | DepositWorkerError::DepositObservationAheadOfScanner { .. }
             | DepositWorkerError::DaemonBehindAnchor { .. }
             | DepositWorkerError::DaemonBehindState { .. },
         ) => (RejectionCode::Unavailable, true),
@@ -9042,10 +15080,14 @@ fn classify_deposit_rejection(error: &DepositServiceError) -> (RejectionCode, bo
         DepositServiceError::TooManyPendingSlots
         | DepositServiceError::TooManyPendingObservations
         | DepositServiceError::ConsensusRequestPoolFull
-        | DepositServiceError::OutboxFull => (RejectionCode::ResourceExhausted, true),
+        | DepositServiceError::OutboxFull
+        | DepositServiceError::DepositPrefixScan(DepositPrefixScanStoreError::RequesterQuota) => {
+            (RejectionCode::ResourceExhausted, true)
+        }
         DepositServiceError::Io(_)
         | DepositServiceError::Storage(_)
         | DepositServiceError::StorageRevisionMismatch
+        | DepositServiceError::DepositSyncLocalRead(_)
         | DepositServiceError::ChainSource(_)
         | DepositServiceError::ConsolidationBackendUnavailable
         | DepositServiceError::Worker(
@@ -9055,7 +15097,15 @@ fn classify_deposit_rejection(error: &DepositServiceError) -> (RejectionCode, bo
             | DepositWorkerError::AnchorMismatch(_)
             | DepositWorkerError::AllocationBackfillBranchChanged
             | DepositWorkerError::PersistenceMismatch,
+        )
+        | DepositServiceError::DepositPrefixScan(
+            DepositPrefixScanStoreError::Storage(_)
+            | DepositPrefixScanStoreError::Database(_)
+            | DepositPrefixScanStoreError::BlockingTask(_),
         ) => (RejectionCode::Internal, true),
+        DepositServiceError::DepositPrefixScan(DepositPrefixScanStoreError::ConcurrentMutation) => {
+            (RejectionCode::Unavailable, true)
+        }
         DepositServiceError::SlotConflict(_)
         | DepositServiceError::RequestEquivocation
         | DepositServiceError::RequestAlreadyReserved
@@ -9065,8 +15115,105 @@ fn classify_deposit_rejection(error: &DepositServiceError) -> (RejectionCode, bo
         | DepositServiceError::ConsolidationWireEquivocation
         | DepositServiceError::ConsolidationRecoveryHistoryIncomplete
         | DepositServiceError::ConsolidationRecoveryRequired
-        | DepositServiceError::ConsolidationRoundClosed => (RejectionCode::Conflict, false),
+        | DepositServiceError::ConsolidationRoundClosed
+        | DepositServiceError::DepositPrefixNotIncluded
+        | DepositServiceError::DepositPrefixScan(
+            DepositPrefixScanStoreError::WrongAttempt
+            | DepositPrefixScanStoreError::RevisionMismatch
+            | DepositPrefixScanStoreError::ReplacementMismatch
+            | DepositPrefixScanStoreError::StartConflict,
+        ) => (RejectionCode::Conflict, false),
         _ => (RejectionCode::InvalidRequest, false),
+    }
+}
+
+/// Keep authenticated source-control retries live without relabeling malformed peer input as a
+/// local outage. Retention/store errors are nested below `DepositServiceError`, so the broad
+/// deposit classification above cannot safely infer their semantics from display strings.
+fn classify_deposit_index_store_rejection(error: &DepositIndexStoreError) -> (RejectionCode, bool) {
+    match error {
+        DepositIndexStoreError::Retention(error) => classify_retention_rejection(error),
+        DepositIndexStoreError::Index(DepositIndexError::MissingObject(_)) => {
+            (RejectionCode::Internal, true)
+        }
+        DepositIndexStoreError::Storage(_)
+        | DepositIndexStoreError::ObjectAuthentication
+        | DepositIndexStoreError::InvalidCheckpoint
+        | DepositIndexStoreError::Serialization => (RejectionCode::Internal, true),
+        DepositIndexStoreError::CheckpointConflict
+        | DepositIndexStoreError::TransitionInProgress => (RejectionCode::Unavailable, true),
+        DepositIndexStoreError::CacheBoundExceeded | DepositIndexStoreError::ReadBoundExceeded => {
+            (RejectionCode::ResourceExhausted, true)
+        }
+        DepositIndexStoreError::Index(_)
+        | DepositIndexStoreError::Ledger(_)
+        | DepositIndexStoreError::SyncWire(_)
+        | DepositIndexStoreError::StateTransferWire(_)
+        | DepositIndexStoreError::InvalidPortableImport
+        | DepositIndexStoreError::InvalidSourcePinResponse
+        | DepositIndexStoreError::InvalidRemoteExportVote
+        | DepositIndexStoreError::UncommittedSigningSlot
+        | DepositIndexStoreError::UncommittedDepositObservationSlot => {
+            (RejectionCode::InvalidRequest, false)
+        }
+    }
+}
+
+fn classify_retention_rejection(error: &RetentionError) -> (RejectionCode, bool) {
+    match error {
+        RetentionError::Storage(_)
+        | RetentionError::Database(_)
+        | RetentionError::BlockingTask(_)
+        | RetentionError::Serialization
+        | RetentionError::NonCanonicalEncoding
+        | RetentionError::StorageAuthentication
+        | RetentionError::StorageConflict
+        | RetentionError::MissingRetentionState
+        | RetentionError::InvalidDurableState
+        | RetentionError::RevisionExhausted
+        | RetentionError::CountOverflow => (RejectionCode::Internal, true),
+        RetentionError::CurrentRootConflict
+        | RetentionError::ConcurrentMutation
+        | RetentionError::AuthorizationHandoffRequired
+        | RetentionError::NoImport
+        | RetentionError::ImportNotSealed
+        | RetentionError::ImportInProgress
+        | RetentionError::NoReauthentication
+        | RetentionError::ReauthenticationInProgress
+        | RetentionError::SourcePinNotAdvanced
+        | RetentionError::ExportCandidateNotPinned
+        | RetentionError::ExportReclaimTombstoneMissing => (RejectionCode::Unavailable, true),
+        RetentionError::GraphBoundExceeded
+        | RetentionError::ImportQuota
+        | RetentionError::ImportBatchBound
+        | RetentionError::ReauthenticationQuota
+        | RetentionError::SourcePinQuota
+        | RetentionError::StorageValueTooLarge => (RejectionCode::ResourceExhausted, true),
+        RetentionError::ImportConflict
+        | RetentionError::ImportAlreadySealed
+        | RetentionError::ReauthenticationConflict
+        | RetentionError::ObjectConflict
+        | RetentionError::AuthorizationRollback
+        | RetentionError::AuthorizationConflict
+        | RetentionError::SourcePinConflict
+        | RetentionError::ExportPinConflict
+        | RetentionError::ExportAlreadyImported
+        | RetentionError::ExportReclaimConflict => (RejectionCode::Conflict, false),
+        RetentionError::InactiveSourceOrRequester => (RejectionCode::Unauthorized, false),
+        RetentionError::Index(_)
+        | RetentionError::StateExport(_)
+        | RetentionError::StateImport(_)
+        | RetentionError::Committee(_)
+        | RetentionError::DuplicateObject
+        | RetentionError::UnreachableStagedObject
+        | RetentionError::GraphCycle
+        | RetentionError::MissingGraphObject(_)
+        | RetentionError::InvalidPortableRoot
+        | RetentionError::SourcePinBinding
+        | RetentionError::InvalidReauthenticationBinding
+        | RetentionError::ReauthenticationAnchorLost
+        | RetentionError::InvalidExportPinBinding
+        | RetentionError::InvalidExportReclaimAuthority => (RejectionCode::InvalidRequest, false),
     }
 }
 
@@ -9148,6 +15295,20 @@ async fn require_deposits(
     }
 }
 
+async fn require_deposit_read_admission(
+    State(permits): State<Arc<Semaphore>>,
+    request: Request<Body>,
+    next: Next,
+) -> Response {
+    let permit = match try_acquire_deposit_read_admission_permit(&permits) {
+        Ok(permit) => permit,
+        Err(response) => return response,
+    };
+    let response = next.run(request).await;
+    drop(permit);
+    response
+}
+
 fn auth_rejection(error: AuthError) -> Response {
     let status = if error == AuthError::Forbidden {
         StatusCode::FORBIDDEN
@@ -9178,9 +15339,9 @@ async fn status(State(server): State<Arc<PartyServer>>) -> Result<Json<PartyStat
                 Ok(EpochStatus {
                     epoch: *epoch,
                     public: share.public(),
-                    history_link: *links
-                        .get(epoch)
-                        .context("active epoch lacks its certified history link")?,
+                    history_link: *links.get(epoch).with_context(|| {
+                        format!("active epoch {epoch} lacks its certified history link")
+                    })?,
                 })
             })
             .collect::<anyhow::Result<Vec<_>>>()?
@@ -9194,6 +15355,7 @@ async fn status(State(server): State<Arc<PartyServer>>) -> Result<Json<PartyStat
                 source_epoch: schedule.source_epoch,
                 target_epoch: schedule.target_epoch,
                 due_unix_ms: schedule.due_unix_ms,
+                selection_fallback_due_unix_ms: schedule.selection_fallback_due_unix_ms,
             }
         });
     // Status is a local observation endpoint. Full issuance synchronization performs bounded
@@ -9221,6 +15383,67 @@ async fn deposit_allocate(
     Extension(principal): Extension<AuthenticatedPrincipal>,
     Json(request): Json<DepositAddressRequest>,
 ) -> Result<Response, ApiError> {
+    let permit = match try_acquire_deposit_allocation_admission_permit(
+        &server.deposit_allocation_admission_permits,
+    ) {
+        Ok(permit) => permit,
+        Err(response) => return Ok(response),
+    };
+    // Hyper may cancel a handler future as soon as the client disconnects or its request timeout
+    // expires. Allocation enters durable reducer CASes below; cancellation after the encrypted
+    // snapshot replacement but before the in-memory publication would leave a live process
+    // permanently one revision behind its own storage. The nonblocking permit bounds detached
+    // work before spawning; the selected mutation then finishes even when its response is no
+    // longer observed.
+    tokio::spawn(async move {
+        let _permit = permit;
+        deposit_allocate_inner(server, principal, request).await
+    })
+    .await
+    .map_err(|error| anyhow::anyhow!("deposit allocation task failed: {error}"))?
+}
+
+fn try_acquire_deposit_allocation_admission_permit(
+    permits: &Arc<Semaphore>,
+) -> Result<tokio::sync::OwnedSemaphorePermit, Response> {
+    permits.clone().try_acquire_owned().map_err(|_| {
+        let mut response = (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "error": "deposit allocation admission is busy; retry the same idempotent request"
+            })),
+        )
+            .into_response();
+        response
+            .headers_mut()
+            .insert(RETRY_AFTER, "1".parse().expect("static retry delay is valid"));
+        response
+    })
+}
+
+fn try_acquire_deposit_read_admission_permit(
+    permits: &Arc<Semaphore>,
+) -> Result<tokio::sync::OwnedSemaphorePermit, Response> {
+    permits.clone().try_acquire_owned().map_err(|_| {
+        let mut response = (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "error": "deposit read admission is busy; retry the same request"
+            })),
+        )
+            .into_response();
+        response
+            .headers_mut()
+            .insert(RETRY_AFTER, "1".parse().expect("static retry delay is valid"));
+        response
+    })
+}
+
+async fn deposit_allocate_inner(
+    server: Arc<PartyServer>,
+    principal: AuthenticatedPrincipal,
+    request: DepositAddressRequest,
+) -> Result<Response, ApiError> {
     server.reconcile_deposit_targets().await?;
     let deposit = server.deposit.as_ref().context("deposit wallet service is not enabled")?;
     let deposit_epoch = deposit.active_epoch().await?;
@@ -9239,12 +15462,11 @@ async fn deposit_allocate(
     let response = deposit
         .submit_allocation_request(
             request,
-            unix_time_millis()?,
+            server.deposit_clock_sample()?.unix_millis,
             server.identity(signing_epoch)?.as_ref(),
         )
         .await?;
-    let issuer_registry = deposit.active_registry().await?;
-    Ok(deposit_http_response(external_request, response, issuer_registry).into_response())
+    Ok(deposit_http_response(external_request, response).into_response())
 }
 
 async fn deposit_status(
@@ -9256,26 +15478,28 @@ async fn deposit_status(
     let deposit = server.deposit.as_ref().context("deposit wallet service is not enabled")?;
     let external_request = request.request;
     let request = tenant_deposit_request(&principal, request)?;
-    let response = deposit.address_status(request, unix_time_seconds()?).await?;
-    let issuer_registry = deposit.active_registry().await?;
-    Ok(deposit_http_response(external_request, response, issuer_registry).into_response())
+    let response =
+        deposit.address_status(request, server.deposit_clock_sample()?.unix_seconds).await?;
+    Ok(deposit_http_response(external_request, response).into_response())
 }
 
 async fn deposit_consolidation_status(
     State(server): State<Arc<PartyServer>>,
     Extension(principal): Extension<AuthenticatedPrincipal>,
-    Json(request): Json<DepositAddressRequest>,
+    Json(request): Json<DepositConsolidationStatusRequest>,
 ) -> Result<Json<DepositConsolidationStatusResponse>, ApiError> {
     server.ensure_deposit_initialized().await?;
     let deposit = server.deposit.as_ref().context("deposit wallet service is not enabled")?;
-    let external_request = request.request;
-    let certified_request = tenant_deposit_request(&principal, request)?.request;
-    let consolidations =
-        deposit.public_consolidation_statuses_for_request(certified_request).await?;
+    let external_request = request.request.request;
+    let certified_request = tenant_deposit_request(&principal, request.request)?.request;
+    let consolidation = deposit
+        .public_consolidation_status_for_request_output(certified_request, request.output)
+        .await?;
     Ok(Json(DepositConsolidationStatusResponse {
         request: external_request,
         certified_request,
-        consolidations,
+        output: request.output,
+        consolidation,
     }))
 }
 
@@ -9296,7 +15520,6 @@ fn tenant_deposit_request(
 fn deposit_http_response(
     external_request: LedgerRequestId,
     response: DepositAddressResponse,
-    issuer_registry: CompactEpochRegistry,
 ) -> (StatusCode, Json<DepositHttpResponse>) {
     let syncing = response.status == DepositAddressStatus::Syncing;
     let response = DepositHttpResponse {
@@ -9313,7 +15536,8 @@ fn deposit_http_response(
         // populated service response. Clients can retry this same tenant-local idempotency key.
         address: (!syncing).then_some(response.address).flatten(),
         certificate: (!syncing).then_some(response.certificate).flatten(),
-        issuer_registry: (!syncing).then_some(issuer_registry),
+        allocation_issuer: (!syncing).then_some(response.allocation_issuer).flatten(),
+        serving_registry: response.serving_registry,
         created_at: (!syncing).then_some(response.created_at).flatten(),
         expires_at: (!syncing).then_some(response.expires_at).flatten(),
         leader: response.leader,
@@ -9327,10 +15551,22 @@ async fn avss_start(
     Json(request): Json<AvssStartRequest>,
 ) -> Result<Json<AvssStepResponse>, ApiError> {
     validate_avss_transition(&server, &request.transition)?;
-    server.ensure_reshare_source_certified(&request.transition).await?;
-    server.ensure_refresh_due_for_live_ingress(&request.transition, unix_time_millis()?).await?;
     let expected = expected_avss_dealers(&request.transition);
     api_ensure(expected.contains(&server.party), "local party is not an AVSS dealer")?;
+    if server.transition_has_terminal_avss_replay_state(&request.transition).await? {
+        return Ok(Json(terminal_avss_replay_response(server.party, server.party)));
+    }
+    let live_admission = async {
+        server.ensure_reshare_source_certified(&request.transition).await?;
+        server.ensure_refresh_due_for_live_ingress(&request.transition, unix_time_millis()?).await
+    }
+    .await;
+    if let Err(error) = live_admission {
+        if server.transition_has_terminal_avss_replay_state(&request.transition).await? {
+            return Ok(Json(terminal_avss_replay_response(server.party, server.party)));
+        }
+        return Err(error.into());
+    }
 
     // Retirement takes consolidation_transition -> epoch_transition -> AVSS/signing state.
     // Acquire the same epoch-before-AVSS suffix here and retain it until the dealer's encrypted
@@ -9344,16 +15580,11 @@ async fn avss_start(
             run.transition == request.transition,
             "session was bound to another transition",
         )?;
-        if run.secret_compacted {
-            validate_avss_secret_compaction(run)?;
-            return Ok(Json(AvssStepResponse {
-                party: server.party,
-                dealer: server.party,
-                completed: false,
-                completion: None,
-                outbound: Vec::new(),
-                qual: None,
-            }));
+        if run.secret_compacted || run.finalized.is_some() {
+            if run.secret_compacted {
+                validate_avss_secret_compaction(run)?;
+            }
+            return Ok(Json(terminal_avss_replay_response(server.party, server.party)));
         }
         if let Some(outbound) = &run.dealer_outbound {
             let response = AvssStepResponse {
@@ -9370,6 +15601,9 @@ async fn avss_start(
         }
         api_ensure(run.finalized.is_none(), "AVSS session is already finalized")?;
     } else {
+        if server.closed_transition_activation_record(&request.transition).await?.is_some() {
+            return Ok(Json(terminal_avss_replay_response(server.party, server.party)));
+        }
         server.ensure_avss_session_open(request.transition.session).await?;
     }
 
@@ -9417,7 +15651,13 @@ async fn avss_start(
         .collect::<anyhow::Result<Vec<_>>>()?;
     let inserted = !runs.contains_key(&request.transition.session);
     if inserted {
-        ensure_avss_live_capacity(&runs, &certified, &request.transition, MAX_LIVE_AVSS_RUNS)?;
+        ensure_avss_live_capacity(
+            server.party,
+            &runs,
+            &certified,
+            &request.transition,
+            MAX_LIVE_AVSS_RUNS,
+        )?;
         runs.insert(request.transition.session, new_avss_run(&server, request.transition.clone())?);
     }
     let run = runs.get_mut(&request.transition.session).expect("AVSS run was inserted above");
@@ -9450,8 +15690,6 @@ async fn avss_deliver(
     Json(request): Json<AvssDeliverRequest>,
 ) -> Result<Json<AvssStepResponse>, ApiError> {
     validate_avss_transition(&server, &request.transition)?;
-    server.ensure_reshare_source_certified(&request.transition).await?;
-    server.ensure_refresh_due_for_live_ingress(&request.transition, unix_time_millis()?).await?;
     request.transition.target.member(server.party)?;
     api_ensure(request.wire.version == AVSS_WIRE_VERSION, "unsupported AVSS wire version")?;
     api_ensure(request.wire.recipient == server.party, "AVSS wire is for another party")?;
@@ -9465,6 +15703,39 @@ async fn avss_deliver(
     // Authenticate and decrypt before allocating an in-memory/durable session slot. Invalid input
     // must not be able to leave a provisional run that poisons later legitimate creation.
     let message = open_avss_wire(&server, &request.transition, &request.wire)?;
+    let sender = request.wire.envelope.from;
+    if server.transition_has_terminal_avss_replay_state(&request.transition).await? {
+        validate_terminal_avss_replay(
+            &server,
+            &request.transition,
+            request.wire.dealer,
+            sender,
+            &message,
+        )?;
+        // Historical retries remain drainable after the live fixed-interval schedule advances.
+        // The complete payload and exact terminal transition were authenticated before this no-op.
+        return Ok(Json(terminal_avss_replay_response(server.party, request.wire.dealer)));
+    }
+    let live_admission = async {
+        server.ensure_reshare_source_certified(&request.transition).await?;
+        server.ensure_refresh_due_for_live_ingress(&request.transition, unix_time_millis()?).await
+    }
+    .await;
+    if let Err(error) = live_admission {
+        // Finalization/retirement may have won after the first classification. Only a fully
+        // authenticated exact terminal state converts that live-admission failure into success.
+        if server.transition_has_terminal_avss_replay_state(&request.transition).await? {
+            validate_terminal_avss_replay(
+                &server,
+                &request.transition,
+                request.wire.dealer,
+                sender,
+                &message,
+            )?;
+            return Ok(Json(terminal_avss_replay_response(server.party, request.wire.dealer)));
+        }
+        return Err(error.into());
+    }
     let certified = server.certified_avss_sessions.read().await.clone();
     let mut runs = server.avss.lock().await;
     api_ensure(
@@ -9477,8 +15748,27 @@ async fn avss_deliver(
     )?;
     let inserted = !runs.contains_key(&request.transition.session);
     if inserted {
+        if server.closed_transition_activation_record(&request.transition).await?.is_some() {
+            // The wire was fully authenticated and decrypted above. An exact transition closure
+            // makes this a terminal semantic duplicate, so acknowledge it without recreating
+            // secret reducer state after compaction.
+            validate_terminal_avss_replay(
+                &server,
+                &request.transition,
+                request.wire.dealer,
+                sender,
+                &message,
+            )?;
+            return Ok(Json(terminal_avss_replay_response(server.party, request.wire.dealer)));
+        }
         server.ensure_avss_session_open(request.transition.session).await?;
-        ensure_avss_live_capacity(&runs, &certified, &request.transition, MAX_LIVE_AVSS_RUNS)?;
+        ensure_avss_live_capacity(
+            server.party,
+            &runs,
+            &certified,
+            &request.transition,
+            MAX_LIVE_AVSS_RUNS,
+        )?;
         runs.insert(request.transition.session, new_avss_run(&server, request.transition.clone())?);
     }
     let run = runs.get_mut(&request.transition.session).expect("AVSS run was inserted above");
@@ -9490,21 +15780,24 @@ async fn avss_deliver(
         server.hold_acceptance_protocol_fault_gate_if_boundary(run).await?;
         return Ok(Json(response));
     }
-    if run.secret_compacted {
-        validate_avss_secret_compaction(run)?;
-        return Ok(Json(AvssStepResponse {
-            party: server.party,
-            dealer: request.wire.dealer,
-            completed: false,
-            completion: None,
-            outbound: Vec::new(),
-            qual: None,
-        }));
+    if run.secret_compacted || run.finalized.is_some() {
+        if run.secret_compacted {
+            validate_avss_secret_compaction(run)?;
+        }
+        validate_terminal_avss_replay(
+            &server,
+            &request.transition,
+            request.wire.dealer,
+            sender,
+            &message,
+        )?;
+        // A verified wire arriving after this exact transition is durably final no longer changes
+        // the reducer. Treat it as an idempotent terminal reduction so the authenticated sender
+        // can retire its per-recipient catch-up item instead of starving a successor transition.
+        return Ok(Json(terminal_avss_replay_response(server.party, request.wire.dealer)));
     }
-    api_ensure(run.finalized.is_none(), "AVSS session is already finalized")?;
 
     let before = run.clone();
-    let sender = request.wire.envelope.from;
     let dealer = request.wire.dealer;
     let state = run.receivers.entry(dealer).or_insert(AvssParty::new(
         avss_config(&server, &request.transition, dealer)?,
@@ -9568,6 +15861,29 @@ async fn avss_deliver(
     }
     server.hold_acceptance_protocol_fault_gate_if_boundary(run).await?;
     Ok(Json(response))
+}
+
+fn terminal_avss_replay_response(party: PartyId, dealer: PartyId) -> AvssStepResponse {
+    AvssStepResponse {
+        party,
+        dealer,
+        completed: false,
+        completion: None,
+        outbound: Vec::new(),
+        qual: None,
+    }
+}
+
+fn validate_terminal_avss_replay(
+    server: &PartyServer,
+    transition: &AvssTransition,
+    dealer: PartyId,
+    sender: PartyId,
+    message: &AvssMessage,
+) -> anyhow::Result<()> {
+    AvssParty::new(avss_config(server, transition, dealer)?, server.party)?
+        .validate_message(sender, message)?;
+    Ok(())
 }
 
 /// Check purpose-specific AVSS constants before local availability certification.
@@ -9677,7 +15993,6 @@ async fn qual_deliver(
     Json(request): Json<QualDeliverRequest>,
 ) -> Result<Json<QualStepResponse>, ApiError> {
     validate_avss_transition(&server, &request.transition)?;
-    server.ensure_refresh_due_for_live_ingress(&request.transition, unix_time_millis()?).await?;
     request.transition.target.member(server.party)?;
     api_ensure(request.wire.version == QUAL_WIRE_VERSION, "unsupported QUAL wire version")?;
     let digest = qual_wire_digest(&request.wire)?;
@@ -9698,6 +16013,19 @@ async fn qual_deliver(
         }
         None => None,
     };
+    if server.transition_has_terminal_avss_replay_state(&request.transition).await? {
+        // As with AVSS delivery, authenticate the complete signed QUAL message before treating an
+        // exact historical transition as a terminal semantic duplicate.
+        return Ok(Json(terminal_qual_replay_response(server.party, message_round)));
+    }
+    if let Err(error) =
+        server.ensure_refresh_due_for_live_ingress(&request.transition, unix_time_millis()?).await
+    {
+        if server.transition_has_terminal_avss_replay_state(&request.transition).await? {
+            return Ok(Json(terminal_qual_replay_response(server.party, message_round)));
+        }
+        return Err(error.into());
+    }
     let mut runs = server.avss.lock().await;
     api_ensure(
         !server
@@ -9713,32 +16041,17 @@ async fn qual_deliver(
             .closed_transition_activation_record(&request.transition)
             .await?
             .context("unknown AVSS session")?;
-        return Ok(Json(QualStepResponse {
-            party: server.party,
-            round: message_round,
-            decision: None,
-            outbound: Vec::new(),
-            evidence: Vec::new(),
-            entered_round: None,
-            requested_round: None,
-            duplicate: true,
-            changed: false,
-        }));
+        return Ok(Json(terminal_qual_replay_response(server.party, message_round)));
     };
     api_ensure(run.transition == request.transition, "session was bound to another transition")?;
-    if run.secret_compacted {
-        validate_avss_secret_compaction(run)?;
-        return Ok(Json(QualStepResponse {
-            party: server.party,
-            round: message_round,
-            decision: None,
-            outbound: Vec::new(),
-            evidence: Vec::new(),
-            entered_round: None,
-            requested_round: None,
-            duplicate: true,
-            changed: false,
-        }));
+    if run.secret_compacted || run.finalized.is_some() {
+        if run.secret_compacted {
+            validate_avss_secret_compaction(run)?;
+        }
+        // The signed QUAL wire was fully authenticated above. Once the exact transition has a
+        // durable final value it is a semantic duplicate, even if this replica did not retain the
+        // sender's exact witness before finalization.
+        return Ok(Json(terminal_qual_replay_response(server.party, message_round)));
     }
     if let Some(cached) = run.qual_delivery_responses.get(&logical_key) {
         if cached.round > message_round {
@@ -9755,7 +16068,6 @@ async fn qual_deliver(
             return Ok(Json(cached.response.clone()));
         }
     }
-    api_ensure(run.finalized.is_none(), "AVSS session is already finalized")?;
     let before = run.clone();
     let step = {
         let qual = run.qual.as_mut().context("target AVSS run omitted QUAL state")?;
@@ -9810,6 +16122,20 @@ async fn qual_deliver(
     }
     server.hold_acceptance_protocol_fault_gate_if_boundary(run).await?;
     Ok(Json(response))
+}
+
+fn terminal_qual_replay_response(party: PartyId, round: u64) -> QualStepResponse {
+    QualStepResponse {
+        party,
+        round,
+        decision: None,
+        outbound: Vec::new(),
+        evidence: Vec::new(),
+        entered_round: None,
+        requested_round: None,
+        duplicate: true,
+        changed: false,
+    }
 }
 
 /// Run every context/structure/leader check independently of mutable reducer state. Live delivery
@@ -10079,6 +16405,16 @@ async fn observe_epoch_certificate(
         &request.value,
         &request.acknowledgements,
     )?;
+    let _epoch_transition = server.epoch_transition.lock().await;
+    let _schedule_mutation = server.proactive_refresh_schedule_mutation.lock().await;
+    // Sample the fixed deadline exactly once for this receive attempt. A replay of the same
+    // certificate keeps the first durable candidate and cannot push its refresh interval out.
+    let passive_schedule = server
+        .proactive_refresh_schedule_for_activation_value(&request.value, unix_time_millis()?)?;
+    let existing_schedule = server.proactive_refresh_schedule.lock().await.clone();
+    server
+        .preflight_passive_refresh_schedule(existing_schedule.as_ref(), &passive_schedule)
+        .context("observed epoch schedule preflight failed")?;
     // Observation is deliberately passive: stable certificate storage and public deposit history
     // only. It never creates, installs, or retires a threshold share.
     server
@@ -10089,19 +16425,11 @@ async fn observe_epoch_certificate(
         )
         .await?;
     server.remember_certified_deposit_target(&request.value).await?;
-    let mut targets = server.deposit_targets.write().await;
-    if let Some(old) = request.transition.old {
-        targets.entry(old.committee.epoch).or_insert(old);
-    }
-    drop(targets);
-    if server
-        .key_rotation_context_for_source(&request.value.public)?
-        .is_some_and(|context| context.target_policy().eligible().member(server.party).is_ok())
-    {
-        server
-            .arm_proactive_refresh_for_activation(&request.value.public, unix_time_millis()?)
-            .await?;
-    }
+    // Persist even a quiescent observer schedule (`target = None`). One bounded monotonic record
+    // is enough to remember the latest certified source and cannot grant AVSS dealer authority.
+    server.defer_or_promote_passive_refresh_schedule_locked(passive_schedule).await?;
+    drop(_schedule_mutation);
+    drop(_epoch_transition);
     if let Err(error) = server.progress_deposit_state().await {
         tracing::debug!(party = %server.party, epoch = request.value.epoch, %error, "passive deposit history observation remains fail-closed");
     }
@@ -10122,6 +16450,9 @@ async fn retire_local_predecessor_after_activation(
     if old.committee.member(server.party).is_err() {
         return Ok(());
     }
+    // `retire_epoch` owns the chain-independent absence proof for a dormant deposit service and
+    // the terminal handoff gate for a live one. It never resolves a birth anchor while holding the
+    // signing transition, so core activation can erase a never-used predecessor immediately.
     boxed_retire_epoch(State(server.clone()), Json(request.clone())).await?;
     Ok(())
 }
@@ -10141,11 +16472,33 @@ async fn activate_epoch(
         &request.acknowledgements,
     )?;
     let epoch = request.transition.target.epoch;
+    tracing::debug!(
+        party = %server.party,
+        epoch,
+        session = %request.transition.session,
+        "verified epoch activation certificate; waiting for transition fences"
+    );
     // Consolidation progress starts with this lock and then leases an epoch share. Preserve that
     // order at cutover so activation cannot deadlock a nonce start or let it cross the handoff
     // fence using a predecessor share.
     let _consolidation_transition = server.consolidation_transition.lock().await;
+    tracing::debug!(
+        party = %server.party,
+        epoch,
+        session = %request.transition.session,
+        "acquired consolidation transition fence for epoch activation"
+    );
     let _epoch_transition = server.epoch_transition.lock().await;
+    tracing::debug!(
+        party = %server.party,
+        epoch,
+        session = %request.transition.session,
+        "acquired epoch transition fence for epoch activation"
+    );
+    // Monero RPC resolves before this lock is acquired. A prepared genesis may therefore publish
+    // only wholly before this activation, or after it against the new revision with an atomic
+    // successor ingress fence.
+    let _deposit_genesis_publication = server.deposit_genesis_publication.lock().await;
     let (response, closed_replay) =
         if let Some(active) = server.activations.read().await.get(&epoch).cloned() {
             (active, false)
@@ -10194,13 +16547,19 @@ async fn activate_epoch(
 
     if server.activations.read().await.contains_key(&epoch) {
         server.remember_certified_deposit_target(&request.value).await?;
-        if let Err(error) = server.boxed_progress_deposit_state().await {
-            tracing::warn!(party = %server.party, epoch, %error, "deposit epoch catch-up remains fail-closed");
-        }
         server.retire_transition_session_if_drained(&request.transition).await?;
+        drop(_deposit_genesis_publication);
         drop(_epoch_transition);
         drop(_consolidation_transition);
-        boxed_retire_local_predecessor_after_activation(&server, &request).await?;
+        if let Err(error) = boxed_retire_local_predecessor_after_activation(&server, &request).await
+        {
+            tracing::debug!(
+                party = %server.party,
+                epoch,
+                error = %error.0,
+                "certified predecessor retirement remains pending after activation replay"
+            );
+        }
         return Ok(Json(response));
     }
     if let Some(old) = &request.transition.old {
@@ -10223,17 +16582,32 @@ async fn activate_epoch(
             "staged activation response changed",
         )?;
     }
+    server.persist_pending_activation_authority(&request).await?;
     // Persist the successor deadline before publishing the activation certificate. Durable-state
     // restoration treats a valid certificate plus the staged share as active, so certificate-first
     // ordering would leave a crash window in which restart silently reset the refresh clock.
-    // Retrying the same activation preserves this exact deadline.
-    server.arm_proactive_refresh_for_activation(&request.value.public, unix_time_millis()?).await?;
+    // The finalized AVSS reducer above is the write-ahead authority for the opposite crash cut,
+    // where this deadline is durable but the public certificate/history CAS is not. Retrying the
+    // same activation preserves this exact deadline.
+    server
+        .arm_proactive_refresh_for_pending_activation(&request.value, unix_time_millis()?)
+        .await?;
+    tracing::debug!(
+        party = %server.party,
+        epoch,
+        session = %request.transition.session,
+        "persisted proactive refresh schedule for epoch activation"
+    );
     let certified_root = request.value.history_link.root()?;
-    if let Some(old) = &request.transition.old {
+    if let Some(old) = &request.transition.old
+        && server.deposit.as_ref().is_none_or(|deposit| deposit.local_runtime_ready())
+    {
         // Close deposit/consolidation ingress on the exact successor before its activation
-        // certificate can become durable. `prepare_deposit_handoff` accepts only the one
-        // post-checkpoint retry condition: an already released nonce-bearing consolidation may
-        // finish under its old-epoch scoped signing lease.
+        // certificate can become durable when the runtime is already local. An uninitialized
+        // runtime has no ingress to close; initialization racing this probe is fenced by the
+        // signing/deposit epoch check for clients and pre-reduction reconciliation for peers.
+        // `prepare_deposit_handoff` accepts only the one post-checkpoint retry condition: an
+        // already released nonce-bearing consolidation may finish under its old-epoch lease.
         server.boxed_prepare_deposit_handoff(old, &request.value.public, certified_root).await?;
     }
     // The certificate reaches stable storage before the share becomes usable for signing.
@@ -10244,35 +16618,74 @@ async fn activate_epoch(
             &request.acknowledgements,
         )
         .await?;
+    tracing::debug!(
+        party = %server.party,
+        epoch,
+        session = %request.transition.session,
+        "persisted activation certificate and authenticated epoch-history link"
+    );
+    // The write-ahead deadline protected the certificate crash cut, but time spent closing
+    // portable predecessor state must not make this newly certified epoch immediately overdue.
+    // Persist the one-way PendingActivation -> Armed transition before exposing the share.
+    server.complete_proactive_refresh_activation(&request.value, unix_time_millis()?).await?;
+    tracing::debug!(
+        party = %server.party,
+        epoch,
+        session = %request.transition.session,
+        "re-armed proactive refresh interval after durable epoch activation"
+    );
+    // Installing a certified threshold share is the core epoch linearization point. Deposit
+    // genesis may need an unavailable daemon to resolve its scanner anchor, so it must not be
+    // awaited between certificate durability and this state change. Deposit endpoints and the
+    // independent allocation/worker pacemakers retry initialization; issuance remains fail-closed
+    // until the deposit registry reaches this active signing epoch.
+    // Acquire every asynchronous guard before removing the staged share. QUIC request deadlines
+    // may cancel this future at any await; mutating the staged map first would leave the durable
+    // successor schedule with neither a retryable staged share nor an active epoch.
+    let mut staged_epochs = server.staged.write().await;
+    let mut epochs = server.epochs.write().await;
+    let mut active_epoch = server.active_epoch.write().await;
+    let mut activations = server.activations.write().await;
+    let staged = staged_epochs.remove(&epoch).context("target epoch is not staged")?;
+    epochs.insert(epoch, staged.share);
+    *active_epoch = Some(epoch);
+    server.deposit_activation_revision.store(
+        epoch.checked_add(1).context("deposit activation revision exhausted")?,
+        Ordering::Release,
+    );
+    activations.insert(epoch, response.clone());
+    drop(activations);
+    drop(active_epoch);
+    drop(epochs);
+    drop(staged_epochs);
+    tracing::info!(
+        party = %server.party,
+        epoch,
+        session = %request.transition.session,
+        "installed certified epoch share"
+    );
+    // Portable deposit metadata is independently retryable and must stay after the share
+    // linearization point. If cancellation lands here, the active-epoch retry branch above
+    // reconstructs both bindings before acknowledging the immutable activation request.
     server.remember_certified_deposit_target(&request.value).await?;
-    if let Some(old) = &request.transition.old {
-        server
-            .deposit_targets
-            .write()
-            .await
-            .entry(old.committee.epoch)
-            .or_insert_with(|| old.clone());
-    } else {
-        if let Err(error) = server.boxed_ensure_deposit_initialized().await {
-            tracing::warn!(party = %server.party, epoch, %error, "deposit genesis initialization deferred; issuance remains closed");
-        }
-    }
-    let staged =
-        server.staged.write().await.remove(&epoch).context("target epoch is not staged")?;
-    server.epochs.write().await.insert(epoch, staged.share);
-    *server.active_epoch.write().await = Some(epoch);
-    server.activations.write().await.insert(epoch, response.clone());
     server.retire_key_rotation_after_activation(&request.value.public).await?;
-    if let Err(error) = server.boxed_progress_deposit_state().await {
-        tracing::warn!(party = %server.party, epoch, %error, "deposit epoch catch-up deferred; issuance remains closed");
-    }
+    // Once locally active, the secret-bearing AVSS reducer is no longer needed for progress.
+    // Retire it before touching any independently retryable deposit state.
     server.retire_transition_session_if_drained(&request.transition).await?;
     // The successor share and its activation certificate have both survived durable readback at
     // this point. Retire this party's predecessor directly; peer certificate routes deliberately
     // exclude self and therefore cannot be the trigger for local crypto-erasure.
+    drop(_deposit_genesis_publication);
     drop(_epoch_transition);
     drop(_consolidation_transition);
-    boxed_retire_local_predecessor_after_activation(&server, &request).await?;
+    if let Err(error) = boxed_retire_local_predecessor_after_activation(&server, &request).await {
+        tracing::debug!(
+            party = %server.party,
+            epoch,
+            error = %error.0,
+            "certified predecessor retirement deferred after core activation"
+        );
+    }
     Ok(Json(response))
 }
 
@@ -10283,8 +16696,6 @@ async fn retire_epoch(
     validate_avss_transition(&server, &request.transition)?;
     let old = request.transition.old.as_ref().context("DKG has no prior epoch to retire")?;
     old.committee.member(server.party)?;
-    let consolidation_transition = server.consolidation_transition.lock().await;
-    let _epoch_transition = server.epoch_transition.lock().await;
     request.value.public.validate()?;
     api_ensure(request.value.epoch == request.transition.target.epoch, "retirement epoch differs")?;
     api_ensure(
@@ -10307,6 +16718,33 @@ async fn retire_epoch(
         &request.acknowledgements,
     )?;
 
+    let staged_predecessor = server
+        .staged
+        .read()
+        .await
+        .get(&old.committee.epoch)
+        .map(|staged| staged.response.public.clone());
+    if let Some(staged_predecessor) = staged_predecessor {
+        api_ensure(
+            staged_predecessor == *old,
+            "retirement predecessor differs from the locally staged epoch",
+        )?;
+        // A target-only joiner can learn this successor retirement immediately after its own
+        // predecessor certificate became durable, while that predecessor share is still staged
+        // behind the activation response boundary. Finish that exact certified activation first;
+        // otherwise advancing the schedule and retiring the epoch-named share would strand a
+        // live `staged` entry whose durable secret has already been destroyed.
+        server.recover_certified_staged_activations().await?;
+    }
+
+    let consolidation_transition = server.consolidation_transition.lock().await;
+    let _epoch_transition = server.epoch_transition.lock().await;
+    let _deposit_genesis_publication = server.deposit_genesis_publication.lock().await;
+    api_ensure(
+        !server.staged.read().await.contains_key(&old.committee.epoch),
+        "retirement cannot supersede a staged predecessor activation",
+    )?;
+
     let expected_retirement = ShareRetirement::for_certified_successor(
         old.committee.epoch,
         old.committee.digest(),
@@ -10316,9 +16754,12 @@ async fn retire_epoch(
     if let Some(retirement) =
         server.store.load_retirement(old.committee.epoch, old.committee.digest()).await?
     {
-        // The share marker is the durable proof that all pre-retirement gates (including the
-        // portable deposit handoff) completed. Pair it with the fully revalidated permanent
-        // activation record before acknowledging an old replay after a later epoch advanced.
+        // The share marker may become visible before the final awaited directory cleanup in
+        // `retire_share`. Cancellation at that boundary can therefore leave the source transport
+        // identity live long enough for a delayed canonical deposit genesis to publish epoch-zero
+        // work. Pair the marker with the fully revalidated permanent activation record, then
+        // re-run the deposit retirement gate under the publication fence before erasing that
+        // identity or acknowledging an old replay.
         api_ensure(
             retirement == expected_retirement,
             "historical share retirement context differs",
@@ -10331,6 +16772,13 @@ async fn retire_epoch(
             record.value == request.value,
             "historical retirement value differs from its durable certificate",
         )?;
+        let certified_root = server.remember_certified_deposit_target(&request.value).await?;
+        server
+            .authorize_deposit_share_retirement(old, &request.value.public, certified_root)
+            .await?;
+        server
+            .arm_proactive_refresh_for_activation(&request.value.public, unix_time_millis()?)
+            .await?;
         server
             .drain_retiring_epoch_signers(
                 &consolidation_transition,
@@ -10338,7 +16786,10 @@ async fn retire_epoch(
                 old.committee.epoch,
             )
             .await?;
+        server.retire_local_epoch_share(expected_retirement).await?;
         server.retire_key_rotation_source_identity_after_handoff(&request.value.public).await?;
+        server.retire_transition_session_if_drained(&request.transition).await?;
+        server.promote_deferred_observer_schedule().await?;
         return Ok(StatusCode::NO_CONTENT);
     }
 
@@ -10362,14 +16813,24 @@ async fn retire_epoch(
         )
         .await?;
     let certified_root = server.remember_certified_deposit_target(&request.value).await?;
-    server.deposit_targets.write().await.entry(old.committee.epoch).or_insert_with(|| old.clone());
+    // Advance the fixed-interval pacemaker before any fallible portable handoff or old-share
+    // erasure. A crash may therefore leave the exact adjacent successor schedule beside the old
+    // active share; restore authenticates that state against this durable certificate and never
+    // lets it launch an old-share dealer.
+    server.arm_proactive_refresh_for_activation(&request.value.public, unix_time_millis()?).await?;
+    // An overlapping target closes this round from `activate_epoch`. A source-only member reaches
+    // the same certified successor exclusively through `Retire`, and must not carry the old live
+    // reducer into the successor's fixed-interval rotation. Keep this fallible cleanup after the
+    // successor schedule is durable so a retry preserves the original fixed deadline.
+    server.retire_key_rotation_after_activation(&request.value.public).await?;
 
     // A proposed handoff is not enough: do not destroy the sole old-epoch authorization until
-    // this party has durably applied the old quorum's terminal ledger certificate. The QUIC
-    // rejection remains retryable and permanent activation-certificate gossip will call us again.
-    server
-        .certify_deposit_handoff_before_share_retirement(old, &request.value.public, certified_root)
-        .await?;
+    // this party has durably applied the old quorum's terminal ledger certificate. The only
+    // exception is an authenticated absence proof under the genesis publication fence, which
+    // establishes that this host never created a deposit registry or any portable obligation.
+    // The QUIC rejection remains retryable and permanent activation-certificate gossip will call
+    // us again.
+    server.authorize_deposit_share_retirement(old, &request.value.public, certified_root).await?;
     server
         .drain_retiring_epoch_signers(
             &consolidation_transition,
@@ -10377,22 +16838,22 @@ async fn retire_epoch(
             old.committee.epoch,
         )
         .await?;
-    server.epochs.write().await.remove(&old.committee.epoch);
-    server.activations.write().await.remove(&old.committee.epoch);
-    let mut active_epoch = server.active_epoch.write().await;
-    if *active_epoch == Some(old.committee.epoch) {
-        *active_epoch = None;
-    }
-    drop(active_epoch);
-    if tokio::fs::try_exists(server.store.share_path(old.committee.epoch)).await? {
-        server.store.retire_share(expected_retirement).await?;
-    }
+    server.retire_local_epoch_share(expected_retirement).await?;
     server.retire_key_rotation_source_identity_after_handoff(&request.value.public).await?;
 
-    if let Err(error) = server.progress_deposit_state().await {
+    server.retire_transition_session_if_drained(&request.transition).await?;
+    server.promote_deferred_observer_schedule().await?;
+    // Capture the already-live case under the publication fence, then release every transition
+    // fence before best-effort catch-up. A dormant service belongs to the independent deposit
+    // pacemaker, and the ready path may itself need transition locks while applying a handoff.
+    let progress_live_deposits =
+        server.deposit.as_ref().is_some_and(|deposit| deposit.local_runtime_ready());
+    drop(_deposit_genesis_publication);
+    drop(_epoch_transition);
+    drop(consolidation_transition);
+    if progress_live_deposits && let Err(error) = server.progress_deposit_state().await {
         tracing::warn!(party = %server.party, epoch = request.value.epoch, %error, "deposit epoch catch-up deferred after share retirement");
     }
-    server.retire_transition_session_if_drained(&request.transition).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -10415,9 +16876,10 @@ fn boxed_propose_consolidation_completion<'a>(
     deposit: &'a DepositService,
     sweep: SweepId,
     identity: &'a Identity,
+    now_unix_ms: u64,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), DepositServiceError>> + Send + 'a>>
 {
-    Box::pin(deposit.propose_consolidation_completion(sweep, identity))
+    Box::pin(deposit.propose_consolidation_completion(sweep, identity, now_unix_ms))
 }
 
 /// Non-async boxing shim for the Byzantine-consolidation progress segment, keeping its
@@ -10427,6 +16889,7 @@ fn boxed_progress_byzantine_consolidations<'a>(
     identity: &'a Identity,
     now_ms: u64,
     base_timeout_ms: u64,
+    transition: Arc<Mutex<()>>,
 ) -> std::pin::Pin<
     Box<
         dyn std::future::Future<
@@ -10435,7 +16898,12 @@ fn boxed_progress_byzantine_consolidations<'a>(
             + 'a,
     >,
 > {
-    Box::pin(deposit.progress_byzantine_consolidations(identity, now_ms, base_timeout_ms))
+    Box::pin(deposit.progress_byzantine_consolidations(
+        identity,
+        now_ms,
+        base_timeout_ms,
+        transition,
+    ))
 }
 
 fn activation_value(response: &InstallResponse) -> ActivationValue {
@@ -10467,6 +16935,25 @@ fn verify_activation_certificate(
     value: &ActivationValue,
     acknowledgements: &[SignedEnvelope],
 ) -> anyhow::Result<()> {
+    verify_activation_certificate_with_history_authority(
+        server,
+        transition,
+        value,
+        acknowledgements,
+        server.receiver_key_commitment_for_epoch(value.epoch)?,
+        server.key_rotation_semantic_digest(value.epoch)?,
+    )
+}
+
+fn verify_activation_certificate_with_history_authority(
+    server: &PartyServer,
+    transition: &AvssTransition,
+    value: &ActivationValue,
+    acknowledgements: &[SignedEnvelope],
+    receiver_keys: ReceiverKeyAccumulatorCommitment,
+    key_rotation_semantic_digest: Option<[u8; 32]>,
+) -> anyhow::Result<()> {
+    receiver_keys.validate()?;
     anyhow::ensure!(value.epoch == transition.target.epoch, "activation epoch differs");
     anyhow::ensure!(value.public.committee.digest() == transition.target.digest());
     anyhow::ensure!(value.public.key_id == transition.key_id, "activation key id differs");
@@ -10479,7 +16966,8 @@ fn verify_activation_certificate(
         avss_transition_digest(transition)?,
         value.activation_digest,
         value.avss_transcript_digest,
-        server.key_rotation_semantic_digest(value.epoch)?,
+        receiver_keys,
+        key_rotation_semantic_digest,
     )?;
     anyhow::ensure!(
         value.history_link == expected_history_link,
@@ -10496,7 +16984,8 @@ fn verify_activation_certificate(
             envelope.sequence == activation_sequence(value.epoch),
             "activation logical sequence differs"
         );
-        let statement: ActivationStatement = postcard::from_bytes(&envelope.payload)?;
+        let statement: ActivationStatement = postcard::from_bytes(&envelope.payload)
+            .context("activation acknowledgement decoding failed")?;
         anyhow::ensure!(
             postcard::to_allocvec(&statement)? == envelope.payload,
             "activation acknowledgement has trailing bytes"
@@ -11044,7 +17533,8 @@ fn decode_postcard_exact<T>(bytes: &[u8]) -> anyhow::Result<T>
 where
     T: for<'de> Deserialize<'de>,
 {
-    let (value, remaining) = postcard::take_from_bytes(bytes)?;
+    let (value, remaining) = postcard::take_from_bytes(bytes)
+        .with_context(|| format!("durable {} decoding failed", std::any::type_name::<T>()))?;
     anyhow::ensure!(remaining.is_empty(), "durable record has trailing bytes");
     Ok(value)
 }
@@ -11066,11 +17556,91 @@ fn encode_durable_avss_run(run: &AvssRun) -> anyhow::Result<Zeroizing<Vec<u8>>> 
     Ok(encoded)
 }
 
+#[derive(Clone, Debug)]
+struct AvssTransitionSourceAuthority {
+    committee: Committee,
+    fault_bound: u16,
+    history_parent: EpochHistoryParent,
+}
+
+#[derive(Clone, Debug)]
+struct AvssTransitionRotationAuthority {
+    context: KeyRotationContext,
+    target: Committee,
+}
+
+#[derive(Clone, Debug)]
+struct AvssTransitionValidationAuthority {
+    target: Committee,
+    target_fault_bound: u16,
+    source: Option<AvssTransitionSourceAuthority>,
+    rotation: Option<AvssTransitionRotationAuthority>,
+}
+
+fn live_avss_transition_validation_authority(
+    server: &PartyServer,
+    transition: &AvssTransition,
+) -> anyhow::Result<AvssTransitionValidationAuthority> {
+    let (target, target_fault_bound) =
+        server.trusted_committee_and_fault_bound(transition.target.epoch)?;
+    let source = transition
+        .old
+        .as_ref()
+        .map(|old| {
+            let (committee, fault_bound) =
+                server.trusted_committee_and_fault_bound(old.committee.epoch)?;
+            let history_parent = server
+                .history_links
+                .read()
+                .map_err(|_| anyhow::anyhow!("epoch-history registry lock is poisoned"))?
+                .get(&old.committee.epoch)
+                .copied()
+                .context("AVSS source lacks a certified history link")?
+                .successor_parent()?;
+            Ok::<_, anyhow::Error>(AvssTransitionSourceAuthority {
+                committee,
+                fault_bound,
+                history_parent,
+            })
+        })
+        .transpose()?;
+    let rotation = if transition.old.is_some() {
+        server
+            .certified_key_rotations
+            .read()
+            .map_err(|_| anyhow::anyhow!("key-rotation registry lock is poisoned"))?
+            .get(&transition.target.epoch)
+            .map(|rotation| AvssTransitionRotationAuthority {
+                context: rotation.context.clone(),
+                target: rotation.target.clone(),
+            })
+    } else {
+        None
+    };
+    Ok(AvssTransitionValidationAuthority { target, target_fault_bound, source, rotation })
+}
+
 fn validate_avss_transition(
     server: &PartyServer,
     transition: &AvssTransition,
 ) -> anyhow::Result<()> {
-    server.validate_committee(&transition.target)?;
+    let authority = live_avss_transition_validation_authority(server, transition)?;
+    validate_avss_transition_with_authority(server, transition, &authority)
+}
+
+fn validate_avss_transition_with_authority(
+    server: &PartyServer,
+    transition: &AvssTransition,
+    authority: &AvssTransitionValidationAuthority,
+) -> anyhow::Result<()> {
+    // The supplied authority is either derived from the live certified registries or from one
+    // exact authenticated history entry. Validate peer-controlled structure before taking its
+    // digest, then bind it to that authority without consulting a second cache here.
+    transition.target.validate()?;
+    anyhow::ensure!(
+        transition.target.digest() == authority.target.digest(),
+        "AVSS target committee differs from its authenticated authority"
+    );
     let dealer_count = match transition.purpose {
         DealPurpose::Dkg => transition.target.members.len(),
         DealPurpose::Refresh | DealPurpose::Reshare => transition.eligible_dealers.len(),
@@ -11083,9 +17653,10 @@ fn validate_avss_transition(
         "AVSS history parent belongs to another network or key"
     );
     let static_spec = server.scenario.committee_spec(transition.target.epoch).ok();
-    let (_, trusted_fault_bound) =
-        server.trusted_committee_and_fault_bound(transition.target.epoch)?;
-    anyhow::ensure!(transition.fault_bound == trusted_fault_bound, "AVSS fault bound differs");
+    anyhow::ensure!(
+        transition.fault_bound == authority.target_fault_bound,
+        "AVSS fault bound differs"
+    );
     transition.target.validate_async_security_with_faults(transition.fault_bound)?;
     let mut selected = transition.eligible_dealers.clone();
     selected.sort_unstable();
@@ -11116,10 +17687,12 @@ fn validate_avss_transition(
                 old.committee.threshold >= 2 && transition.target.threshold >= 2,
                 "proactive zero-refresh requires threshold at least two"
             );
-            let (expected_old, old_fault_bound) =
-                server.trusted_committee_and_fault_bound(old.committee.epoch)?;
+            let source = authority
+                .source
+                .as_ref()
+                .context("zero-refresh source lacks authenticated authority")?;
             anyhow::ensure!(
-                old.committee.digest() == expected_old.digest(),
+                old.committee.digest() == source.committee.digest(),
                 "zero-refresh source committee differs from scenario"
             );
             anyhow::ensure!(
@@ -11127,23 +17700,13 @@ fn validate_avss_transition(
                 "zero-refresh key id differs from its source"
             );
             anyhow::ensure!(
-                old_fault_bound == transition.fault_bound,
+                source.fault_bound == transition.fault_bound,
                 "zero refresh changed the current committee's fault bound"
             );
-            let links = server
-                .history_links
-                .read()
-                .map_err(|_| anyhow::anyhow!("epoch-history registry lock is poisoned"))?;
-            let certified_parent = links
-                .get(&old.committee.epoch)
-                .copied()
-                .context("zero-refresh source lacks a certified history link")?
-                .successor_parent()?;
             anyhow::ensure!(
-                transition.history_parent == certified_parent,
+                transition.history_parent == source.history_parent,
                 "zero-refresh history parent differs from the certified source"
             );
-            drop(links);
             anyhow::ensure!(
                 transition.session
                     == canonical_refresh_session(
@@ -11167,20 +17730,16 @@ fn validate_avss_transition(
                     "zero-refresh target is not configured as a successor"
                 );
             }
-            let rotations = server
-                .certified_key_rotations
-                .read()
-                .map_err(|_| anyhow::anyhow!("key-rotation registry lock is poisoned"))?;
-            let rotation = rotations
-                .get(&transition.target.epoch)
+            let rotation = authority
+                .rotation
+                .as_ref()
                 .context("zero-refresh target lacks its receiver-key certificate")?;
             anyhow::ensure!(
                 rotation.context.source().digest() == old.committee.digest()
                     && rotation.context.source_activation() == old.activation_digest()?
                     && rotation.context.target_epoch() == transition.target.epoch
                     && rotation.context.target_fault_bound() == transition.fault_bound
-                    && rotation.certificate.verify(&rotation.context)?.digest()
-                        == transition.target.digest(),
+                    && rotation.target.digest() == transition.target.digest(),
                 "zero-refresh transition differs from receiver-key certification"
             );
             let mut expected =
@@ -11193,27 +17752,19 @@ fn validate_avss_transition(
         }
         (DealPurpose::Reshare, Some(old)) => {
             old.validate()?;
-            let (expected_old, old_fault_bound) =
-                server.trusted_committee_and_fault_bound(old.committee.epoch)?;
+            let source = authority
+                .source
+                .as_ref()
+                .context("reshare source lacks authenticated authority")?;
             anyhow::ensure!(
-                old.committee.digest() == expected_old.digest(),
+                old.committee.digest() == source.committee.digest(),
                 "old committee differs from scenario"
             );
             anyhow::ensure!(old.key_id == transition.key_id, "reshare key id differs");
-            let links = server
-                .history_links
-                .read()
-                .map_err(|_| anyhow::anyhow!("epoch-history registry lock is poisoned"))?;
-            let certified_parent = links
-                .get(&old.committee.epoch)
-                .copied()
-                .context("reshare source lacks a certified history link")?
-                .successor_parent()?;
             anyhow::ensure!(
-                transition.history_parent == certified_parent,
+                transition.history_parent == source.history_parent,
                 "reshare history parent differs from the certified source"
             );
-            drop(links);
             anyhow::ensure!(
                 transition.session
                     == canonical_reshare_session(
@@ -11231,28 +17782,21 @@ fn validate_avss_transition(
                 !same_refresh_layout(&old.committee, &transition.target),
                 "same-committee successor must use zero-refresh, not old-share redistribution"
             );
-            let mut configured: Vec<PartyId> = if let Some(specification) = static_spec {
+            if let Some(specification) = static_spec {
                 anyhow::ensure!(
                     specification.operation == Operation::Reshare,
                     "resharing target is not configured as a successor"
                 );
-                specification
-                    .old_dealers
-                    .iter()
-                    .copied()
-                    .filter(|party| old.committee.member(*party).is_ok())
-                    .collect()
-            } else {
-                old.committee.members.iter().map(|member| member.id).collect()
-            };
-            configured.sort_unstable();
+            }
+            let configured =
+                old.committee.members.iter().map(|member| member.id).collect::<Vec<_>>();
             anyhow::ensure!(
                 selected == configured,
-                "selected old dealer set differs from scenario"
+                "selected old dealer set differs from the certified source committee"
             );
             anyhow::ensure!(
                 selected.len()
-                    >= usize::from(old.committee.threshold.saturating_add(old_fault_bound)),
+                    >= usize::from(old.committee.threshold.saturating_add(source.fault_bound)),
                 "reshare dealer candidates cannot survive the configured old-committee faults"
             );
             anyhow::ensure!(
@@ -11262,20 +17806,16 @@ fn validate_avss_transition(
             for dealer in &selected {
                 old.committee.member(*dealer)?;
             }
-            let rotations = server
-                .certified_key_rotations
-                .read()
-                .map_err(|_| anyhow::anyhow!("key-rotation registry lock is poisoned"))?;
-            let rotation = rotations
-                .get(&transition.target.epoch)
+            let rotation = authority
+                .rotation
+                .as_ref()
                 .context("resharing target lacks its receiver-key certificate")?;
             anyhow::ensure!(
                 rotation.context.source().digest() == old.committee.digest()
                     && rotation.context.source_activation() == old.activation_digest()?
                     && rotation.context.target_epoch() == transition.target.epoch
                     && rotation.context.target_fault_bound() == transition.fault_bound
-                    && rotation.certificate.verify(&rotation.context)?.digest()
-                        == transition.target.digest(),
+                    && rotation.target.digest() == transition.target.digest(),
                 "resharing transition differs from receiver-key certification"
             );
         }
@@ -11357,13 +17897,6 @@ fn unix_time_millis() -> anyhow::Result<u64> {
     u64::try_from(elapsed.as_millis()).context("Unix timestamp does not fit u64 milliseconds")
 }
 
-fn unix_time_seconds() -> anyhow::Result<u64> {
-    Ok(std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .context("system time precedes the Unix epoch")?
-        .as_secs())
-}
-
 /// A sample older than the persisted round start is either a concurrent-start observation or a
 /// wall-clock rollback. Neither is evidence that the request window timed out. A later progress
 /// tick retries after the clock catches up; requesting another round immediately would create
@@ -11374,10 +17907,11 @@ fn qual_round_expired(started_unix_ms: u64, now_unix_ms: u64, timeout_ms: u64) -
 
 fn qual_backoff_timeout_ms(base_timeout_ms: u64, exponent: u8) -> u64 {
     let multiplier = 1_u64.checked_shl(u32::from(exponent).min(63)).unwrap_or(u64::MAX);
-    base_timeout_ms.saturating_mul(multiplier).min(MAX_QUAL_BACKOFF_TIMEOUT_MS)
+    base_timeout_ms.saturating_mul(multiplier)
 }
 
-fn avss_run_is_certified(
+fn avss_run_is_certificate_terminal(
+    local_party: PartyId,
     session: SessionId,
     run: &AvssRun,
     certified: &BTreeMap<SessionId, [u8; 32]>,
@@ -11393,7 +17927,16 @@ fn avss_run_is_certified(
         avss_transition_digest(&run.transition)? == *expected,
         "certified AVSS session is bound to another transition"
     );
-    Ok(true)
+    // Source-only dealers have no target share to reconstruct, so the global certificate is their
+    // terminal authority. A target member remains live until its own reducer has finalized.
+    if run.transition.target.member(local_party).is_err() {
+        return Ok(true);
+    }
+    anyhow::ensure!(
+        !run.secret_compacted || run.finalized.is_some(),
+        "local-target AVSS reducer was compacted before finalization"
+    );
+    Ok(run.finalized.is_some())
 }
 
 fn compact_avss_secret_state(run: &mut AvssRun) {
@@ -11446,6 +17989,7 @@ fn validate_avss_secret_compaction(run: &AvssRun) -> anyhow::Result<()> {
 /// comes back after first receiving the permanent activation certificate), so its exact context
 /// is classified before deciding whether another live slot is required.
 fn ensure_avss_live_capacity(
+    local_party: PartyId,
     runs: &BTreeMap<SessionId, AvssRun>,
     certified: &BTreeMap<SessionId, [u8; 32]>,
     candidate: &AvssTransition,
@@ -11453,7 +17997,7 @@ fn ensure_avss_live_capacity(
 ) -> anyhow::Result<()> {
     let mut live = 0_usize;
     for (session, run) in runs {
-        if !avss_run_is_certified(*session, run, certified)? {
+        if !avss_run_is_certificate_terminal(local_party, *session, run, certified)? {
             live = live.saturating_add(1);
         }
     }
@@ -11463,7 +18007,9 @@ fn ensure_avss_live_capacity(
                 avss_transition_digest(candidate)? == *expected,
                 "certified AVSS candidate is bound to another transition"
             );
-            true
+            // An absent candidate has no local finalization. Only a source-only dealer can treat
+            // the global certificate as terminal without allocating a catch-up reducer.
+            candidate.target.member(local_party).is_err()
         }
         None => false,
     };
@@ -11805,10 +18351,16 @@ fn avss_transition_digest(transition: &AvssTransition) -> anyhow::Result<[u8; 32
     Ok(*hasher.finalize().as_bytes())
 }
 
+const AVSS_TOMBSTONE_PREFIX: &[u8] = b"avss-finalized/v3/";
+
+fn avss_tombstone_purpose_for_digest(transition_digest: [u8; 32]) -> Vec<u8> {
+    let mut purpose = AVSS_TOMBSTONE_PREFIX.to_vec();
+    purpose.extend_from_slice(&transition_digest);
+    purpose
+}
+
 fn avss_tombstone_purpose(transition: &AvssTransition) -> anyhow::Result<Vec<u8>> {
-    let mut purpose = b"avss-finalized/v3/".to_vec();
-    purpose.extend_from_slice(&avss_transition_digest(transition)?);
-    Ok(purpose)
+    Ok(avss_tombstone_purpose_for_digest(avss_transition_digest(transition)?))
 }
 
 const SUPERSEDED_AVSS_TOMBSTONE_PREFIX: &[u8] = b"avss-superseded/v1/";
@@ -11921,14 +18473,17 @@ mod tests {
         },
         committee::{MAX_COMMITTEE_MEMBERS, MAX_COMMITTEE_THRESHOLD, Member},
         compact_registry_archive::prepare_compact_registry_genesis,
-        config::{CommitteeSpec, Hex32, Operation, ScenarioParty},
+        config::{CommitteeSpec, Hex32, MAX_SCENARIO_PARTIES, Operation, ScenarioParty},
         deposit_consensus::{
             ConsensusMessageBody, ViewChange, ViewChangeCertificate, sign_consensus_message,
         },
-        deposit_index::DepositIndexHead,
+        deposit_index::{DEPOSIT_INDEX_ARTIFACT_KIND, DepositIndexHead, DepositIndexObjectId},
         deposit_ledger::{LedgerPayload, LedgerStatement, genesis_head},
         deposit_wallet::{DepositAddressDeriver, DepositSubaddressIndex},
-        deposit_worker::MoneroRpcLimits,
+        deposit_worker::{
+            ChainFuture, DepositBlockScanCursor, DepositBlockScanResult, DepositChainSource,
+            DepositOutputIndexBackend, MoneroRpcLimits,
+        },
         key_rotation::VerifiedRegistryHandoffTarget,
         keys::{
             PointBytes, SecretPolynomial, aggregate_dkg, aggregate_proactive_reshare,
@@ -11936,8 +18491,102 @@ mod tests {
         },
         qual::{QualNewRound, QualProposal, QualRoundChange, QualValue, RoundChangeCertificate},
         reconnecting_monero::ReconnectingMoneroDaemon,
+        storage::{MAX_REFRESH_SCHEDULE_BYTES, WalletArtifactRef},
     };
     use curve25519_dalek::{Scalar, constants::ED25519_BASEPOINT_POINT};
+
+    #[derive(Default)]
+    struct BlockingDepositChain {
+        polled: AtomicBool,
+    }
+
+    impl DepositChainSource for BlockingDepositChain {
+        fn latest_height(&self) -> ChainFuture<'_, u64> {
+            self.polled.store(true, Ordering::Release);
+            Box::pin(std::future::pending())
+        }
+
+        fn block_hash(&self, _height: u64) -> ChainFuture<'_, [u8; 32]> {
+            self.polled.store(true, Ordering::Release);
+            Box::pin(std::future::pending())
+        }
+
+        fn scanned_block_evidence<'a>(
+            &'a self,
+            _height: u64,
+            _deriver: &'a DepositAddressDeriver,
+            _output_index: &'a dyn DepositOutputIndexBackend,
+            _portable_snapshot: [u8; 32],
+            _resume: Option<DepositBlockScanCursor>,
+        ) -> ChainFuture<'a, DepositBlockScanResult> {
+            self.polled.store(true, Ordering::Release);
+            Box::pin(std::future::pending())
+        }
+    }
+
+    #[derive(Default)]
+    struct GatedDepositChain {
+        polled: AtomicBool,
+        released: AtomicBool,
+        release: tokio::sync::Notify,
+    }
+
+    impl GatedDepositChain {
+        fn release(&self) {
+            self.released.store(true, Ordering::Release);
+            self.release.notify_waiters();
+        }
+
+        async fn wait_until_polled(&self) {
+            while !self.polled.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        }
+
+        async fn wait_until_released(&self) {
+            loop {
+                let released = self.release.notified();
+                if self.released.load(Ordering::Acquire) {
+                    return;
+                }
+                released.await;
+            }
+        }
+    }
+
+    impl DepositChainSource for GatedDepositChain {
+        fn latest_height(&self) -> ChainFuture<'_, u64> {
+            Box::pin(async { Ok(0) })
+        }
+
+        fn block_hash(&self, height: u64) -> ChainFuture<'_, [u8; 32]> {
+            self.polled.store(true, Ordering::Release);
+            Box::pin(async move {
+                self.wait_until_released().await;
+                if height != 0 {
+                    return Err(crate::deposit_worker::ChainSourceError::Invalid(
+                        "gated test chain contains only genesis".to_owned(),
+                    ));
+                }
+                Ok([0xA0; 32])
+            })
+        }
+
+        fn scanned_block_evidence<'a>(
+            &'a self,
+            _height: u64,
+            _deriver: &'a DepositAddressDeriver,
+            _output_index: &'a dyn DepositOutputIndexBackend,
+            _portable_snapshot: [u8; 32],
+            _resume: Option<DepositBlockScanCursor>,
+        ) -> ChainFuture<'a, DepositBlockScanResult> {
+            Box::pin(async {
+                Err(crate::deposit_worker::ChainSourceError::Invalid(
+                    "gated test chain has no scannable successor block".to_owned(),
+                ))
+            })
+        }
+    }
 
     fn committee(epoch: u64, members: u16, threshold: u16) -> Committee {
         Committee {
@@ -11951,6 +18600,239 @@ mod tests {
                 })
                 .collect(),
         }
+    }
+
+    fn committee_for_parties(epoch: u64, parties: &[u16], threshold: u16) -> Committee {
+        Committee {
+            epoch,
+            threshold,
+            members: parties
+                .iter()
+                .copied()
+                .map(|id| Member {
+                    id: PartyId(id),
+                    signing_key: [u8::try_from(id).unwrap(); 32],
+                    encryption_key: [u8::try_from(id.saturating_add(20)).unwrap(); 32],
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn consolidation_closure_plan_separates_restart_recovery_from_live_reconciliation() {
+        let open = ConsolidationSessionClosure {
+            session: SessionId([0x41; 32]),
+            purpose: vec![0x51; 48],
+            currently_signing_released: true,
+        };
+        let closed = ConsolidationSessionClosure {
+            session: SessionId([0x42; 32]),
+            purpose: vec![0x52; 48],
+            currently_signing_released: false,
+        };
+        let closures = vec![open.clone(), closed.clone()];
+
+        let (startup_closures, startup_live) =
+            plan_consolidation_session_closures(&closures, true).unwrap();
+        assert_eq!(
+            startup_closures.iter().map(|closure| closure.session).collect::<Vec<_>>(),
+            vec![open.session, closed.session],
+            "process recovery must permanently close even the current released attempt",
+        );
+        assert!(
+            startup_live.is_empty(),
+            "a non-serializable FROST machine cannot survive process recovery",
+        );
+
+        let (live_closures, live_sessions) =
+            plan_consolidation_session_closures(&closures, false).unwrap();
+        assert_eq!(
+            live_closures.iter().map(|closure| closure.session).collect::<Vec<_>>(),
+            vec![closed.session],
+            "live reconciliation must continue closing burned or completed attempts",
+        );
+        assert_eq!(
+            live_sessions.get(&open.session).copied(),
+            Some(open.purpose.as_slice()),
+            "the current released attempt must survive the CAS-to-Release-action gap",
+        );
+    }
+
+    #[test]
+    fn consolidation_closure_plan_rejects_duplicate_session_authority() {
+        let closures = vec![
+            ConsolidationSessionClosure {
+                session: SessionId([0x43; 32]),
+                purpose: vec![0x53; 48],
+                currently_signing_released: true,
+            },
+            ConsolidationSessionClosure {
+                session: SessionId([0x43; 32]),
+                purpose: vec![0x54; 48],
+                currently_signing_released: false,
+            },
+        ];
+        assert!(plan_consolidation_session_closures(&closures, false).is_err());
+    }
+
+    #[test]
+    fn lagging_deposit_source_keeps_pre_handoff_obligations_routable() {
+        for operation in [
+            DepositOperation::ClientRequest,
+            DepositOperation::ConsensusProposal,
+            DepositOperation::ConsensusMessage,
+            DepositOperation::ConsensusCertificate,
+            DepositOperation::Attest,
+            DepositOperation::Certificate,
+            DepositOperation::DepositObservation,
+            DepositOperation::DepositObservationAttest,
+            DepositOperation::DepositObservationCertificate,
+            DepositOperation::Consolidation,
+            DepositOperation::ConsolidationAbandonment,
+        ] {
+            assert!(
+                PartyServer::lagging_deposit_source_operation_allowed(operation),
+                "{operation:?} must reach the source reducer after successor certification",
+            );
+        }
+
+        for operation in [
+            DepositOperation::SyncHead,
+            DepositOperation::SyncObjects,
+            DepositOperation::SyncRelease,
+            DepositOperation::PrefixSupportStart,
+            DepositOperation::PrefixSupportContinue,
+        ] {
+            assert!(
+                !PartyServer::lagging_deposit_source_operation_allowed(operation),
+                "{operation:?} belongs to the separately fenced compact-sync dispatcher",
+            );
+        }
+    }
+
+    #[test]
+    fn ordinary_sync_admits_only_exact_pinned_predecessor_source_members() {
+        let source = committee_for_parties(7, &[1, 2, 3, 4], 3);
+        let target = committee_for_parties(8, &[3, 4, 5, 6], 3);
+
+        assert!(
+            !PartyServer::ordinary_deposit_sync_state_read_policy(
+                true,
+                source.epoch,
+                Some(target.epoch),
+                true,
+                &source,
+                PartyId(5),
+                PartyId(1),
+            ),
+            "a target-only lagger must not use ordinary predecessor sync",
+        );
+        assert!(
+            !PartyServer::ordinary_deposit_sync_state_read_policy(
+                true,
+                source.epoch,
+                Some(target.epoch),
+                false,
+                &source,
+                PartyId(3),
+                PartyId(1),
+            ),
+            "an overlap member must not use predecessor sync without the exact durable pin",
+        );
+        assert!(
+            PartyServer::ordinary_deposit_sync_state_read_policy(
+                true,
+                source.epoch,
+                Some(target.epoch),
+                true,
+                &source,
+                PartyId(3),
+                PartyId(1),
+            ),
+            "a pinned source member may finish compact terminal catch-up",
+        );
+        assert!(
+            !PartyServer::ordinary_deposit_sync_state_read_policy(
+                true,
+                source.epoch,
+                Some(target.epoch + 1),
+                true,
+                &source,
+                PartyId(3),
+                PartyId(1),
+            ),
+            "a pin never authorizes synchronization across more than one epoch",
+        );
+        assert!(
+            !PartyServer::ordinary_deposit_sync_state_read_policy(
+                false,
+                target.epoch,
+                Some(target.epoch),
+                false,
+                &target,
+                PartyId(5),
+                PartyId(6),
+            ),
+            "the certified cold-import gate must close ordinary target sync",
+        );
+        assert!(PartyServer::ordinary_deposit_sync_state_read_policy(
+            true,
+            target.epoch,
+            Some(target.epoch),
+            false,
+            &target,
+            PartyId(5),
+            PartyId(6),
+        ));
+    }
+
+    #[test]
+    fn state_transfer_prelude_enforces_adjacent_union_endpoint_roles() {
+        let source = committee_for_parties(7, &[1, 2, 3, 4], 3);
+        let target = committee_for_parties(8, &[3, 4, 5, 6], 3);
+        let authorized = |local, peer, operation| {
+            PartyServer::deposit_state_transfer_route_authorized(
+                PartyId(local),
+                PartyId(peer),
+                operation,
+                &source,
+                &target,
+            )
+        };
+
+        assert!(authorized(1, 2, DepositOperation::PostHandoffExportSealRequest));
+        assert!(authorized(3, 4, DepositOperation::PostHandoffExportSealVote));
+        assert!(!authorized(5, 1, DepositOperation::PostHandoffExportSealRequest));
+
+        assert!(authorized(5, 1, DepositOperation::PostHandoffExportSealCertificate));
+        assert!(authorized(3, 1, DepositOperation::PostHandoffExportSealCertificate));
+        assert!(!authorized(1, 5, DepositOperation::PostHandoffExportSealCertificate));
+
+        assert!(authorized(1, 5, DepositOperation::ExportHead));
+        assert!(authorized(3, 6, DepositOperation::ExportObjects));
+        assert!(!authorized(5, 1, DepositOperation::ExportHead));
+
+        assert!(authorized(5, 6, DepositOperation::StateImportedAck));
+        assert!(authorized(3, 5, DepositOperation::StateImportedAck));
+        assert!(!authorized(1, 5, DepositOperation::StateImportedAck));
+
+        assert!(authorized(1, 5, DepositOperation::StateImportedCertificate));
+        assert!(authorized(5, 6, DepositOperation::StateImportedCertificate));
+        assert!(!authorized(5, 1, DepositOperation::StateImportedCertificate));
+
+        for operation in [
+            DepositOperation::PostHandoffExportSealRequest,
+            DepositOperation::PostHandoffExportSealVote,
+            DepositOperation::PostHandoffExportSealCertificate,
+            DepositOperation::ExportHead,
+            DepositOperation::ExportObjects,
+            DepositOperation::StateImportedAck,
+            DepositOperation::StateImportedCertificate,
+        ] {
+            assert!(!authorized(9, 10, operation), "{operation:?}");
+        }
+        assert!(authorized(9, 10, DepositOperation::ExportRelease));
+        assert!(!authorized(1, 2, DepositOperation::SyncHead));
     }
 
     fn test_qual_wire(transition: &AvssTransition, message: QualMessage) -> QualWire {
@@ -12155,6 +19037,93 @@ mod tests {
         }
     }
 
+    fn test_peer_message_id(index: u16, activation_ack: bool) -> PeerMessageId {
+        let mut session = [0_u8; 32];
+        session[..2].copy_from_slice(&index.to_be_bytes());
+        let session = SessionId(session);
+        let mut digest = [0_u8; 32];
+        digest[..2].copy_from_slice(&index.to_be_bytes());
+        if activation_ack {
+            PeerMessageId::ActivationAck { session, recipient: PartyId(2), digest }
+        } else {
+            PeerMessageId::Avss { session, recipient: PartyId(2), digest }
+        }
+    }
+
+    #[test]
+    fn peer_outbox_successor_survives_removal_and_lower_key_insertion() {
+        let lower = test_peer_message_id(1, false);
+        let first = test_peer_message_id(2, false);
+        let upper = test_peer_message_id(3, false);
+        let activation_ack = BTreeSet::new();
+        let mut protocol = BTreeSet::from([first, upper]);
+        let mut cursor = PeerOutboxCursor::default();
+
+        assert_eq!(
+            select_bounded_peer_message_ids(&protocol, &activation_ack, &mut cursor, 1),
+            [first]
+        );
+
+        protocol.remove(&first);
+        protocol.insert(lower);
+        assert_eq!(
+            select_bounded_peer_message_ids(&protocol, &activation_ack, &mut cursor, 1),
+            [upper],
+            "removing the prior item reinterpreted the cursor as a changing numeric offset"
+        );
+        assert_eq!(
+            select_bounded_peer_message_ids(&protocol, &activation_ack, &mut cursor, 1),
+            [lower],
+            "stable successor did not wrap after reaching the greatest live identifier"
+        );
+    }
+
+    #[test]
+    fn peer_outbox_always_exposes_activation_ack_amid_over_batch_protocol_churn() {
+        let mut protocol =
+            (0..300).map(|index| test_peer_message_id(index, false)).collect::<BTreeSet<_>>();
+        let first_ack = test_peer_message_id(500, true);
+        let mut activation_ack = BTreeSet::from([first_ack]);
+        let mut cursor = PeerOutboxCursor::default();
+
+        let first = select_bounded_peer_message_ids(
+            &protocol,
+            &activation_ack,
+            &mut cursor,
+            MAX_PEER_OUTBOX_SNAPSHOT,
+        );
+        assert_eq!(first.len(), MAX_PEER_OUTBOX_SNAPSHOT);
+        assert_eq!(first.first(), Some(&first_ack));
+        assert_eq!(first.iter().filter(|id| **id == first_ack).count(), 1);
+
+        for id in first.iter().filter(|id| !matches!(id, PeerMessageId::ActivationAck { .. })) {
+            protocol.remove(id);
+        }
+        protocol.extend((600..900).map(|index| test_peer_message_id(index, false)));
+        activation_ack.remove(&first_ack);
+        let second_ack = test_peer_message_id(901, true);
+        activation_ack.insert(second_ack);
+        assert_eq!(
+            select_bounded_peer_message_ids(&protocol, &activation_ack, &mut cursor, 1,),
+            [second_ack],
+            "changing AVSS/QUAL membership kept an activation acknowledgement outside the batch"
+        );
+    }
+
+    #[test]
+    fn peer_outbox_preserves_distinct_activation_exact_ids() {
+        let first = test_peer_message_id(1, true);
+        let second = test_peer_message_id(2, true);
+        let protocol = BTreeSet::new();
+        let activation_ack = BTreeSet::from([first, second]);
+        let mut cursor = PeerOutboxCursor::default();
+        assert_eq!(
+            select_bounded_peer_message_ids(&protocol, &activation_ack, &mut cursor, usize::MAX,),
+            [first, second],
+            "server enumeration collapsed distinct exact activation acknowledgements"
+        );
+    }
+
     fn signing_scenario(network: NetworkKind, demo_only: bool, identity: &Identity) -> Scenario {
         Scenario {
             schema_version: crate::config::SCENARIO_SCHEMA_VERSION,
@@ -12179,7 +19148,6 @@ mod tests {
                 fault_bound: 0,
                 members: vec![PartyId(1)],
                 eligible_members: vec![PartyId(1)],
-                old_dealers: Vec::new(),
             }],
             funding_blocks: 61,
             confirmation_blocks: 1,
@@ -12234,7 +19202,7 @@ mod tests {
             scenario.clone(),
             state.path(),
             &signing_seed,
-            &bootstrap_x25519_secret,
+            Some(&bootstrap_x25519_secret),
         )
         .await
         .unwrap();
@@ -12245,7 +19213,7 @@ mod tests {
             scenario.clone(),
             state.path(),
             &signing_seed,
-            &bootstrap_x25519_secret,
+            Some(&bootstrap_x25519_secret),
         )
         .await
         .unwrap_err();
@@ -12290,6 +19258,124 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn acceptance_deposit_checkpoint_gate_retains_armed_head_across_advance_and_restart() {
+        let directory = tempfile::tempdir().unwrap();
+        let seed = [0x95; 32];
+        let party = PartyId(2);
+        let network = [0x96; 32];
+        let output = WalletOutputId { transaction: [0x97; 32], index_in_transaction: 3 };
+        let evidence = DurableDepositObservationEvidence {
+            output: crate::deposit_index::PortableDepositOutputRecord::for_acceptance_test(output),
+            portable_index_digest: [0x98; 32],
+            checkpoint_statement_digest: [0x99; 32],
+            checkpoint_sequence: 2,
+        };
+        let arm = AcceptanceDepositCheckpointGateRequest {
+            action: AcceptanceConsolidationGateAction::Arm,
+            output,
+        };
+        assert!(
+            AcceptanceDepositCheckpointGate::default()
+                .transition(
+                    AcceptanceDepositCheckpointGateRequest {
+                        action: AcceptanceConsolidationGateAction::Release,
+                        output,
+                    },
+                    None,
+                )
+                .unwrap_err()
+                .to_string()
+                .contains("cannot release before it is held")
+        );
+        let held = AcceptanceDepositCheckpointGate::default()
+            .transition(arm, Some(evidence.clone()))
+            .unwrap()
+            .expect("the first authenticated arm must hold the exact checkpoint");
+
+        let mut advanced_evidence = evidence.clone();
+        advanced_evidence.portable_index_digest = [0x9A; 32];
+        advanced_evidence.checkpoint_statement_digest = [0x9B; 32];
+        advanced_evidence.checkpoint_sequence = 3;
+        assert_ne!(advanced_evidence, evidence);
+        assert!(
+            held.transition(
+                AcceptanceDepositCheckpointGateRequest {
+                    action: AcceptanceConsolidationGateAction::Status,
+                    output,
+                },
+                Some(advanced_evidence),
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("cannot replace durable")
+        );
+        assert!(
+            held.transition(
+                AcceptanceDepositCheckpointGateRequest {
+                    action: AcceptanceConsolidationGateAction::Status,
+                    output,
+                },
+                None,
+            )
+            .unwrap()
+            .is_none(),
+            "status must retain the authenticated historical barrier as the live head advances"
+        );
+        assert_eq!(held.response(party).evidence, Some(evidence.clone()));
+        assert!(
+            held.transition(arm, None).unwrap().is_none(),
+            "an exact arm retry must not replace the first durable evidence"
+        );
+        assert!(
+            held.transition(
+                AcceptanceDepositCheckpointGateRequest {
+                    action: AcceptanceConsolidationGateAction::Status,
+                    output: WalletOutputId { transaction: [0x9C; 32], index_in_transaction: 3 },
+                },
+                None,
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("names another output")
+        );
+
+        let store = ProtocolStore::new(directory.path(), party, &seed).unwrap();
+        let (session, context) =
+            acceptance_deposit_checkpoint_gate_storage_key(network, party).unwrap();
+        store
+            .save_session_state(
+                session,
+                context,
+                &postcard::to_allocvec(&held).unwrap(),
+                &mut OsRng,
+            )
+            .await
+            .unwrap();
+        drop(store);
+
+        let restarted = ProtocolStore::new(directory.path(), party, &seed).unwrap();
+        let restored =
+            restore_acceptance_deposit_checkpoint_gate(&restarted, network, party).await.unwrap();
+        assert_eq!(restored, held);
+        let released = restored
+            .transition(
+                AcceptanceDepositCheckpointGateRequest {
+                    action: AcceptanceConsolidationGateAction::Release,
+                    output,
+                },
+                None,
+            )
+            .unwrap()
+            .expect("the first release must persist a terminal gate state");
+        assert_eq!(released.state, AcceptanceConsolidationGateState::Released);
+        assert_eq!(released.evidence, Some(evidence));
+        assert!(
+            released.transition(arm, None).unwrap().is_none(),
+            "a released single-use gate cannot be rearmed"
+        );
+    }
+
+    #[tokio::test]
     async fn acceptance_protocol_fault_gate_snapshot_binds_exact_restart_boundary() {
         let directory = tempfile::tempdir().unwrap();
         let seed = [0x71; 32];
@@ -12321,6 +19407,142 @@ mod tests {
             restore_acceptance_protocol_fault_gate(&restarted, [0x74; 32], party).await.unwrap(),
             AcceptanceProtocolFaultGate::default()
         );
+    }
+
+    #[tokio::test]
+    async fn acceptance_driver_latch_rejects_wrong_binding_and_restores_exact_event() {
+        let directory = tempfile::tempdir().unwrap();
+        let seed = [0x75; 32];
+        let party = PartyId(2);
+        let network = [0x76; 32];
+        let due_unix_ms = 1_000_000;
+        let binding = [0x77; 32];
+        let held = AcceptanceDriverLatch {
+            version: ACCEPTANCE_DRIVER_LATCH_VERSION,
+            state: AcceptanceConsolidationGateState::Held,
+            kind: Some(AcceptanceDriverLatchKind::ProactiveDeadline),
+            binding: Some(binding),
+            event_unix_ms: None,
+        };
+        held.validate().unwrap();
+        assert!(
+            held.transition(AcceptanceDriverLatchRequest {
+                action: AcceptanceConsolidationGateAction::Status,
+                kind: AcceptanceDriverLatchKind::ProactiveDeadline,
+                binding: [0x78; 32],
+            })
+            .unwrap_err()
+            .to_string()
+            .contains("differs from the durable latch")
+        );
+        assert!(
+            held.transition(AcceptanceDriverLatchRequest {
+                action: AcceptanceConsolidationGateAction::Release,
+                kind: AcceptanceDriverLatchKind::ProactiveDeadline,
+                binding,
+            })
+            .unwrap_err()
+            .to_string()
+            .contains("before its durable start event")
+        );
+        let with_event = held
+            .record_proactive_deadline_event(binding, due_unix_ms, due_unix_ms + 1)
+            .unwrap()
+            .expect("the first exact due-time event must be retained");
+        assert_eq!(with_event.event_unix_ms, Some(due_unix_ms + 1));
+
+        let store = ProtocolStore::new(directory.path(), party, &seed).unwrap();
+        let (session, context) = acceptance_driver_latch_storage_key(network, party).unwrap();
+        let bytes = postcard::to_allocvec(&with_event).unwrap();
+        store.save_session_state(session, context, &bytes, &mut OsRng).await.unwrap();
+        drop(store);
+
+        let restarted = ProtocolStore::new(directory.path(), party, &seed).unwrap();
+        assert_eq!(
+            restore_acceptance_driver_latch(&restarted, network, party).await.unwrap(),
+            with_event
+        );
+        let mut obsolete = with_event.clone();
+        obsolete.version = ACCEPTANCE_DRIVER_LATCH_VERSION - 1;
+        assert!(obsolete.validate().is_err());
+    }
+
+    #[tokio::test]
+    async fn consolidation_reconnect_latch_survives_restart_with_exact_binding() {
+        let directory = tempfile::tempdir().unwrap();
+        let seed = [0x7B; 32];
+        let party = PartyId(3);
+        let network = [0x7C; 32];
+        let binding = [0x7D; 32];
+        let held = AcceptanceDriverLatch::default()
+            .transition(AcceptanceDriverLatchRequest {
+                action: AcceptanceConsolidationGateAction::Arm,
+                kind: AcceptanceDriverLatchKind::ConsolidationPeerReconnect,
+                binding,
+            })
+            .unwrap()
+            .expect("arming must durably hold the exact reconnect event");
+        let store = ProtocolStore::new(directory.path(), party, &seed).unwrap();
+        let (session, context) = acceptance_driver_latch_storage_key(network, party).unwrap();
+        store
+            .save_session_state(
+                session,
+                context,
+                &postcard::to_allocvec(&held).unwrap(),
+                &mut OsRng,
+            )
+            .await
+            .unwrap();
+        drop(store);
+
+        let restarted = ProtocolStore::new(directory.path(), party, &seed).unwrap();
+        let restored = restore_acceptance_driver_latch(&restarted, network, party).await.unwrap();
+        assert_eq!(restored, held);
+        assert!(
+            restored
+                .transition(AcceptanceDriverLatchRequest {
+                    action: AcceptanceConsolidationGateAction::Release,
+                    kind: AcceptanceDriverLatchKind::ConsolidationPeerReconnect,
+                    binding: [0x7E; 32],
+                })
+                .unwrap_err()
+                .to_string()
+                .contains("differs from the durable latch")
+        );
+    }
+
+    #[tokio::test]
+    async fn acceptance_driver_latch_is_disabled_without_the_demo_overlay() {
+        let directory = tempfile::tempdir().unwrap();
+        let signing_seed = [0x79; 32];
+        let bootstrap_x25519_secret = [0xD9; 32];
+        let identity =
+            Identity::from_test_secrets(PartyId(1), 0, &signing_seed, bootstrap_x25519_secret)
+                .unwrap();
+        let scenario = signing_scenario(NetworkKind::Regtest, true, &identity);
+        let server = PartyServer::new_inner(
+            PartyId(1),
+            scenario,
+            directory.path().to_path_buf(),
+            &signing_seed,
+            Some(&bootstrap_x25519_secret),
+            None,
+            false,
+            false,
+            false,
+            false,
+        )
+        .await
+        .unwrap();
+        let error = server
+            .update_acceptance_driver_latch(AcceptanceDriverLatchRequest {
+                action: AcceptanceConsolidationGateAction::Arm,
+                kind: AcceptanceDriverLatchKind::ConsolidationPeerReconnect,
+                binding: [0x7A; 32],
+            })
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("acceptance driver latch is disabled"));
     }
 
     #[tokio::test]
@@ -12374,7 +19596,7 @@ mod tests {
             scenario.clone(),
             directory.path().to_path_buf(),
             &signing_seed,
-            &bootstrap_x25519_secret,
+            Some(&bootstrap_x25519_secret),
             None,
             false,
             true,
@@ -12428,7 +19650,7 @@ mod tests {
             scenario,
             directory.path().to_path_buf(),
             &signing_seed,
-            &bootstrap_x25519_secret,
+            Some(&bootstrap_x25519_secret),
             None,
             false,
             true,
@@ -12476,7 +19698,7 @@ mod tests {
             scenario.clone(),
             directory.path().to_path_buf(),
             &signing_seed,
-            &bootstrap_x25519_secret,
+            Some(&bootstrap_x25519_secret),
             None,
             true,
             false,
@@ -12506,7 +19728,7 @@ mod tests {
             scenario,
             directory.path().to_path_buf(),
             &signing_seed,
-            &bootstrap_x25519_secret,
+            Some(&bootstrap_x25519_secret),
             None,
             true,
             false,
@@ -12574,6 +19796,439 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn deposit_read_routes_share_admission_and_enforce_body_limit() {
+        const ADMIN_TOKEN: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let signing_seed = [0x4A; 32];
+        let bootstrap_x25519_secret = [0xCA; 32];
+        let identity =
+            Identity::from_test_secrets(PartyId(1), 0, &signing_seed, bootstrap_x25519_secret)
+                .unwrap();
+        let scenario = signing_scenario(NetworkKind::Regtest, true, &identity);
+        let daemon = Arc::new(
+            ReconnectingMoneroDaemon::new(
+                ["http://192.0.2.1:18081"],
+                NetworkKind::Regtest,
+                MoneroRpcLimits {
+                    request_timeout: std::time::Duration::from_secs(30),
+                    ..Default::default()
+                },
+            )
+            .unwrap(),
+        );
+        let state = tempfile::tempdir().unwrap();
+        let server = PartyServer::new_with_deposits(
+            PartyId(1),
+            scenario,
+            state.path(),
+            &signing_seed,
+            &bootstrap_x25519_secret,
+            PartyDepositConfig {
+                private_view_scalar: Zeroizing::new(Scalar::from(7_u64).to_bytes()),
+                birth_anchor: None,
+                worker: DepositWorkerConfig::default(),
+                chain_source: daemon.clone(),
+                consolidation_backend: daemon.clone(),
+                chain_readiness: daemon.readiness(),
+            },
+        )
+        .await
+        .unwrap();
+        let held =
+            try_acquire_deposit_read_admission_permit(&server.deposit_read_admission_permits)
+                .unwrap();
+
+        let app = server.clone().http_router(admin_authenticator());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = reqwest::Client::new();
+        let status_url = format!("http://{address}/v1/deposits/status");
+
+        let unauthenticated =
+            client.post(&status_url).json(&serde_json::json!({})).send().await.unwrap();
+        assert_eq!(unauthenticated.status(), reqwest::StatusCode::UNAUTHORIZED);
+
+        for route in ["/v1/deposits/status", "/v1/deposits/consolidations/status"] {
+            let response = client
+                .post(format!("http://{address}{route}"))
+                .bearer_auth(ADMIN_TOKEN)
+                .json(&serde_json::json!({}))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE, "{route}");
+            assert_eq!(response.headers().get(RETRY_AFTER).unwrap(), "1", "{route}");
+        }
+        drop(held);
+
+        let oversized = client
+            .post(status_url)
+            .bearer_auth(ADMIN_TOKEN)
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(vec![b' '; MAX_DEPOSIT_HTTP_JSON_BYTES + 1])
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(oversized.status(), reqwest::StatusCode::PAYLOAD_TOO_LARGE);
+        let released =
+            try_acquire_deposit_read_admission_permit(&server.deposit_read_admission_permits)
+                .unwrap();
+        drop(released);
+        assert!(!daemon.is_ready(), "admission/body rejection unexpectedly contacted monerod");
+
+        task.abort();
+        let _ = task.await;
+    }
+
+    #[tokio::test]
+    async fn checkpoint_mutation_rejects_fenced_runtime_before_transition_without_initializing() {
+        let signing_seed = [0x4B; 32];
+        let bootstrap_x25519_secret = [0xCB; 32];
+        let identity =
+            Identity::from_test_secrets(PartyId(1), 0, &signing_seed, bootstrap_x25519_secret)
+                .unwrap();
+        let scenario = signing_scenario(NetworkKind::Regtest, true, &identity);
+        let daemon = Arc::new(
+            ReconnectingMoneroDaemon::new(
+                ["http://192.0.2.1:18081"],
+                NetworkKind::Regtest,
+                MoneroRpcLimits {
+                    request_timeout: std::time::Duration::from_secs(30),
+                    ..Default::default()
+                },
+            )
+            .unwrap(),
+        );
+        let state = tempfile::tempdir().unwrap();
+        let server = PartyServer::new_with_deposits(
+            PartyId(1),
+            scenario,
+            state.path(),
+            &signing_seed,
+            &bootstrap_x25519_secret,
+            PartyDepositConfig {
+                private_view_scalar: Zeroizing::new(Scalar::from(7_u64).to_bytes()),
+                birth_anchor: None,
+                worker: DepositWorkerConfig::default(),
+                chain_source: daemon.clone(),
+                consolidation_backend: daemon.clone(),
+                chain_readiness: daemon.readiness(),
+            },
+        )
+        .await
+        .unwrap();
+
+        let held = server.consolidation_transition.lock().await;
+        let error = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            server.dispatch_deposit_checkpoint_peer_request(
+                PartyId(1),
+                DepositOperation::ClientRequest,
+                vec![0xFF],
+            ),
+        )
+        .await
+        .expect("fenced checkpoint ingress waited for the transition turn")
+        .unwrap_err();
+        assert!(matches!(
+            error.downcast_ref::<DepositServiceError>(),
+            Some(DepositServiceError::ColdImportAwaitingCertificate)
+        ));
+        assert!(matches!(
+            quic_peer_rejection(error),
+            PeerResponse::Rejected { code: RejectionCode::Unavailable, retryable: true, .. }
+        ));
+        assert!(matches!(
+            server.deposit.as_ref().unwrap().active_epoch().await,
+            Err(DepositServiceError::NotInitialized)
+        ));
+        assert!(!server.deposit.as_ref().unwrap().local_runtime_ready());
+        assert!(
+            !daemon.is_ready(),
+            "fenced checkpoint ingress unexpectedly initialized deposits or contacted monerod"
+        );
+        drop(held);
+    }
+
+    #[test]
+    fn checkpoint_mutation_rechecks_runtime_after_transition_wait() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .thread_stack_size(16 * 1024 * 1024)
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            tokio::spawn(async {
+                let local = PartyId(1);
+                let signing_seed = historical_replay_seed(local);
+                let bootstrap_x25519_secret = historical_replay_x25519_secret(local, 0);
+                let scenario = historical_replay_scenario();
+                let chain = Arc::new(GatedDepositChain::default());
+                chain.release();
+                let daemon = Arc::new(
+                    ReconnectingMoneroDaemon::new(
+                        ["http://192.0.2.1:18081"],
+                        NetworkKind::Regtest,
+                        MoneroRpcLimits {
+                            request_timeout: std::time::Duration::from_secs(30),
+                            ..Default::default()
+                        },
+                    )
+                    .unwrap(),
+                );
+                let state = tempfile::tempdir().unwrap();
+                let server = PartyServer::new_with_deposits(
+                    local,
+                    scenario.clone(),
+                    state.path(),
+                    &signing_seed,
+                    &bootstrap_x25519_secret,
+                    PartyDepositConfig {
+                        private_view_scalar: Zeroizing::new(Scalar::from(7_u64).to_bytes()),
+                        birth_anchor: None,
+                        worker: DepositWorkerConfig::default(),
+                        chain_source: chain,
+                        consolidation_backend: daemon.clone(),
+                        chain_readiness: daemon.readiness(),
+                    },
+                )
+                .await
+                .unwrap();
+                let share = proactive_epoch_zero_share(&scenario, local);
+                install_proactive_epoch_zero(&server, &share).await;
+                server.ensure_deposit_initialized().await.unwrap();
+                let deposit = server.deposit.as_ref().unwrap();
+                assert!(deposit.local_runtime_ready());
+                assert_eq!(deposit.active_epoch().await.unwrap(), 0);
+                assert!(!daemon.is_ready(), "genesis fixture unexpectedly contacted monerod");
+
+                let held = server.consolidation_transition.lock().await;
+                let mut ingress = Box::pin(server.dispatch_deposit_checkpoint_peer_request(
+                    local,
+                    DepositOperation::ClientRequest,
+                    vec![0xFF],
+                ));
+                {
+                    let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+                    assert!(
+                        std::future::Future::poll(ingress.as_mut(), &mut context).is_pending(),
+                        "ready checkpoint ingress did not wait for the held transition turn"
+                    );
+                }
+
+                deposit.fence_local_runtime_for_test();
+                assert!(!deposit.local_runtime_ready());
+                drop(held);
+                let error = tokio::time::timeout(std::time::Duration::from_secs(1), ingress)
+                    .await
+                    .expect("checkpoint ingress did not resume after the transition turn")
+                    .unwrap_err();
+                assert!(matches!(
+                    error.downcast_ref::<DepositServiceError>(),
+                    Some(DepositServiceError::ColdImportAwaitingCertificate)
+                ));
+                assert!(
+                    !deposit.local_runtime_ready(),
+                    "post-lock checkpoint rejection ran live import recovery"
+                );
+                assert_eq!(deposit.active_epoch().await.unwrap(), 0);
+                assert!(
+                    !daemon.is_ready(),
+                    "post-lock checkpoint rejection unexpectedly contacted monerod"
+                );
+            })
+            .await
+            .unwrap();
+        });
+    }
+
+    #[tokio::test]
+    async fn checkpoint_operations_reject_local_loopback_before_initialization() {
+        let signing_seed = [0x4C; 32];
+        let bootstrap_x25519_secret = [0xCC; 32];
+        let identity =
+            Identity::from_test_secrets(PartyId(1), 0, &signing_seed, bootstrap_x25519_secret)
+                .unwrap();
+        let scenario = signing_scenario(NetworkKind::Regtest, true, &identity);
+        let daemon = Arc::new(
+            ReconnectingMoneroDaemon::new(
+                ["http://192.0.2.1:18081"],
+                NetworkKind::Regtest,
+                MoneroRpcLimits {
+                    request_timeout: std::time::Duration::from_secs(30),
+                    ..Default::default()
+                },
+            )
+            .unwrap(),
+        );
+        let state = tempfile::tempdir().unwrap();
+        let server = PartyServer::new_with_deposits(
+            PartyId(1),
+            scenario,
+            state.path(),
+            &signing_seed,
+            &bootstrap_x25519_secret,
+            PartyDepositConfig {
+                private_view_scalar: Zeroizing::new(Scalar::from(7_u64).to_bytes()),
+                birth_anchor: None,
+                worker: DepositWorkerConfig::default(),
+                chain_source: daemon.clone(),
+                consolidation_backend: daemon.clone(),
+                chain_readiness: daemon.readiness(),
+            },
+        )
+        .await
+        .unwrap();
+
+        for operation in DEPOSIT_CHECKPOINT_OPERATIONS {
+            assert!(is_deposit_checkpoint_operation(operation));
+            assert_eq!(
+                server
+                    .handle_local_peer_request(PeerRequest::Deposit { operation, body: vec![0xFF] })
+                    .await,
+                PeerResponse::Rejected {
+                    code: RejectionCode::InvalidRequest,
+                    retryable: false,
+                    message: LOCAL_DEPOSIT_CHECKPOINT_REJECTION.to_owned(),
+                },
+                "{operation:?}",
+            );
+        }
+        assert!(
+            !daemon.is_ready(),
+            "rejected checkpoint loopback unexpectedly initialized deposits or contacted monerod"
+        );
+
+        let state_transfer = server
+            .handle_local_peer_request(PeerRequest::Deposit {
+                operation: DepositOperation::ExportRelease,
+                body: vec![0xFF],
+            })
+            .await;
+        assert!(
+            !matches!(
+                state_transfer,
+                PeerResponse::Rejected { ref message, .. }
+                    if message == LOCAL_DEPOSIT_CHECKPOINT_REJECTION
+            ),
+            "certified state-transfer loopback was captured by checkpoint admission"
+        );
+        assert!(
+            !daemon.is_ready(),
+            "storage-only state-transfer loopback unexpectedly contacted monerod"
+        );
+    }
+
+    #[test]
+    fn allocation_pacemaker_does_not_hold_runtime_fence_across_genesis_rpc() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .thread_stack_size(16 * 1024 * 1024)
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            tokio::spawn(async {
+                let local = PartyId(1);
+                let signing_seed = historical_replay_seed(local);
+                let bootstrap_x25519_secret = historical_replay_x25519_secret(local, 0);
+                let identity =
+                    Identity::from_test_secrets(local, 0, &signing_seed, bootstrap_x25519_secret)
+                        .unwrap();
+                let scenario = signing_scenario(NetworkKind::Regtest, true, &identity);
+                let chain = Arc::new(GatedDepositChain::default());
+                let daemon = Arc::new(
+                    ReconnectingMoneroDaemon::new(
+                        ["http://192.0.2.1:18081"],
+                        NetworkKind::Regtest,
+                        MoneroRpcLimits {
+                            request_timeout: std::time::Duration::from_secs(30),
+                            ..Default::default()
+                        },
+                    )
+                    .unwrap(),
+                );
+                let state = tempfile::tempdir().unwrap();
+                let server = PartyServer::new_with_deposits(
+                    local,
+                    scenario.clone(),
+                    state.path(),
+                    &signing_seed,
+                    &bootstrap_x25519_secret,
+                    PartyDepositConfig {
+                        private_view_scalar: Zeroizing::new(Scalar::from(7_u64).to_bytes()),
+                        birth_anchor: None,
+                        worker: DepositWorkerConfig::default(),
+                        chain_source: chain.clone(),
+                        consolidation_backend: daemon.clone(),
+                        chain_readiness: daemon.readiness(),
+                    },
+                )
+                .await
+                .unwrap();
+
+                let committee = scenario.genesis_committee().unwrap();
+                let (key_id, _) = canonical_dkg_identity(&scenario).unwrap();
+                let polynomial = SecretPolynomial::random(committee.threshold, &mut OsRng).unwrap();
+                let share = aggregate_dkg(
+                    key_id,
+                    committee.clone(),
+                    local,
+                    vec![make_dkg_output(local, &polynomial, &committee, local).unwrap()],
+                )
+                .unwrap();
+                install_proactive_epoch_zero(&server, &share).await;
+
+                // The certified target is available, so the pacemaker reaches the deliberately blocked
+                // genesis chain RPC. With no runtime or volatile signer yet, that RPC must not own the
+                // global transition fence.
+                let progress_server = server.clone();
+                let progress = tokio::spawn(async move {
+                    progress_server
+                        .progress_deposit_allocation_consensus(unix_time_millis().unwrap())
+                        .await
+                });
+                chain.wait_until_polled().await;
+                let transition = tokio::time::timeout(
+                    std::time::Duration::from_millis(100),
+                    server.consolidation_transition.lock(),
+                )
+                .await
+                .expect("blocked genesis RPC owned the runtime fence");
+                drop(transition);
+
+                let error = tokio::time::timeout(
+                    std::time::Duration::from_millis(100),
+                    server.dispatch_deposit_checkpoint_peer_request(
+                        PartyId(1),
+                        DepositOperation::ClientRequest,
+                        vec![0xFF],
+                    ),
+                )
+                .await
+                .expect("uninitialized checkpoint ingress waited on genesis")
+                .unwrap_err();
+                assert!(matches!(
+                    error.downcast_ref::<DepositServiceError>(),
+                    Some(DepositServiceError::ColdImportAwaitingCertificate)
+                ));
+                assert!(!daemon.is_ready(), "blocked pacemaker unexpectedly contacted monerod");
+
+                progress.abort();
+                let cancelled = tokio::time::timeout(std::time::Duration::from_secs(1), progress)
+                    .await
+                    .expect("cancelled allocation pacemaker did not stop")
+                    .unwrap_err();
+                assert!(cancelled.is_cancelled());
+                chain.release();
+            })
+            .await
+            .unwrap();
+        });
+    }
+
+    #[tokio::test]
     async fn status_reports_uninitialized_deposits_without_waiting_for_monerod() {
         let signing_seed = [0x43; 32];
         let bootstrap_x25519_secret = [0xC3; 32];
@@ -12622,6 +20277,2065 @@ mod tests {
         assert_eq!(observed.deposit_ready, Some(false));
         assert_eq!(observed.deposit_chain_ready, Some(false));
         assert!(!daemon.is_ready(), "status unexpectedly connected to monerod");
+    }
+
+    #[tokio::test]
+    async fn certified_dkg_activation_and_restart_do_not_wait_for_deposit_genesis() {
+        const INDEPENDENCE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+        let local = PartyId(1);
+        let signing_seed = [0x44; 32];
+        let bootstrap_x25519_secret = [0xC4; 32];
+        let identity =
+            Identity::from_test_secrets(local, 0, &signing_seed, bootstrap_x25519_secret).unwrap();
+        let scenario = signing_scenario(NetworkKind::Regtest, true, &identity);
+        let daemon = Arc::new(
+            ReconnectingMoneroDaemon::new(
+                ["http://192.0.2.1:18081"],
+                NetworkKind::Regtest,
+                MoneroRpcLimits {
+                    request_timeout: std::time::Duration::from_secs(30),
+                    ..Default::default()
+                },
+            )
+            .unwrap(),
+        );
+        let blocking_chain = Arc::new(BlockingDepositChain::default());
+        let state = tempfile::tempdir().unwrap();
+        let deposit_config = || PartyDepositConfig {
+            private_view_scalar: Zeroizing::new(Scalar::from(7_u64).to_bytes()),
+            birth_anchor: None,
+            worker: DepositWorkerConfig::default(),
+            chain_source: blocking_chain.clone(),
+            consolidation_backend: daemon.clone(),
+            chain_readiness: daemon.readiness(),
+        };
+        let server = PartyServer::new_with_deposits(
+            local,
+            scenario.clone(),
+            state.path(),
+            &signing_seed,
+            &bootstrap_x25519_secret,
+            deposit_config(),
+        )
+        .await
+        .unwrap();
+        let transition = canonical_dkg_transition(&scenario).unwrap();
+        let share = proactive_epoch_zero_share(&scenario, local);
+        let response = server.stage(transition.clone(), share, [0xD4; 32]).await.unwrap();
+        let value = activation_value(&response);
+        let acknowledgement =
+            sign_activation_acknowledgement(&server, &transition, &value).unwrap();
+        let mut run = new_avss_run(&server, transition.clone()).unwrap();
+        run.finalized = Some(response.clone());
+        run.activation_acknowledgements.insert(local, acknowledgement.clone());
+        server.persist_avss_run(&run).await.unwrap();
+        server.avss.lock().await.insert(transition.session, run);
+
+        let Json(installed) = tokio::time::timeout(
+            INDEPENDENCE_TIMEOUT,
+            activate_epoch(
+                State(server.clone()),
+                Json(ActivateEpochRequest {
+                    transition: transition.clone(),
+                    value,
+                    acknowledgements: vec![acknowledgement],
+                }),
+            ),
+        )
+        .await
+        .expect("certified DKG activation waited for the unreachable Monero daemon")
+        .unwrap();
+        assert_eq!(installed, response);
+        assert_eq!(*server.active_epoch.read().await, Some(0));
+        assert!(server.staged.read().await.is_empty());
+        assert!(!server.avss.lock().await.contains_key(&transition.session));
+        assert!(
+            tokio::fs::try_exists(server.protocol_store.session_tombstone_path(transition.session))
+                .await
+                .unwrap(),
+            "locally active DKG left its secret-bearing AVSS reducer live"
+        );
+        assert_eq!(
+            server.deposit.as_ref().map(|deposit| deposit.local_runtime_ready()),
+            Some(false)
+        );
+        assert!(
+            !blocking_chain.polled.load(Ordering::Acquire),
+            "threshold activation attempted to resolve deposit genesis"
+        );
+        assert!(!daemon.is_ready(), "threshold activation unexpectedly contacted monerod");
+        drop(server);
+
+        let restarted = tokio::time::timeout(
+            INDEPENDENCE_TIMEOUT,
+            PartyServer::new_with_deposits(
+                local,
+                scenario,
+                state.path(),
+                &signing_seed,
+                Some(&bootstrap_x25519_secret),
+                deposit_config(),
+            ),
+        )
+        .await
+        .expect("certified threshold-state recovery waited for deposit genesis")
+        .unwrap();
+        assert_eq!(*restarted.active_epoch.read().await, Some(0));
+        assert_eq!(
+            restarted.deposit.as_ref().map(|deposit| deposit.local_runtime_ready()),
+            Some(false)
+        );
+        // Background recovery replaces authenticated store handles and must serialize with
+        // scanner/handoff publication, even though these entry points do not initialize genesis.
+        let transition = restarted.consolidation_transition.lock().await;
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(100),
+                restarted.deposit_sync_sources(),
+            )
+            .await
+            .is_err(),
+            "moving-tip recovery bypassed the host transition fence",
+        );
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(100),
+                restarted.pending_deposit_state_export_seal_work(),
+            )
+            .await
+            .is_err(),
+            "export-seal recovery bypassed the host transition fence",
+        );
+        drop(transition);
+        let (sync_sources, sync_read_authorized, pending_seals) =
+            tokio::time::timeout(INDEPENDENCE_TIMEOUT, async {
+                tokio::join!(
+                    restarted.deposit_sync_sources(),
+                    restarted.deposit_sync_state_read_authorized(local),
+                    restarted.pending_deposit_state_export_seal_work(),
+                )
+            })
+            .await
+            .expect("closed compact synchronization attempted to initialize deposit genesis");
+        assert!(sync_sources.unwrap().is_none());
+        assert!(!sync_read_authorized.unwrap());
+        assert!(pending_seals.unwrap().is_empty());
+        assert!(
+            !blocking_chain.polled.load(Ordering::Acquire),
+            "threshold-state recovery or compact synchronization attempted to resolve deposit genesis"
+        );
+        assert!(!daemon.is_ready(), "threshold-state recovery unexpectedly contacted monerod");
+    }
+
+    #[test]
+    fn refresh_activation_linearizes_snapshot_absence_against_canonical_genesis() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(8)
+            .thread_stack_size(16 * 1024 * 1024)
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            tokio::spawn(async {
+                let scenario = proactive_refresh_scenario();
+                let state = tempfile::tempdir().unwrap();
+                let backend = Arc::new(
+                    ReconnectingMoneroDaemon::new(
+                        ["http://127.0.0.1:9"],
+                        NetworkKind::Regtest,
+                        MoneroRpcLimits {
+                            request_timeout: std::time::Duration::from_millis(50),
+                            ..Default::default()
+                        },
+                    )
+                    .unwrap(),
+                );
+                let mut chains = BTreeMap::new();
+                let mut servers = BTreeMap::new();
+                let offline = PartyId(5);
+                for party in (1_u16..=5).map(PartyId) {
+                    let chain = Arc::new(GatedDepositChain::default());
+                    if party != PartyId(1) {
+                        chain.release();
+                    }
+                    let server = PartyServer::new_with_deposits(
+                        party,
+                        scenario.clone(),
+                        state.path().join(format!("party-{}", party.0)),
+                        &historical_replay_seed(party),
+                        &historical_replay_x25519_secret(party, 0),
+                        PartyDepositConfig {
+                            private_view_scalar: Zeroizing::new(Scalar::from(7_u64).to_bytes()),
+                            birth_anchor: None,
+                            worker: DepositWorkerConfig::default(),
+                            chain_source: chain.clone(),
+                            consolidation_backend: backend.clone(),
+                            chain_readiness: backend.readiness(),
+                        },
+                    )
+                    .await
+                    .unwrap();
+                    chains.insert(party, chain);
+                    servers.insert(party, server);
+                }
+
+                let committee = scenario.genesis_committee().unwrap();
+                let (key_id, _) = canonical_dkg_identity(&scenario).unwrap();
+                let dkg_polynomials = committee
+                    .members
+                    .iter()
+                    .map(|member| {
+                        (
+                            member.id,
+                            SecretPolynomial::random(committee.threshold, &mut OsRng).unwrap(),
+                        )
+                    })
+                    .collect::<BTreeMap<_, _>>();
+                let old_shares = committee
+                    .members
+                    .iter()
+                    .map(|member| {
+                        let outputs = committee
+                            .members
+                            .iter()
+                            .map(|dealer| {
+                                make_dkg_output(
+                                    dealer.id,
+                                    &dkg_polynomials[&dealer.id],
+                                    &committee,
+                                    member.id,
+                                )
+                                .unwrap()
+                            })
+                            .collect();
+                        (
+                            member.id,
+                            aggregate_dkg(key_id, committee.clone(), member.id, outputs).unwrap(),
+                        )
+                    })
+                    .collect::<BTreeMap<_, _>>();
+                let genesis_transition = canonical_dkg_transition(&scenario).unwrap();
+                for (party, server) in &servers {
+                    install_proactive_epoch_zero(server, &old_shares[party]).await;
+                    let genesis = server
+                        .durable_activation_record_for_transition(&genesis_transition)
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    server.remember_certified_deposit_target(&genesis.value).await.unwrap();
+                }
+                for party in (2_u16..=5).map(PartyId) {
+                    servers[&party].ensure_deposit_initialized().await.unwrap();
+                    assert_eq!(
+                        servers[&party].deposit.as_ref().unwrap().active_epoch().await.unwrap(),
+                        0
+                    );
+                }
+
+                let local = servers[&PartyId(1)].clone();
+                let initializing = {
+                    let local = local.clone();
+                    tokio::spawn(async move { local.ensure_deposit_initialized().await })
+                };
+                chains[&PartyId(1)].wait_until_polled().await;
+                assert!(!local.deposit.as_ref().unwrap().local_runtime_ready());
+
+                let mut rotation = None;
+                for server in servers.values() {
+                    let installed = install_historical_key_rotation(
+                        server,
+                        &old_shares[&server.party].public(),
+                        &[PartyId(1), PartyId(2), PartyId(3), PartyId(4), PartyId(5)],
+                        &[PartyId(1), PartyId(2), PartyId(3), PartyId(4)],
+                    )
+                    .await;
+                    if let Some(expected) = &rotation {
+                        assert_eq!(&installed, expected);
+                    } else {
+                        rotation = Some(installed);
+                    }
+                }
+                let (rotation_context, rotation_certificate, target) = rotation.unwrap();
+                let transition = servers[&PartyId(1)]
+                    .configured_proactive_refresh_transition(&old_shares[&PartyId(1)].public())
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(transition.purpose, DealPurpose::Refresh);
+                assert_eq!(transition.target, target);
+                let selected = transition
+                    .eligible_dealers
+                    .iter()
+                    .copied()
+                    .take(usize::from(target.n() - transition.fault_bound))
+                    .collect::<Vec<_>>();
+                let refresh_polynomials = selected
+                    .iter()
+                    .map(|dealer| {
+                        (
+                            *dealer,
+                            SecretPolynomial::random_zero_constant(target.threshold, &mut OsRng)
+                                .unwrap(),
+                        )
+                    })
+                    .collect::<BTreeMap<_, _>>();
+                let successor_shares = target
+                    .members
+                    .iter()
+                    .map(|member| {
+                        let outputs = selected
+                            .iter()
+                            .map(|dealer| {
+                                make_dkg_output(
+                                    *dealer,
+                                    &refresh_polynomials[dealer],
+                                    &target,
+                                    member.id,
+                                )
+                                .unwrap()
+                            })
+                            .collect();
+                        (
+                            member.id,
+                            aggregate_zero_share_refresh(
+                                &old_shares[&member.id],
+                                target.clone(),
+                                member.id,
+                                transition.fault_bound,
+                                &selected,
+                                outputs,
+                            )
+                            .unwrap(),
+                        )
+                    })
+                    .collect::<BTreeMap<_, _>>();
+
+                let mut activation = None;
+                for (party, server) in &servers {
+                    let response = server
+                        .stage(transition.clone(), successor_shares[party].clone(), [0xE6; 32])
+                        .await
+                        .unwrap();
+                    let request = historical_activation_request(
+                        &transition,
+                        response.public.clone(),
+                        0xE6,
+                        rotation_certificate.resulting_receiver_keys(&rotation_context).unwrap(),
+                        Some(rotation_certificate.semantic_digest(&rotation_context).unwrap()),
+                    );
+                    assert_eq!(activation_value(&response), request.value);
+                    if let Some(expected) = &activation {
+                        assert_eq!(&request, expected);
+                    } else {
+                        activation = Some(request.clone());
+                    }
+                    let mut run = new_avss_run(server, transition.clone()).unwrap();
+                    run.finalized = Some(response);
+                    run.activation_acknowledgements = request
+                        .acknowledgements
+                        .iter()
+                        .cloned()
+                        .map(|acknowledgement| (acknowledgement.from, acknowledgement))
+                        .collect();
+                    server.persist_avss_run(&run).await.unwrap();
+                    server.avss.lock().await.insert(transition.session, run);
+                }
+                let activation = activation.unwrap();
+
+                for party in (2_u16..=4).map(PartyId) {
+                    let _ =
+                        activate_epoch(State(servers[&party].clone()), Json(activation.clone()))
+                            .await
+                            .unwrap();
+                }
+                let _ = tokio::time::timeout(
+                    std::time::Duration::from_secs(10),
+                    activate_epoch(State(local.clone()), Json(activation.clone())),
+                )
+                .await
+                .expect("refresh activation waited for the in-flight deposit genesis RPC")
+                .unwrap();
+                assert_eq!(*local.active_epoch.read().await, Some(1));
+                assert_eq!(
+                    local.proactive_refresh_schedule.lock().await.as_ref().map(|schedule| {
+                        (schedule.phase, schedule.source_epoch, schedule.target_epoch)
+                    }),
+                    Some((ProactiveRefreshSchedulePhase::Armed, 1, Some(2)))
+                );
+                assert!(
+                    !local.epochs.read().await.contains_key(&0),
+                    "snapshot absence did not authorize immediate predecessor erasure"
+                );
+                assert!(
+                    local
+                        .store
+                        .load_retirement(0, old_shares[&PartyId(1)].public().committee.digest())
+                        .await
+                        .unwrap()
+                        .is_some(),
+                    "snapshot-absence retirement was not durable"
+                );
+
+                chains[&PartyId(1)].release();
+                let stale_preparation =
+                    tokio::time::timeout(std::time::Duration::from_secs(5), initializing)
+                        .await
+                        .expect("released deposit genesis did not finish")
+                        .unwrap()
+                        .unwrap_err();
+                assert!(
+                    stale_preparation.to_string().contains("crossed an epoch activation"),
+                    "unexpected stale genesis result: {stale_preparation}"
+                );
+                assert!(
+                    !local.deposit.as_ref().unwrap().local_runtime_ready(),
+                    "stale pre-activation genesis preparation published an old runtime"
+                );
+                local.ensure_deposit_initialized().await.unwrap();
+                assert_eq!(
+                    local.deposit.as_ref().unwrap().active_epoch().await.unwrap(),
+                    0,
+                    "snapshot absence must bootstrap canonical epoch zero before sequential handoff"
+                );
+                assert!(
+                    !local.epochs.read().await.contains_key(&0),
+                    "late deposit genesis resurrected the retired predecessor share"
+                );
+                local
+                    .progress_deposit_allocation_consensus(unix_time_millis().unwrap())
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    local.deposit_consensus_signer(0).await.unwrap().scope(),
+                    EnvelopeSignerScope::RecoveryAndFenceOnly,
+                    "retired party did not narrow to transition-bound recovery authority"
+                );
+
+                let mut allocation_errors = BTreeMap::new();
+                let mut retryable_peer_rejections = Vec::new();
+                let mut terminal_peer_rejections = Vec::new();
+                let mut rounds_completed = 0_u32;
+                let mut registries_activated = false;
+                let mut first_checkpoint_commit_observed = None;
+                let consensus_timeout_advance = scenario
+                    .protocol_timeout_seconds
+                    .checked_mul(1_000)
+                    .and_then(|timeout| timeout.checked_add(1_000))
+                    .unwrap();
+                // Keep logical protocol time fixed while one causal proposal/vote pipeline drains.
+                // Debug builds persist and authenticate every delivery and can take longer than
+                // the deliberately short scenario timeout in real wall time. Feeding that wall
+                // time back into the pacemaker would expire a healthy view between its proposal
+                // and votes, so only the explicit pulses below advance the logical clock.
+                let mut logical_now = unix_time_millis().unwrap();
+                for round in 0..64_u32 {
+                    rounds_completed = round + 1;
+                    // Pulse the logical clock only after several relay rounds. Advancing it on
+                    // every round would immediately expire each newly entered view before its
+                    // proposal and votes can drain through the causal outbox.
+                    if round % 8 == 7 {
+                        logical_now = unix_time_millis()
+                            .unwrap()
+                            .checked_add(consensus_timeout_advance)
+                            .unwrap();
+                    }
+                    let round_now = logical_now;
+                    if first_checkpoint_commit_observed.is_none() {
+                        for (party, server) in &servers {
+                            if *party != offline
+                                && server
+                                    .deposit
+                                    .as_ref()
+                                    .unwrap()
+                                    .checkpoint_consensus_committed_for_test()
+                                    .await
+                            {
+                                first_checkpoint_commit_observed =
+                                    Some((round + 1, "before-pacemaker", *party));
+                                break;
+                            }
+                        }
+                    }
+                    for (party, server) in &servers {
+                        if *party == offline {
+                            continue;
+                        }
+                        match server.progress_deposit_allocation_consensus(round_now).await {
+                            Ok(()) => {
+                                allocation_errors.remove(party);
+                            }
+                            Err(error) => {
+                                allocation_errors.insert(*party, format!("{error:#}"));
+                            }
+                        }
+                    }
+
+                    let mut deliveries_by_recipient = BTreeMap::new();
+                    for (sender, server) in &servers {
+                        if *sender == offline {
+                            continue;
+                        }
+                        let mut earliest = BTreeMap::new();
+                        for message in server.pending_deposit_peer_messages(usize::MAX).await {
+                            // Mirror the production QUIC scheduler: ledger and portable-index
+                            // checkpoint reducers may carry the same numeric sequence, but they are
+                            // independent causal namespaces and must each make progress.
+                            let lane = (message.recipient(), message.causal_lane());
+                            let order = message.causal_key();
+                            let replace = earliest.get(&lane).is_none_or(
+                                |current: &PendingDepositPeerMessage| order < current.causal_key(),
+                            );
+                            if replace {
+                                earliest.insert(lane, message);
+                            }
+                        }
+                        for message in earliest.into_values() {
+                            let id = message.id;
+                            let recipient = message.recipient();
+                            if recipient == offline {
+                                continue;
+                            }
+                            let authenticated_sender = *sender;
+                            deliveries_by_recipient
+                                .entry(recipient)
+                                .or_insert_with(Vec::new)
+                                .push((authenticated_sender, id, message.into_quic_request()));
+                        }
+                    }
+                    // The production QUIC runtime admits mutable deposit requests through one
+                    // fair capacity-one lane per recipient. Preserve parallelism across endpoints
+                    // while processing each endpoint's admitted requests serially.
+                    let mut deliveries = Vec::new();
+                    for (recipient, requests) in deliveries_by_recipient {
+                        let recipient_server = servers[&recipient].clone();
+                        deliveries.push(tokio::spawn(async move {
+                            let mut responses = Vec::with_capacity(requests.len());
+                            for (authenticated_sender, id, request) in requests {
+                                let response = recipient_server
+                                    .handle_quic_peer_request(authenticated_sender, request)
+                                    .await;
+                                responses.push((authenticated_sender, id, response));
+                            }
+                            responses
+                        }));
+                    }
+                    let mut acknowledged = BTreeMap::<PartyId, Vec<DepositPeerMessageId>>::new();
+                    for delivery in deliveries {
+                        for (sender, id, response) in delivery.await.unwrap() {
+                            match response {
+                                PeerResponse::Success { .. } => {
+                                    acknowledged.entry(sender).or_default().push(id);
+                                }
+                                PeerResponse::Rejected { code, retryable, message } => {
+                                    if retryable {
+                                        retryable_peer_rejections.push((sender, id, code, message));
+                                    } else {
+                                        acknowledged.entry(sender).or_default().push(id);
+                                        terminal_peer_rejections.push((sender, id, code, message));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    for (sender, ids) in acknowledged {
+                        servers[&sender].acknowledge_deposit_peer_messages(&ids).await.unwrap();
+                    }
+
+                    if first_checkpoint_commit_observed.is_none() {
+                        for (party, server) in &servers {
+                            if *party != offline
+                                && server
+                                    .deposit
+                                    .as_ref()
+                                    .unwrap()
+                                    .checkpoint_consensus_committed_for_test()
+                                    .await
+                            {
+                                first_checkpoint_commit_observed =
+                                    Some((round + 1, "after-ingress", *party));
+                                break;
+                            }
+                        }
+                    }
+                    // Peer ingress only commits its authenticated transition and ACKs. Production
+                    // keeps the autonomous pacemaker live, so model the next local turn after the
+                    // ingress batch instead of making handlers perform unbounded follow-on work.
+                    for (party, server) in &servers {
+                        if *party == offline {
+                            continue;
+                        }
+                        match server.progress_deposit_allocation_consensus(round_now).await {
+                            Ok(()) => {
+                                allocation_errors.remove(party);
+                            }
+                            Err(error) => {
+                                allocation_errors.insert(*party, format!("{error:#}"));
+                            }
+                        }
+                    }
+
+                    registries_activated = true;
+                    for (party, server) in &servers {
+                        if *party == offline {
+                            continue;
+                        }
+                        registries_activated &=
+                            server.deposit.as_ref().unwrap().active_epoch().await.unwrap() == 1;
+                    }
+                    if registries_activated {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+                let mut handoff_liveness = BTreeMap::new();
+                if !registries_activated {
+                    for (party, server) in &servers {
+                        handoff_liveness.insert(
+                            *party,
+                            server.deposit.as_ref().unwrap().handoff_liveness_summary().await,
+                        );
+                    }
+                }
+                assert!(
+                    registries_activated,
+                    "deposit handoff did not activate every successor registry after \
+                     {rounds_completed} logical rounds; allocation errors: {allocation_errors:?}; \
+                     first checkpoint commit: {first_checkpoint_commit_observed:?}; \
+                     retryable rejections: {retryable_peer_rejections:?}; terminal rejections: \
+                     {terminal_peer_rejections:#?}; durable handoff state: {handoff_liveness:#?}"
+                );
+                assert!(
+                    retryable_peer_rejections
+                        .iter()
+                        .all(|(_, _, code, _)| *code == RejectionCode::Unavailable),
+                    "the no-fault logical relay produced a non-ordering retryable rejection: \
+                     {retryable_peer_rejections:?}"
+                );
+
+                let mut scanner_errors = BTreeMap::new();
+                for (party, server) in &servers {
+                    if *party == offline {
+                        continue;
+                    }
+                    if let Err(error) = server.tick_deposit_worker().await {
+                        scanner_errors.insert(*party, format!("{error:#}"));
+                    }
+                }
+                for (party, server) in &servers {
+                    if *party == offline {
+                        continue;
+                    }
+                    assert_eq!(
+                        server.deposit.as_ref().unwrap().active_epoch().await.unwrap(),
+                        1,
+                        "party {party:?} did not retain its activated successor registry"
+                    );
+                    assert!(
+                        !server.epochs.read().await.contains_key(&0),
+                        "party {party:?} retained its predecessor share; scanner errors: \
+                         {scanner_errors:?}"
+                    );
+                    assert!(
+                        server
+                            .store
+                            .load_retirement(0, old_shares[party].public().committee.digest())
+                            .await
+                            .unwrap()
+                            .is_some(),
+                        "party {party:?} did not durably authorize predecessor retirement; \
+                        scanner errors: {scanner_errors:?}"
+                    );
+                }
+                let offline_server = &servers[&offline];
+                assert_eq!(*offline_server.active_epoch.read().await, Some(0));
+                assert_eq!(
+                    offline_server.deposit.as_ref().unwrap().active_epoch().await.unwrap(),
+                    0
+                );
+                assert!(
+                    offline_server.epochs.read().await.contains_key(&0),
+                    "silent source party unexpectedly retired its predecessor share"
+                );
+                assert!(
+                    offline_server
+                        .store
+                        .load_retirement(0, old_shares[&offline].public().committee.digest(),)
+                        .await
+                        .unwrap()
+                        .is_none(),
+                    "silent source party unexpectedly wrote a retirement marker"
+                );
+            })
+            .await
+            .unwrap();
+        });
+    }
+
+    #[test]
+    fn never_initialized_deposits_do_not_pin_obsolete_shares_across_refreshes() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(4)
+            .thread_stack_size(16 * 1024 * 1024)
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            tokio::spawn(async {
+                let scenario = historical_replay_scenario();
+                scenario.validate().unwrap();
+                let local = PartyId(1);
+                let peer = PartyId(2);
+                let state = tempfile::tempdir().unwrap();
+                let chain = Arc::new(BlockingDepositChain::default());
+                let backend = Arc::new(
+                    ReconnectingMoneroDaemon::new(
+                        ["http://127.0.0.1:9"],
+                        NetworkKind::Regtest,
+                        MoneroRpcLimits {
+                            request_timeout: std::time::Duration::from_millis(50),
+                            ..Default::default()
+                        },
+                    )
+                    .unwrap(),
+                );
+                let server = PartyServer::new_with_deposits(
+                    local,
+                    scenario.clone(),
+                    state.path(),
+                    &historical_replay_seed(local),
+                    &historical_replay_x25519_secret(local, 0),
+                    PartyDepositConfig {
+                        private_view_scalar: Zeroizing::new(Scalar::from(7_u64).to_bytes()),
+                        birth_anchor: None,
+                        worker: DepositWorkerConfig::default(),
+                        chain_source: chain.clone(),
+                        consolidation_backend: backend.clone(),
+                        chain_readiness: backend.readiness(),
+                    },
+                )
+                .await
+                .unwrap();
+
+                let committee_zero = scenario.genesis_committee().unwrap();
+                let (key_id, _) = canonical_dkg_identity(&scenario).unwrap();
+                let dkg_polynomial =
+                    SecretPolynomial::random(committee_zero.threshold, &mut OsRng).unwrap();
+                let epoch_zero = aggregate_dkg(
+                    key_id,
+                    committee_zero.clone(),
+                    local,
+                    vec![make_dkg_output(local, &dkg_polynomial, &committee_zero, local).unwrap()],
+                )
+                .unwrap();
+                install_proactive_epoch_zero(&server, &epoch_zero).await;
+
+                let (rotation_one_context, rotation_one_certificate, committee_one) =
+                    install_historical_key_rotation(
+                        &server,
+                        &epoch_zero.public(),
+                        &[local, peer],
+                        &[local],
+                    )
+                    .await;
+                let transition_one = server
+                    .configured_proactive_refresh_transition(&epoch_zero.public())
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(transition_one.target, committee_one);
+                let polynomial_one = make_proactive_reshare_polynomial(
+                    &epoch_zero,
+                    local,
+                    committee_one.threshold,
+                    &mut OsRng,
+                )
+                .unwrap();
+                let epoch_one = committee_one
+                    .members
+                    .iter()
+                    .map(|recipient| {
+                        let output =
+                            make_dkg_output(local, &polynomial_one, &committee_one, recipient.id)
+                                .unwrap();
+                        (
+                            recipient.id,
+                            aggregate_proactive_reshare(
+                                &epoch_zero,
+                                committee_one.clone(),
+                                recipient.id,
+                                &[local],
+                                vec![output],
+                            )
+                            .unwrap(),
+                        )
+                    })
+                    .collect::<BTreeMap<_, _>>();
+                let response_one = server
+                    .stage(transition_one.clone(), epoch_one[&local].clone(), [0xA1; 32])
+                    .await
+                    .unwrap();
+                let activation_one = historical_activation_request(
+                    &transition_one,
+                    response_one.public.clone(),
+                    0xA1,
+                    rotation_one_certificate
+                        .resulting_receiver_keys(&rotation_one_context)
+                        .unwrap(),
+                    Some(rotation_one_certificate.semantic_digest(&rotation_one_context).unwrap()),
+                );
+                let mut run_one = new_avss_run(&server, transition_one.clone()).unwrap();
+                run_one.finalized = Some(response_one);
+                run_one.activation_acknowledgements = activation_one
+                    .acknowledgements
+                    .iter()
+                    .cloned()
+                    .map(|acknowledgement| (acknowledgement.from, acknowledgement))
+                    .collect();
+                server.persist_avss_run(&run_one).await.unwrap();
+                server.avss.lock().await.insert(transition_one.session, run_one);
+                let _ = activate_epoch(State(server.clone()), Json(activation_one.clone()))
+                    .await
+                    .unwrap();
+
+                assert_eq!(*server.active_epoch.read().await, Some(1));
+                assert_eq!(server.epochs.read().await.keys().copied().collect::<Vec<_>>(), vec![1]);
+                assert!(
+                    server
+                        .store
+                        .load_retirement(0, committee_zero.digest())
+                        .await
+                        .unwrap()
+                        .is_some()
+                );
+                assert!(!chain.polled.load(Ordering::Acquire));
+
+                let epoch_one_public = epoch_one[&local].public();
+                let (rotation_two_context, rotation_two_certificate, committee_two) =
+                    install_historical_key_rotation(
+                        &server,
+                        &epoch_one_public,
+                        &[local],
+                        &[local, peer],
+                    )
+                    .await;
+                let transition_two = server
+                    .configured_proactive_refresh_transition(&epoch_one_public)
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(transition_two.target, committee_two);
+                let selected_two = [local, peer];
+                let polynomials_two = selected_two
+                    .iter()
+                    .map(|dealer| {
+                        (
+                            *dealer,
+                            make_proactive_reshare_polynomial(
+                                &epoch_one[dealer],
+                                *dealer,
+                                committee_two.threshold,
+                                &mut OsRng,
+                            )
+                            .unwrap(),
+                        )
+                    })
+                    .collect::<BTreeMap<_, _>>();
+                let outputs_two = polynomials_two
+                    .iter()
+                    .map(|(dealer, polynomial)| {
+                        make_dkg_output(*dealer, polynomial, &committee_two, local).unwrap()
+                    })
+                    .collect();
+                let epoch_two = aggregate_proactive_reshare(
+                    &epoch_one[&local],
+                    committee_two,
+                    local,
+                    &selected_two,
+                    outputs_two,
+                )
+                .unwrap();
+                let response_two = server
+                    .stage(transition_two.clone(), epoch_two.clone(), [0xA2; 32])
+                    .await
+                    .unwrap();
+                let activation_two = historical_activation_request(
+                    &transition_two,
+                    response_two.public.clone(),
+                    0xA2,
+                    rotation_two_certificate
+                        .resulting_receiver_keys(&rotation_two_context)
+                        .unwrap(),
+                    Some(rotation_two_certificate.semantic_digest(&rotation_two_context).unwrap()),
+                );
+                let mut run_two = new_avss_run(&server, transition_two.clone()).unwrap();
+                run_two.finalized = Some(response_two);
+                run_two.activation_acknowledgements = activation_two
+                    .acknowledgements
+                    .iter()
+                    .cloned()
+                    .map(|acknowledgement| (acknowledgement.from, acknowledgement))
+                    .collect();
+                server.persist_avss_run(&run_two).await.unwrap();
+                server.avss.lock().await.insert(transition_two.session, run_two);
+                let _ = activate_epoch(State(server.clone()), Json(activation_two)).await.unwrap();
+
+                assert_eq!(*server.active_epoch.read().await, Some(2));
+                assert_eq!(server.epochs.read().await.keys().copied().collect::<Vec<_>>(), vec![2]);
+                assert!(
+                    server
+                        .store
+                        .load_retirement(1, epoch_one_public.committee.digest())
+                        .await
+                        .unwrap()
+                        .is_some()
+                );
+                assert!(
+                    !server.deposit.as_ref().unwrap().local_runtime_ready(),
+                    "refresh unexpectedly initialized deposits"
+                );
+                assert!(
+                    !chain.polled.load(Ordering::Acquire),
+                    "fixed-interval refresh contacted the unavailable chain source"
+                );
+            })
+            .await
+            .unwrap();
+        });
+    }
+
+    #[test]
+    fn restart_restores_active_refresh_without_waiting_for_durable_deposit_genesis() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(4)
+            .thread_stack_size(16 * 1024 * 1024)
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            tokio::spawn(async {
+                let scenario = historical_replay_scenario();
+                scenario.validate().unwrap();
+                let local = PartyId(1);
+                let peer = PartyId(2);
+                let state = tempfile::tempdir().unwrap();
+                let backend = Arc::new(
+                    ReconnectingMoneroDaemon::new(
+                        ["http://127.0.0.1:9"],
+                        NetworkKind::Regtest,
+                        MoneroRpcLimits {
+                            request_timeout: std::time::Duration::from_millis(50),
+                            ..Default::default()
+                        },
+                    )
+                    .unwrap(),
+                );
+                let initial_chain = Arc::new(GatedDepositChain::default());
+                initial_chain.release();
+                let signing_seed = historical_replay_seed(local);
+                let bootstrap_x25519_secret = historical_replay_x25519_secret(local, 0);
+                let deposit_config = |chain: Arc<dyn DepositChainSource>| PartyDepositConfig {
+                    private_view_scalar: Zeroizing::new(Scalar::from(7_u64).to_bytes()),
+                    birth_anchor: None,
+                    worker: DepositWorkerConfig::default(),
+                    chain_source: chain,
+                    consolidation_backend: backend.clone(),
+                    chain_readiness: backend.readiness(),
+                };
+                let server = PartyServer::new_with_deposits(
+                    local,
+                    scenario.clone(),
+                    state.path(),
+                    &signing_seed,
+                    &bootstrap_x25519_secret,
+                    deposit_config(initial_chain),
+                )
+                .await
+                .unwrap();
+
+                let committee_zero = scenario.genesis_committee().unwrap();
+                let (key_id, _) = canonical_dkg_identity(&scenario).unwrap();
+                let dkg_polynomial =
+                    SecretPolynomial::random(committee_zero.threshold, &mut OsRng).unwrap();
+                let epoch_zero = aggregate_dkg(
+                    key_id,
+                    committee_zero.clone(),
+                    local,
+                    vec![make_dkg_output(local, &dkg_polynomial, &committee_zero, local).unwrap()],
+                )
+                .unwrap();
+                install_proactive_epoch_zero(&server, &epoch_zero).await;
+                let dkg_transition = canonical_dkg_transition(&scenario).unwrap();
+                let dkg_record = server
+                    .durable_activation_record_for_transition(&dkg_transition)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                server.remember_certified_deposit_target(&dkg_record.value).await.unwrap();
+                server.ensure_deposit_initialized().await.unwrap();
+                assert_eq!(server.deposit.as_ref().unwrap().active_epoch().await.unwrap(), 0);
+
+                let (rotation_context, rotation_certificate, committee_one) =
+                    install_historical_key_rotation(
+                        &server,
+                        &epoch_zero.public(),
+                        &[local, peer],
+                        &[local],
+                    )
+                    .await;
+                let transition = server
+                    .configured_proactive_refresh_transition(&epoch_zero.public())
+                    .unwrap()
+                    .unwrap();
+                let polynomial = make_proactive_reshare_polynomial(
+                    &epoch_zero,
+                    local,
+                    committee_one.threshold,
+                    &mut OsRng,
+                )
+                .unwrap();
+                let output = make_dkg_output(local, &polynomial, &committee_one, local).unwrap();
+                let epoch_one = aggregate_proactive_reshare(
+                    &epoch_zero,
+                    committee_one,
+                    local,
+                    &[local],
+                    vec![output],
+                )
+                .unwrap();
+                let response =
+                    server.stage(transition.clone(), epoch_one.clone(), [0xB1; 32]).await.unwrap();
+                let activation = historical_activation_request(
+                    &transition,
+                    response.public.clone(),
+                    0xB1,
+                    rotation_certificate.resulting_receiver_keys(&rotation_context).unwrap(),
+                    Some(rotation_certificate.semantic_digest(&rotation_context).unwrap()),
+                );
+                let mut run = new_avss_run(&server, transition.clone()).unwrap();
+                run.finalized = Some(response);
+                run.activation_acknowledgements = activation
+                    .acknowledgements
+                    .iter()
+                    .cloned()
+                    .map(|acknowledgement| (acknowledgement.from, acknowledgement))
+                    .collect();
+                server.persist_avss_run(&run).await.unwrap();
+                server.avss.lock().await.insert(transition.session, run);
+
+                // Model the crash cut after successor certificate/schedule/share durability but
+                // before in-memory activation and predecessor retirement.
+                server.persist_pending_activation_authority(&activation).await.unwrap();
+                server
+                    .arm_proactive_refresh_for_pending_activation(&activation.value, 100_000)
+                    .await
+                    .unwrap();
+                server
+                    .persist_activation_certificate(
+                        &activation.transition,
+                        &activation.value,
+                        &activation.acknowledgements,
+                    )
+                    .await
+                    .unwrap();
+                server
+                    .complete_proactive_refresh_activation(&activation.value, 100_001)
+                    .await
+                    .unwrap();
+                drop(server);
+
+                let restart_chain = Arc::new(GatedDepositChain::default());
+                let restart_x25519_secret = historical_replay_x25519_secret(local, 0);
+                // The unreleased chain gate makes any accidental genesis dependency block
+                // indefinitely. Keep the wall-clock bound generous enough for encrypted state
+                // reconstruction under the full parallel test suite; this is an independence
+                // assertion, not a startup-latency benchmark.
+                let restarted = tokio::time::timeout(
+                    std::time::Duration::from_secs(10),
+                    PartyServer::new_with_deposits(
+                        local,
+                        scenario,
+                        state.path(),
+                        &signing_seed,
+                        Some(&restart_x25519_secret),
+                        deposit_config(restart_chain.clone()),
+                    ),
+                )
+                .await
+                .expect("restart waited for deposit genesis")
+                .unwrap();
+                assert_eq!(*restarted.active_epoch.read().await, Some(1));
+                assert_eq!(
+                    restarted.epochs.read().await.keys().copied().collect::<Vec<_>>(),
+                    vec![0, 1],
+                    "restore erased the old share before restoring the durable deposit registry"
+                );
+                assert_eq!(
+                    restarted
+                        .proactive_refresh_schedule
+                        .lock()
+                        .await
+                        .as_ref()
+                        .map(|schedule| (schedule.phase, schedule.source_epoch)),
+                    Some((ProactiveRefreshSchedulePhase::Armed, 1))
+                );
+                assert!(!restart_chain.polled.load(Ordering::Acquire));
+
+                restart_chain.release();
+                let initial_scanner_error =
+                    restarted.tick_deposit_worker().await.err().map(|error| format!("{error:#}"));
+                let mut last_allocation_error = None;
+                for _ in 0..8 {
+                    if let Err(error) = restarted
+                        .progress_deposit_allocation_consensus(unix_time_millis().unwrap())
+                        .await
+                    {
+                        last_allocation_error = Some(format!("{error:#}"));
+                    }
+                    if restarted.deposit.as_ref().unwrap().active_epoch().await.unwrap() == 1 {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+                assert_eq!(
+                    restarted.deposit.as_ref().unwrap().active_epoch().await.unwrap(),
+                    1,
+                    "bounded allocation pacemaker actions did not finish the deposit handoff; \
+                     initial scanner error: {initial_scanner_error:?}; \
+                     last allocation error: {last_allocation_error:?}"
+                );
+                let final_scanner_error =
+                    restarted.tick_deposit_worker().await.err().map(|error| format!("{error:#}"));
+                assert!(
+                    !restarted.epochs.read().await.contains_key(&0),
+                    "deposit recovery did not retire the restored predecessor share; \
+                     final scanner error: {final_scanner_error:?}"
+                );
+                assert_eq!(restarted.deposit.as_ref().unwrap().active_epoch().await.unwrap(), 1);
+                assert!(
+                    restarted
+                        .store
+                        .load_retirement(0, committee_zero.digest())
+                        .await
+                        .unwrap()
+                        .is_some()
+                );
+                // A source-only retirement clears the active signing epoch but retains the
+                // certified deposit handoff and its old-source export obligations. Exercise that
+                // authority boundary without changing the authenticated deposit registry.
+                restarted.verified_current_deposit_sync_target(1).await.unwrap();
+                *restarted.active_epoch.write().await = None;
+                assert!(restarted.verified_current_deposit_sync_target(1).await.is_err());
+                assert!(restarted.verified_current_deposit_registry_target(0).await.is_err());
+                let transfer = restarted
+                    .authenticated_current_deposit_state_transfer()
+                    .await
+                    .expect("retained deposit handoff requires no active signing share");
+                assert_eq!(transfer.source().active_epoch(), 0);
+                assert_eq!(transfer.target().committee().epoch, 1);
+                let pending = restarted
+                    .pending_deposit_state_export_seal_work()
+                    .await
+                    .expect("retired source must retain export-seal authority");
+                assert!(!pending.is_empty(), "fixture must exercise retained export-seal work");
+                for locator in pending {
+                    restarted.reconstruct_deposit_state_export_seal_work(locator).await.unwrap();
+                }
+            })
+            .await
+            .unwrap();
+        });
+    }
+
+    #[tokio::test]
+    async fn protocol_tick_recovers_a_certified_staged_activation_without_ack_relay() {
+        let local = PartyId(1);
+        let signing_seed = [0x45; 32];
+        let bootstrap_x25519_secret = [0xC5; 32];
+        let identity =
+            Identity::from_test_secrets(local, 0, &signing_seed, bootstrap_x25519_secret).unwrap();
+        let scenario = signing_scenario(NetworkKind::Regtest, true, &identity);
+        let state = tempfile::tempdir().unwrap();
+        let server = PartyServer::new(
+            local,
+            scenario.clone(),
+            state.path(),
+            &signing_seed,
+            &bootstrap_x25519_secret,
+        )
+        .await
+        .unwrap();
+        let transition = canonical_dkg_transition(&scenario).unwrap();
+        let share = proactive_epoch_zero_share(&scenario, local);
+        let response = server.stage(transition.clone(), share, [0xD5; 32]).await.unwrap();
+        let value = activation_value(&response);
+        let acknowledgement =
+            sign_activation_acknowledgement(&server, &transition, &value).unwrap();
+        let mut run = new_avss_run(&server, transition.clone()).unwrap();
+        run.finalized = Some(response.clone());
+        run.activation_acknowledgements.insert(local, acknowledgement.clone());
+        server.persist_avss_run(&run).await.unwrap();
+        server.avss.lock().await.insert(transition.session, run);
+
+        // Model authenticated history catch-up, or a crash boundary after the certificate CAS but
+        // before the publisher installs its already-staged share. No acknowledgement or Activate
+        // message is delivered after this point.
+        server
+            .persist_activation_certificate(&transition, &value, &[acknowledgement])
+            .await
+            .unwrap();
+        assert_eq!(*server.active_epoch.read().await, None);
+        assert_eq!(server.staged.read().await.keys().copied().collect::<Vec<_>>(), vec![0]);
+        let before = server.protocol_session_status(transition.session).await.unwrap();
+        assert!(before.finalized);
+        assert!(before.secret_compacted);
+        assert_eq!(before.activation_acknowledgements, 1);
+        assert!(server.pending_peer_messages(usize::MAX).await.is_empty());
+
+        server.progress_protocols(1, std::time::Duration::from_millis(10)).await.unwrap();
+
+        assert_eq!(*server.active_epoch.read().await, Some(0));
+        assert!(server.staged.read().await.is_empty());
+        assert!(
+            server.protocol_session_status(transition.session).await.is_none(),
+            "drained certified reducer remained live after recovered activation"
+        );
+        assert!(
+            tokio::fs::try_exists(server.protocol_store.session_tombstone_path(transition.session))
+                .await
+                .unwrap(),
+            "recovered certified activation did not permanently close its drained reducer"
+        );
+    }
+
+    #[tokio::test]
+    async fn history_catchup_arms_staged_activation_schedule_before_restart() {
+        let local = PartyId(1);
+        let signing_seed = historical_replay_seed(local);
+        let bootstrap_x25519_secret = historical_replay_x25519_secret(local, 0);
+        let scenario = proactive_refresh_scenario();
+        let state = tempfile::tempdir().unwrap();
+
+        let source = PartyServer::new(
+            local,
+            scenario.clone(),
+            state.path().join("source"),
+            &signing_seed,
+            &bootstrap_x25519_secret,
+        )
+        .await
+        .unwrap();
+        let share = proactive_epoch_zero_share(&scenario, local);
+        install_proactive_epoch_zero(&source, &share).await;
+        let (manifest, activation, rotation) = historical_epoch_catchup_bundle(&source, 0).await;
+
+        let target_state = state.path().join("target");
+        let target = PartyServer::new(
+            local,
+            scenario.clone(),
+            &target_state,
+            &signing_seed,
+            &bootstrap_x25519_secret,
+        )
+        .await
+        .unwrap();
+        let transition = canonical_dkg_transition(&scenario).unwrap();
+        let response = target.stage(transition.clone(), share, [0xD0; 32]).await.unwrap();
+        let record: ActivationCertificateRecord = decode_postcard_exact(&activation).unwrap();
+        let mut run = new_avss_run(&target, transition.clone()).unwrap();
+        run.finalized = Some(response);
+        run.activation_acknowledgements = record
+            .acknowledgements
+            .iter()
+            .cloned()
+            .map(|acknowledgement| (acknowledgement.from, acknowledgement))
+            .collect();
+        target.persist_avss_run(&run).await.unwrap();
+        target.avss.lock().await.insert(transition.session, run);
+
+        // No protocol tick or activation-certificate relay follows this catch-up. Returning from
+        // catch-up must mean the normal activation write order has made both the schedule and
+        // certificate durable before installing the staged share.
+        target.apply_epoch_history_catchup(local, manifest, activation, rotation).await.unwrap();
+        assert_eq!(*target.active_epoch.read().await, Some(0));
+        assert!(target.staged.read().await.is_empty());
+        assert!(
+            target
+                .protocol_store
+                .load_proactive_refresh_schedule(scenario.quic_network_id().unwrap())
+                .await
+                .unwrap()
+                .is_some(),
+            "history catch-up installed a staged share without a durable proactive schedule"
+        );
+        drop(target);
+
+        let restarted = PartyServer::new(
+            local,
+            scenario.clone(),
+            &target_state,
+            &signing_seed,
+            &bootstrap_x25519_secret,
+        )
+        .await
+        .unwrap();
+        assert_eq!(*restarted.active_epoch.read().await, Some(0));
+        assert!(
+            restarted
+                .protocol_store
+                .load_proactive_refresh_schedule(scenario.quic_network_id().unwrap())
+                .await
+                .unwrap()
+                .is_some(),
+            "certified staged-share recovery lost its proactive schedule"
+        );
+    }
+
+    #[tokio::test]
+    async fn staged_selected_successor_is_a_hard_passive_reconciliation_boundary() {
+        let scenario = proactive_refresh_scenario();
+        let local = PartyId(1);
+        let state = tempfile::tempdir().unwrap();
+        let server = PartyServer::new(
+            local,
+            scenario.clone(),
+            state.path(),
+            &historical_replay_seed(local),
+            &historical_replay_x25519_secret(local, 0),
+        )
+        .await
+        .unwrap();
+        let source_share = proactive_epoch_zero_share(&scenario, local);
+        install_proactive_epoch_zero(&server, &source_share).await;
+        server.arm_proactive_refresh_for_activation(&source_share.public(), 90_000).await.unwrap();
+        let source_schedule = server.proactive_refresh_schedule.lock().await.clone().unwrap();
+
+        let (rotation_context, rotation_certificate, target) = install_historical_key_rotation(
+            &server,
+            &source_share.public(),
+            &[PartyId(1), PartyId(2), PartyId(3), PartyId(4), PartyId(5)],
+            &[PartyId(1), PartyId(2), PartyId(3), PartyId(4)],
+        )
+        .await;
+        let transition = server
+            .configured_proactive_refresh_transition(&source_share.public())
+            .unwrap()
+            .unwrap();
+        assert_eq!(transition.target, target);
+        let selected = transition
+            .eligible_dealers
+            .iter()
+            .copied()
+            .take(usize::from(target.n() - transition.fault_bound))
+            .collect::<Vec<_>>();
+        let outputs = selected
+            .iter()
+            .map(|dealer| {
+                let polynomial =
+                    SecretPolynomial::random_zero_constant(target.threshold, &mut OsRng).unwrap();
+                make_dkg_output(*dealer, &polynomial, &target, local).unwrap()
+            })
+            .collect();
+        let successor_share = aggregate_zero_share_refresh(
+            &source_share,
+            target,
+            local,
+            transition.fault_bound,
+            &selected,
+            outputs,
+        )
+        .unwrap();
+        let response = server.stage(transition.clone(), successor_share, [0xE5; 32]).await.unwrap();
+        let activation = historical_activation_request(
+            &transition,
+            response.public.clone(),
+            0xE5,
+            rotation_certificate.resulting_receiver_keys(&rotation_context).unwrap(),
+            Some(rotation_certificate.semantic_digest(&rotation_context).unwrap()),
+        );
+        assert_eq!(activation_value(&response), activation.value);
+        let mut run = new_avss_run(&server, transition.clone()).unwrap();
+        run.finalized = Some(response);
+        run.activation_acknowledgements = activation
+            .acknowledgements
+            .iter()
+            .cloned()
+            .map(|acknowledgement| (acknowledgement.from, acknowledgement))
+            .collect();
+        server.persist_avss_run(&run).await.unwrap();
+        server.avss.lock().await.insert(transition.session, run);
+
+        // Reproduce a history-only crash cut while the valid successor share remains staged.
+        // Passive repair must not synthesize an epoch-one candidate: the normal activation path
+        // owns the successor's pending write-ahead schedule and must remain able to install it.
+        server
+            .persist_activation_certificate(
+                &activation.transition,
+                &activation.value,
+                &activation.acknowledgements,
+            )
+            .await
+            .unwrap();
+        server.remember_certified_deposit_target(&activation.value).await.unwrap();
+        assert!(server.staged.read().await.contains_key(&activation.value.epoch));
+        assert!(
+            server
+                .store
+                .load_if_active(activation.value.epoch, activation.value.public.committee.digest())
+                .await
+                .unwrap()
+                .is_some()
+        );
+        server.reconcile_proactive_refresh_schedule_from_history(100_000).await.unwrap();
+        assert_eq!(
+            server.proactive_refresh_schedule.lock().await.clone(),
+            Some(source_schedule),
+            "passive reconciliation crossed a selected staged successor"
+        );
+
+        let _ = boxed_activate_epoch(State(server.clone()), Json(activation)).await.unwrap();
+        assert_eq!(*server.active_epoch.read().await, Some(1));
+        let activated_schedule = server.proactive_refresh_schedule.lock().await.clone().unwrap();
+        assert_eq!(activated_schedule.source_epoch, 1);
+        assert_eq!(activated_schedule.phase, ProactiveRefreshSchedulePhase::Armed);
+        assert!(activated_schedule.deferred_observer.is_none());
+    }
+
+    #[tokio::test]
+    async fn shareless_history_reconciliation_arms_schedule_after_history_only_crash() {
+        let scenario = proactive_refresh_scenario();
+        let state = tempfile::tempdir().unwrap();
+        let source_party = PartyId(1);
+        let source = PartyServer::new(
+            source_party,
+            scenario.clone(),
+            state.path().join("source"),
+            &historical_replay_seed(source_party),
+            &historical_replay_x25519_secret(source_party, 0),
+        )
+        .await
+        .unwrap();
+        let source_share = proactive_epoch_zero_share(&scenario, source_party);
+        install_proactive_epoch_zero(&source, &source_share).await;
+        let (_, activation, _) = historical_epoch_catchup_bundle(&source, 0).await;
+
+        // Party 6 is not in epoch zero and therefore cannot stage or activate a share from this
+        // certificate. It is, however, an authenticated eligible receiver for the fixed-interval
+        // successor. Reproduce a stop after the history CAS but before the first passive schedule;
+        // production reconciliation must derive epoch zero without an old bundle replay.
+        let spare = PartyId(6);
+        let target = PartyServer::new(
+            spare,
+            scenario.clone(),
+            state.path().join("spare"),
+            &historical_replay_seed(spare),
+            None::<&[u8; 32]>,
+        )
+        .await
+        .unwrap();
+        assert!(target.staged.read().await.is_empty());
+        assert_eq!(*target.active_epoch.read().await, None);
+        assert!(target.proactive_refresh_schedule.lock().await.is_none());
+
+        let record: ActivationCertificateRecord = decode_postcard_exact(&activation).unwrap();
+        target
+            .persist_activation_certificate(
+                &record.transition,
+                &record.value,
+                &record.acknowledgements,
+            )
+            .await
+            .unwrap();
+        target.remember_certified_deposit_target(&record.value).await.unwrap();
+        assert_eq!(target.epoch_history.read().await.tip_epoch(), Some(0));
+        assert!(target.proactive_refresh_schedule.lock().await.is_none());
+        const RECONCILED_AT: u64 = 100_000;
+        target.reconcile_proactive_refresh_schedule_from_history(RECONCILED_AT).await.unwrap();
+
+        assert_eq!(*target.active_epoch.read().await, None);
+        assert!(target.staged.read().await.is_empty());
+        let schedule = target.proactive_refresh_schedule.lock().await.clone().unwrap();
+        assert_eq!(schedule.source_epoch, 0);
+        assert_eq!(schedule.target_epoch, Some(1));
+        assert_eq!(schedule.due_unix_ms, Some(RECONCILED_AT + 1_000));
+        assert!(
+            target
+                .protocol_store
+                .load_proactive_refresh_schedule(scenario.quic_network_id().unwrap())
+                .await
+                .unwrap()
+                .is_some(),
+            "shareless history reconciliation returned before the schedule was durable"
+        );
+
+        // Exercise the constructor hook at the same durable cut. This second replica stops with
+        // authenticated history but no candidate at all; readiness may be published only after
+        // startup reconstructs and seals the passive genesis schedule.
+        let startup_state = state.path().join("startup-spare");
+        {
+            let startup_target = PartyServer::new(
+                spare,
+                scenario.clone(),
+                &startup_state,
+                &historical_replay_seed(spare),
+                None::<&[u8; 32]>,
+            )
+            .await
+            .unwrap();
+            startup_target
+                .persist_activation_certificate(
+                    &record.transition,
+                    &record.value,
+                    &record.acknowledgements,
+                )
+                .await
+                .unwrap();
+            assert!(startup_target.proactive_refresh_schedule.lock().await.is_none());
+        }
+        let restart_started = unix_time_millis().unwrap();
+        let restarted = PartyServer::new(
+            spare,
+            scenario,
+            &startup_state,
+            &historical_replay_seed(spare),
+            None::<&[u8; 32]>,
+        )
+        .await
+        .unwrap();
+        let restored = restarted.proactive_refresh_schedule.lock().await.clone().unwrap();
+        assert_eq!(restored.source_epoch, 0);
+        assert_eq!(restored.target_epoch, Some(1));
+        assert!(restored.due_unix_ms.is_some_and(|due| due >= restart_started + 1_000));
+        assert!(
+            restarted
+                .protocol_store
+                .load_proactive_refresh_schedule(restarted.scenario.quic_network_id().unwrap())
+                .await
+                .unwrap()
+                .is_some(),
+            "startup published readiness without sealing the reconciled schedule"
+        );
+    }
+
+    #[tokio::test]
+    async fn shareless_source_member_does_not_reconstruct_a_target_only_schedule_on_restart() {
+        let scenario = proactive_refresh_scenario();
+        let state = tempfile::tempdir().unwrap();
+        let source_party = PartyId(1);
+        let source = PartyServer::new(
+            source_party,
+            scenario.clone(),
+            state.path().join("source"),
+            &historical_replay_seed(source_party),
+            &historical_replay_x25519_secret(source_party, 0),
+        )
+        .await
+        .unwrap();
+        let source_share = proactive_epoch_zero_share(&scenario, source_party);
+        install_proactive_epoch_zero(&source, &source_share).await;
+        let (manifest, activation, rotation) = historical_epoch_catchup_bundle(&source, 0).await;
+
+        // This replica authenticated the public genesis certificate while it was offline for
+        // DKG, so it owns no active or staged source share. Although it is eligible for the next
+        // receiver-key committee, it is a member of the certified source and therefore must not
+        // be reconstructed as a target-only joiner after restart.
+        let local = PartyId(2);
+        let target_state = state.path().join("shareless-source-member");
+        let target = PartyServer::new(
+            local,
+            scenario.clone(),
+            &target_state,
+            &historical_replay_seed(local),
+            &historical_replay_x25519_secret(local, 0),
+        )
+        .await
+        .unwrap();
+        target
+            .apply_epoch_history_catchup(source_party, manifest, activation, rotation)
+            .await
+            .unwrap();
+        assert_eq!(*target.active_epoch.read().await, None);
+        assert!(target.staged.read().await.is_empty());
+        assert!(target.proactive_refresh_schedule.lock().await.is_none());
+        drop(target);
+
+        let restarted = PartyServer::new(
+            local,
+            scenario,
+            &target_state,
+            &historical_replay_seed(local),
+            &historical_replay_x25519_secret(local, 0),
+        )
+        .await
+        .unwrap();
+        assert_eq!(*restarted.active_epoch.read().await, None);
+        assert!(
+            restarted.proactive_refresh_schedule.lock().await.is_none(),
+            "shareless source member was misclassified as a target-only joiner"
+        );
+    }
+
+    #[tokio::test]
+    async fn pending_genesis_schedule_survives_crash_before_activation_certificate() {
+        let local = PartyId(1);
+        let signing_seed = historical_replay_seed(local);
+        let bootstrap_x25519_secret = historical_replay_x25519_secret(local, 0);
+        let scenario = proactive_refresh_scenario();
+        let state = tempfile::tempdir().unwrap();
+
+        let source = PartyServer::new(
+            local,
+            scenario.clone(),
+            state.path().join("source"),
+            &signing_seed,
+            &bootstrap_x25519_secret,
+        )
+        .await
+        .unwrap();
+        let share = proactive_epoch_zero_share(&scenario, local);
+        install_proactive_epoch_zero(&source, &share).await;
+        let (_, activation, _) = historical_epoch_catchup_bundle(&source, 0).await;
+        let record: ActivationCertificateRecord = decode_postcard_exact(&activation).unwrap();
+        let request = ActivateEpochRequest {
+            transition: record.transition.clone(),
+            value: record.value.clone(),
+            acknowledgements: record.acknowledgements,
+        };
+
+        let target_state = state.path().join("target");
+        let target = PartyServer::new(
+            local,
+            scenario.clone(),
+            &target_state,
+            &signing_seed,
+            &bootstrap_x25519_secret,
+        )
+        .await
+        .unwrap();
+        let response = target
+            .stage(request.transition.clone(), share, request.value.avss_transcript_digest)
+            .await
+            .unwrap();
+        let mut run = new_avss_run(&target, request.transition.clone()).unwrap();
+        run.finalized = Some(response);
+        target.persist_avss_run(&run).await.unwrap();
+        target.avss.lock().await.insert(request.transition.session, run);
+
+        // Model a power loss after the verified activation evidence and fixed deadline are durable,
+        // but before the public activation certificate/history CAS begins.
+        target.persist_pending_activation_authority(&request).await.unwrap();
+        let armed_at = unix_time_millis().unwrap();
+        target
+            .arm_proactive_refresh_for_pending_activation(&request.value, armed_at)
+            .await
+            .unwrap();
+        let expected_due = armed_at + scenario.proactive_refresh_interval_seconds * 1_000;
+        assert_eq!(
+            target.proactive_refresh_schedule.lock().await.as_ref().unwrap().due_unix_ms,
+            Some(expected_due)
+        );
+        assert_eq!(
+            target.proactive_refresh_schedule.lock().await.as_ref().unwrap().phase,
+            ProactiveRefreshSchedulePhase::PendingActivation
+        );
+        assert!(
+            !tokio::fs::try_exists(
+                target.protocol_store.activation_certificate_path(
+                    request.value.epoch,
+                    request.value.activation_digest
+                )
+            )
+            .await
+            .unwrap(),
+            "activation certificate crossed the modeled pre-certificate crash boundary"
+        );
+        drop(target);
+
+        let restarted = PartyServer::new(
+            local,
+            scenario.clone(),
+            &target_state,
+            &signing_seed,
+            &bootstrap_x25519_secret,
+        )
+        .await
+        .unwrap();
+        assert_eq!(*restarted.active_epoch.read().await, None);
+        assert_eq!(
+            restarted.proactive_refresh_schedule.lock().await.as_ref().unwrap().due_unix_ms,
+            Some(expected_due),
+            "restart moved the authenticated pre-certificate refresh deadline"
+        );
+        assert_eq!(
+            restarted.proactive_refresh_schedule.lock().await.as_ref().unwrap().phase,
+            ProactiveRefreshSchedulePhase::PendingActivation
+        );
+        let completion_started = unix_time_millis().unwrap();
+        restarted
+            .progress_protocols(expected_due + 1, std::time::Duration::from_millis(10))
+            .await
+            .unwrap();
+        assert_eq!(*restarted.active_epoch.read().await, Some(0));
+        let armed = restarted.proactive_refresh_schedule.lock().await.clone().unwrap();
+        assert_eq!(armed.phase, ProactiveRefreshSchedulePhase::Armed);
+        assert!(
+            armed.due_unix_ms.unwrap()
+                >= completion_started + scenario.proactive_refresh_interval_seconds * 1_000,
+            "durable activation did not re-arm a complete successor interval"
+        );
+    }
+
+    #[tokio::test]
+    async fn activation_write_ahead_recovers_before_schedule_and_after_certificate_cas() {
+        let local = PartyId(1);
+        let signing_seed = historical_replay_seed(local);
+        let bootstrap_x25519_secret = historical_replay_x25519_secret(local, 0);
+        let scenario = proactive_refresh_scenario();
+        let state = tempfile::tempdir().unwrap();
+
+        let source = PartyServer::new(
+            local,
+            scenario.clone(),
+            state.path().join("source"),
+            &signing_seed,
+            &bootstrap_x25519_secret,
+        )
+        .await
+        .unwrap();
+        let share = proactive_epoch_zero_share(&scenario, local);
+        install_proactive_epoch_zero(&source, &share).await;
+        let (_, activation, _) = historical_epoch_catchup_bundle(&source, 0).await;
+        let record: ActivationCertificateRecord = decode_postcard_exact(&activation).unwrap();
+        let request = ActivateEpochRequest {
+            transition: record.transition,
+            value: record.value,
+            acknowledgements: record.acknowledgements,
+        };
+
+        // Cut one: verified n-f evidence is durable, but no deadline or public certificate exists.
+        let before_schedule_state = state.path().join("before-schedule");
+        let before_schedule = PartyServer::new(
+            local,
+            scenario.clone(),
+            &before_schedule_state,
+            &signing_seed,
+            &bootstrap_x25519_secret,
+        )
+        .await
+        .unwrap();
+        let response = before_schedule
+            .stage(request.transition.clone(), share.clone(), request.value.avss_transcript_digest)
+            .await
+            .unwrap();
+        let mut run = new_avss_run(&before_schedule, request.transition.clone()).unwrap();
+        run.finalized = Some(response);
+        before_schedule.persist_avss_run(&run).await.unwrap();
+        before_schedule.avss.lock().await.insert(request.transition.session, run);
+        before_schedule.persist_pending_activation_authority(&request).await.unwrap();
+        assert!(before_schedule.proactive_refresh_schedule.lock().await.is_none());
+        drop(before_schedule);
+
+        let recovered_before_schedule = PartyServer::new(
+            local,
+            scenario.clone(),
+            &before_schedule_state,
+            &signing_seed,
+            &bootstrap_x25519_secret,
+        )
+        .await
+        .unwrap();
+        assert_eq!(*recovered_before_schedule.active_epoch.read().await, None);
+        recovered_before_schedule
+            .progress_protocols(unix_time_millis().unwrap(), std::time::Duration::from_millis(10))
+            .await
+            .unwrap();
+        assert_eq!(*recovered_before_schedule.active_epoch.read().await, Some(0));
+        assert!(recovered_before_schedule.proactive_refresh_schedule.lock().await.is_some());
+
+        // Cut three: evidence, deadline, and public certificate/history are durable, while the
+        // process has not yet installed the matching share into its in-memory signing set.
+        let after_certificate_state = state.path().join("after-certificate");
+        let after_certificate = PartyServer::new(
+            local,
+            scenario.clone(),
+            &after_certificate_state,
+            &signing_seed,
+            &bootstrap_x25519_secret,
+        )
+        .await
+        .unwrap();
+        let response = after_certificate
+            .stage(request.transition.clone(), share, request.value.avss_transcript_digest)
+            .await
+            .unwrap();
+        let mut run = new_avss_run(&after_certificate, request.transition.clone()).unwrap();
+        run.finalized = Some(response);
+        after_certificate.persist_avss_run(&run).await.unwrap();
+        after_certificate.avss.lock().await.insert(request.transition.session, run);
+        after_certificate.persist_pending_activation_authority(&request).await.unwrap();
+        let armed_at = unix_time_millis().unwrap();
+        after_certificate
+            .arm_proactive_refresh_for_pending_activation(&request.value, armed_at)
+            .await
+            .unwrap();
+        let expected_due = armed_at + scenario.proactive_refresh_interval_seconds * 1_000;
+        assert_eq!(
+            after_certificate.proactive_refresh_schedule.lock().await.as_ref().unwrap().phase,
+            ProactiveRefreshSchedulePhase::PendingActivation
+        );
+        after_certificate
+            .persist_activation_certificate(
+                &request.transition,
+                &request.value,
+                &request.acknowledgements,
+            )
+            .await
+            .unwrap();
+        assert_eq!(*after_certificate.active_epoch.read().await, None);
+        drop(after_certificate);
+
+        let restart_started = unix_time_millis().unwrap();
+        let recovered_after_certificate = PartyServer::new(
+            local,
+            scenario.clone(),
+            &after_certificate_state,
+            &signing_seed,
+            &bootstrap_x25519_secret,
+        )
+        .await
+        .unwrap();
+        assert_eq!(*recovered_after_certificate.active_epoch.read().await, Some(0));
+        let recovered_schedule =
+            recovered_after_certificate.proactive_refresh_schedule.lock().await.clone().unwrap();
+        assert_eq!(recovered_schedule.phase, ProactiveRefreshSchedulePhase::Armed);
+        assert!(
+            recovered_schedule.due_unix_ms.unwrap()
+                >= restart_started + scenario.proactive_refresh_interval_seconds * 1_000,
+            "certificate-first restart did not re-arm a complete successor interval"
+        );
+        assert!(recovered_schedule.due_unix_ms.unwrap() >= expected_due);
+    }
+
+    #[tokio::test]
+    async fn certified_activation_rearms_pending_deadline_once_from_local_completion_time() {
+        let local = PartyId(1);
+        let signing_seed = historical_replay_seed(local);
+        let bootstrap_x25519_secret = historical_replay_x25519_secret(local, 0);
+        let scenario = proactive_refresh_scenario();
+        let state = tempfile::tempdir().unwrap();
+
+        let source = PartyServer::new(
+            local,
+            scenario.clone(),
+            state.path().join("source"),
+            &signing_seed,
+            &bootstrap_x25519_secret,
+        )
+        .await
+        .unwrap();
+        let share = proactive_epoch_zero_share(&scenario, local);
+        install_proactive_epoch_zero(&source, &share).await;
+        let (_, activation, _) = historical_epoch_catchup_bundle(&source, 0).await;
+        let record: ActivationCertificateRecord = decode_postcard_exact(&activation).unwrap();
+        let request = ActivateEpochRequest {
+            transition: record.transition,
+            value: record.value,
+            acknowledgements: record.acknowledgements,
+        };
+
+        let target = PartyServer::new(
+            local,
+            scenario.clone(),
+            state.path().join("target"),
+            &signing_seed,
+            &bootstrap_x25519_secret,
+        )
+        .await
+        .unwrap();
+        let response = target
+            .stage(request.transition.clone(), share, request.value.avss_transcript_digest)
+            .await
+            .unwrap();
+        let mut run = new_avss_run(&target, request.transition.clone()).unwrap();
+        run.finalized = Some(response);
+        target.persist_avss_run(&run).await.unwrap();
+        target.avss.lock().await.insert(request.transition.session, run);
+        target.persist_pending_activation_authority(&request).await.unwrap();
+
+        const PENDING_AT: u64 = 10_000;
+        const COMPLETED_AT: u64 = 50_000;
+        const COMPLETED_DUE: u64 = COMPLETED_AT + 1_000;
+        target
+            .arm_proactive_refresh_for_pending_activation(&request.value, PENDING_AT)
+            .await
+            .unwrap();
+        let mut pending = target.proactive_refresh_schedule.lock().await.clone().unwrap();
+        pending.rotation_certificate_delivered_through.insert(PartyId(2), 1);
+        target.persist_proactive_refresh_schedule(pending).await.unwrap();
+
+        target
+            .persist_activation_certificate(
+                &request.transition,
+                &request.value,
+                &request.acknowledgements,
+            )
+            .await
+            .unwrap();
+        target.complete_proactive_refresh_activation(&request.value, COMPLETED_AT).await.unwrap();
+        let armed = target.proactive_refresh_schedule.lock().await.clone().unwrap();
+        assert_eq!(armed.phase, ProactiveRefreshSchedulePhase::Armed);
+        assert_eq!(armed.due_unix_ms, Some(COMPLETED_DUE));
+        assert_eq!(armed.rotation_certificate_delivered_through.get(&PartyId(2)), Some(&1));
+        assert!(
+            target
+                .ensure_key_rotation_started(&request.value.public, COMPLETED_DUE)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("source share is not active"),
+            "an Armed-but-staged source started receiver-key rotation"
+        );
+
+        // Model cancellation immediately after the Armed schedule CAS but before the staged share
+        // is consumed. Hold the independently retryable deposit-metadata lock to prove that the
+        // core share linearization no longer waits behind it. Cancellation after the share moves
+        // active must leave an idempotent retry which repairs the derived metadata without moving
+        // the already armed deadline.
+        let metadata_fence = target.deposit_targets.write().await;
+        let cut_target = target.clone();
+        let cut_request = request.clone();
+        let cut =
+            tokio::spawn(async move { activate_epoch(State(cut_target), Json(cut_request)).await });
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if *target.active_epoch.read().await == Some(request.value.epoch)
+                    && !target.staged.read().await.contains_key(&request.value.epoch)
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("deposit metadata lock blocked the active-share linearization point");
+        assert!(
+            !cut.is_finished(),
+            "activation unexpectedly published deposit metadata through the held fence"
+        );
+        cut.abort();
+        assert!(cut.await.unwrap_err().is_cancelled());
+        drop(metadata_fence);
+        assert!(
+            !target.deposit_targets.read().await.contains_key(&request.value.epoch),
+            "cancelled post-linearization activation published deposit metadata"
+        );
+
+        // The ordinary activation retry re-enters through the already-active branch; the exact
+        // durable certificate must make schedule handling an idempotent no-op and reconstruct the
+        // missing portable target bindings without requiring a process restart.
+        let _installed =
+            activate_epoch(State(target.clone()), Json(request.clone())).await.unwrap();
+        assert_eq!(*target.active_epoch.read().await, Some(request.value.epoch));
+        assert_eq!(
+            target.deposit_targets.read().await.get(&request.value.epoch),
+            Some(&request.value.public)
+        );
+        assert_eq!(
+            target.deposit_target_roots.read().await.get(&request.value.epoch).copied(),
+            Some(request.value.history_link.root().unwrap())
+        );
+        assert_eq!(
+            target.proactive_refresh_schedule.lock().await.clone(),
+            Some(armed.clone()),
+            "a live activation retry moved the already armed successor deadline"
+        );
+
+        target
+            .complete_proactive_refresh_activation(&request.value, COMPLETED_AT + 500_000)
+            .await
+            .unwrap();
+        assert_eq!(
+            target.proactive_refresh_schedule.lock().await.clone(),
+            Some(armed),
+            "an activation retry moved the already armed successor deadline"
+        );
+    }
+
+    #[tokio::test]
+    async fn certified_observer_without_a_staged_share_remains_passive() {
+        let local = PartyId(6);
+        let mut scenario = activation_witness_scenario();
+        scenario.parties.push(activation_witness_extra_party(local));
+        scenario.validate().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let server = PartyServer::new(
+            local,
+            scenario.clone(),
+            state.path(),
+            &historical_replay_seed(local),
+            None,
+        )
+        .await
+        .unwrap();
+        let transition = canonical_dkg_transition(&scenario).unwrap();
+        let public = proactive_epoch_zero_share(&scenario, PartyId(1)).public();
+        let activation_digest = public.activation_digest().unwrap();
+        let value = ActivationValue {
+            epoch: 0,
+            activation_digest,
+            public,
+            avss_transcript_digest: [0xD6; 32],
+            history_link: EpochHistoryLink::new(
+                scenario.quic_network_id().unwrap(),
+                transition.key_id,
+                0,
+                transition.history_parent.root(),
+                avss_transition_digest(&transition).unwrap(),
+                activation_digest,
+                [0xD6; 32],
+                scenario
+                    .bootstrap_receiver_key_accumulator(scenario.quic_network_id().unwrap())
+                    .unwrap(),
+                None,
+            )
+            .unwrap(),
+        };
+        let payload =
+            postcard::to_allocvec(&activation_statement(&value, transition.session)).unwrap();
+        let acknowledgements = transition
+            .target
+            .members
+            .iter()
+            .map(|member| {
+                Identity::from_test_secrets(
+                    member.id,
+                    0,
+                    &historical_replay_seed(member.id),
+                    historical_replay_x25519_secret(member.id, 0),
+                )
+                .unwrap()
+                .sign_envelope(
+                    &transition.target,
+                    transition.session,
+                    None,
+                    activation_sequence(0),
+                    payload.clone(),
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+
+        server
+            .persist_activation_certificate(&transition, &value, &acknowledgements)
+            .await
+            .unwrap();
+        assert!(server.staged.read().await.is_empty());
+
+        server.progress_protocols(1, std::time::Duration::from_millis(10)).await.unwrap();
+
+        assert_eq!(*server.active_epoch.read().await, None);
+        assert!(server.epochs.read().await.is_empty());
+        assert!(
+            server.staged.read().await.is_empty(),
+            "public certificate observation manufactured a local threshold share"
+        );
     }
 
     #[test]
@@ -12809,6 +22523,370 @@ mod tests {
         assert_eq!(restored.pending_avss.get(&pending_key), Some(&pending_wire));
     }
 
+    #[tokio::test]
+    async fn retirement_avss_scan_excludes_every_acceptance_record_and_rejects_unknown_state() {
+        let local = PartyId(1);
+        let scenario = proactive_refresh_scenario();
+        let state = tempfile::tempdir().unwrap();
+        let server = PartyServer::new(
+            local,
+            scenario.clone(),
+            state.path(),
+            &historical_replay_seed(local),
+            &historical_replay_x25519_secret(local, 0),
+        )
+        .await
+        .unwrap();
+        let network = scenario.quic_network_id().unwrap();
+        for (key, bytes) in [
+            (
+                acceptance_consolidation_gate_storage_key(network, local).unwrap(),
+                postcard::to_allocvec(&AcceptanceConsolidationGate::default()).unwrap(),
+            ),
+            (
+                acceptance_consolidation_bootstrap_gate_storage_key(network, local).unwrap(),
+                postcard::to_allocvec(&AcceptanceConsolidationBootstrapGate::default()).unwrap(),
+            ),
+            (
+                acceptance_protocol_fault_gate_storage_key(network, local).unwrap(),
+                postcard::to_allocvec(&AcceptanceProtocolFaultGate::default()).unwrap(),
+            ),
+            (
+                acceptance_driver_latch_storage_key(network, local).unwrap(),
+                postcard::to_allocvec(&AcceptanceDriverLatch::default()).unwrap(),
+            ),
+            (
+                acceptance_deposit_checkpoint_gate_storage_key(network, local).unwrap(),
+                postcard::to_allocvec(&AcceptanceDepositCheckpointGate::default()).unwrap(),
+            ),
+        ] {
+            server
+                .protocol_store
+                .save_session_state(key.0, key.1, &bytes, &mut OsRng)
+                .await
+                .unwrap();
+        }
+        server.assert_retiring_epoch_avss_secret_compacted(0).await.unwrap();
+        server
+            .protocol_store
+            .save_session_state(SessionId([0x91; 32]), [0x92; 32], &[0xFF], &mut OsRng)
+            .await
+            .unwrap();
+        assert!(server.assert_retiring_epoch_avss_secret_compacted(0).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn durable_certificate_preserves_unfinalized_local_target_until_its_own_finalization() {
+        let local = PartyId(1);
+        let scenario = proactive_refresh_scenario();
+        let state = tempfile::tempdir().unwrap();
+        let server = PartyServer::new(
+            local,
+            scenario.clone(),
+            state.path(),
+            &historical_replay_seed(local),
+            &historical_replay_x25519_secret(local, 0),
+        )
+        .await
+        .unwrap();
+        let transition = canonical_dkg_transition(&scenario).unwrap();
+        let run = new_avss_run(&server, transition.clone()).unwrap();
+        server.persist_avss_run(&run).await.unwrap();
+        server.avss.lock().await.insert(transition.session, run);
+
+        // Model this target falling behind while the first n-f targets publish the permanent
+        // activation certificate. Global activation is not proof that this replica reconstructed
+        // and staged its own share.
+        let public = proactive_epoch_zero_share(&scenario, local).public();
+        let certificate = historical_activation_request(
+            &transition,
+            public,
+            0xB7,
+            server.receiver_keys.read().unwrap().commitment(),
+            None,
+        );
+        server
+            .persist_activation_certificate(
+                &certificate.transition,
+                &certificate.value,
+                &certificate.acknowledgements,
+            )
+            .await
+            .unwrap();
+        assert!(server.transition_has_durable_activation_certificate(&transition).await.unwrap());
+        let behind = server.protocol_session_status(transition.session).await.unwrap();
+        assert!(!behind.finalized);
+        assert!(!behind.secret_compacted);
+        {
+            let certified = server.certified_avss_sessions.read().await;
+            let runs = server.avss.lock().await;
+            assert!(
+                !avss_run_is_certificate_terminal(
+                    local,
+                    transition.session,
+                    runs.get(&transition.session).unwrap(),
+                    &certified,
+                )
+                .unwrap(),
+                "the autonomous pacemaker would skip a certified but unfinalized local target"
+            );
+        }
+        assert!(
+            !server.compact_certified_avss_transition(&transition).await.unwrap(),
+            "certificate compacted a target reducer before local finalization"
+        );
+        assert!(
+            !server.retire_transition_session_if_drained(&transition).await.unwrap(),
+            "certificate retired a target reducer before local finalization"
+        );
+        assert!(server.avss.lock().await.contains_key(&transition.session));
+        assert!(
+            !tokio::fs::try_exists(
+                server.protocol_store.session_tombstone_path(transition.session)
+            )
+            .await
+            .unwrap()
+        );
+
+        let mut finalized = server.avss.lock().await.get(&transition.session).unwrap().clone();
+        finalized.finalized = Some(InstallResponse {
+            party: local,
+            epoch: certificate.value.epoch,
+            public: certificate.value.public.clone(),
+            activation_digest: certificate.value.activation_digest,
+            avss_transcript_digest: certificate.value.avss_transcript_digest,
+            history_link: certificate.value.history_link,
+        });
+        server.persist_avss_run(&finalized).await.unwrap();
+        server.avss.lock().await.insert(transition.session, finalized);
+
+        assert!(
+            server.compact_certified_avss_transition(&transition).await.unwrap(),
+            "locally finalized target reducer was not compacted"
+        );
+        let compacted = server.protocol_session_status(transition.session).await.unwrap();
+        assert!(compacted.finalized);
+        assert!(compacted.secret_compacted);
+        assert!(
+            server.retire_transition_session_if_drained(&transition).await.unwrap(),
+            "drained, locally finalized target reducer was not retired"
+        );
+        assert!(!server.avss.lock().await.contains_key(&transition.session));
+        assert!(
+            tokio::fs::try_exists(server.protocol_store.session_tombstone_path(transition.session))
+                .await
+                .unwrap()
+        );
+    }
+
+    async fn commit_successor_over_unfinalized_predecessor(
+        server: &Arc<PartyServer>,
+        scenario: &Scenario,
+        keep_predecessor_live: bool,
+    ) -> (AvssTransition, ActivateEpochRequest, AvssSuccessorSupersession) {
+        let predecessor = canonical_dkg_transition(scenario).unwrap();
+        let predecessor_public = proactive_epoch_zero_share(scenario, server.party).public();
+        let mut predecessor_certificate = historical_activation_request(
+            &predecessor,
+            predecessor_public.clone(),
+            0xB8,
+            server.receiver_keys.read().unwrap().commitment(),
+            None,
+        );
+        predecessor_certificate
+            .acknowledgements
+            .retain(|acknowledgement| acknowledgement.from != server.party);
+        server
+            .persist_activation_certificate(
+                &predecessor,
+                &predecessor_certificate.value,
+                &predecessor_certificate.acknowledgements,
+            )
+            .await
+            .unwrap();
+
+        // This party is outside the first activation quorum's completed local reducers. The exact
+        // predecessor snapshot remains its only authenticated path to reconstruct the certified
+        // share.
+        let predecessor_run = new_avss_run(server, predecessor.clone()).unwrap();
+        server.persist_avss_run(&predecessor_run).await.unwrap();
+        if keep_predecessor_live {
+            server.avss.lock().await.insert(predecessor.session, predecessor_run);
+        }
+
+        let (rotation_context, rotation_certificate, target) = install_historical_key_rotation(
+            server,
+            &predecessor_public,
+            &[PartyId(1), PartyId(2), PartyId(3), PartyId(4), PartyId(5)],
+            &[PartyId(1), PartyId(2), PartyId(3), PartyId(4)],
+        )
+        .await;
+        let successor = server
+            .configured_proactive_refresh_transition(&predecessor_public)
+            .unwrap()
+            .expect("certified receiver-key rotation must define the successor transition");
+        let mut successor_public = predecessor_public;
+        successor_public.committee = target;
+        successor_public.validate().unwrap();
+        let mut successor_certificate = historical_activation_request(
+            &successor,
+            successor_public,
+            0xB9,
+            rotation_certificate.resulting_receiver_keys(&rotation_context).unwrap(),
+            Some(rotation_certificate.semantic_digest(&rotation_context).unwrap()),
+        );
+        successor_certificate
+            .acknowledgements
+            .retain(|acknowledgement| acknowledgement.from != server.party);
+        server
+            .persist_activation_certificate(
+                &successor,
+                &successor_certificate.value,
+                &successor_certificate.acknowledgements,
+            )
+            .await
+            .unwrap();
+
+        let history = server.epoch_history.read().await.clone();
+        let (successor_entry, _) =
+            server.epoch_history_entry(&history, 1).await.unwrap().expect("successor history");
+        let closure =
+            successor_entry.predecessor_supersession().expect("successor omitted AVSS closure");
+        assert_eq!(closure.predecessor_transition(), avss_transition_digest(&predecessor).unwrap());
+        (predecessor, predecessor_certificate, closure)
+    }
+
+    #[tokio::test]
+    async fn successor_supersession_waits_for_live_local_target_finalization_before_cleanup() {
+        let local = PartyId(1);
+        let scenario = proactive_refresh_scenario();
+        let state = tempfile::tempdir().unwrap();
+        let server = PartyServer::new(
+            local,
+            scenario.clone(),
+            state.path(),
+            &historical_replay_seed(local),
+            &historical_replay_x25519_secret(local, 0),
+        )
+        .await
+        .unwrap();
+        let (predecessor, predecessor_certificate, closure) =
+            commit_successor_over_unfinalized_predecessor(&server, &scenario, true).await;
+        let state_path = server
+            .protocol_store
+            .session_state_path(predecessor.session, avss_transition_digest(&predecessor).unwrap());
+        let tombstone_path = server.protocol_store.session_tombstone_path(predecessor.session);
+
+        assert!(server.avss.lock().await.contains_key(&predecessor.session));
+        assert!(tokio::fs::try_exists(&state_path).await.unwrap());
+        assert!(
+            !tokio::fs::try_exists(&tombstone_path).await.unwrap(),
+            "a later history certificate tombstoned this target's unfinished reducer"
+        );
+
+        let mut finalized = server.avss.lock().await.get(&predecessor.session).unwrap().clone();
+        finalized.finalized = Some(InstallResponse {
+            party: local,
+            epoch: predecessor_certificate.value.epoch,
+            public: predecessor_certificate.value.public.clone(),
+            activation_digest: predecessor_certificate.value.activation_digest,
+            avss_transcript_digest: predecessor_certificate.value.avss_transcript_digest,
+            history_link: predecessor_certificate.value.history_link,
+        });
+        server.persist_avss_run(&finalized).await.unwrap();
+        server.avss.lock().await.insert(predecessor.session, finalized);
+        server.close_superseded_avss_transition(closure).await.unwrap();
+
+        assert!(!server.avss.lock().await.contains_key(&predecessor.session));
+        assert!(!tokio::fs::try_exists(&state_path).await.unwrap());
+        let tombstone =
+            server.protocol_store.load_session_tombstone(predecessor.session).await.unwrap();
+        assert_eq!(tombstone.purpose(), superseded_avss_tombstone_purpose(closure).unwrap());
+    }
+
+    #[tokio::test]
+    async fn successor_supersession_preserves_disk_only_local_target_reducer_across_restart() {
+        let local = PartyId(1);
+        let scenario = proactive_refresh_scenario();
+        let state = tempfile::tempdir().unwrap();
+        let signing_seed = historical_replay_seed(local);
+        let bootstrap_secret = historical_replay_x25519_secret(local, 0);
+        let server = PartyServer::new(
+            local,
+            scenario.clone(),
+            state.path(),
+            &signing_seed,
+            &bootstrap_secret,
+        )
+        .await
+        .unwrap();
+        let (predecessor, _, _) =
+            commit_successor_over_unfinalized_predecessor(&server, &scenario, false).await;
+        let context = avss_transition_digest(&predecessor).unwrap();
+        let state_path = server.protocol_store.session_state_path(predecessor.session, context);
+        let tombstone_path = server.protocol_store.session_tombstone_path(predecessor.session);
+
+        assert!(!server.avss.lock().await.contains_key(&predecessor.session));
+        assert!(tokio::fs::try_exists(&state_path).await.unwrap());
+        assert!(
+            !tokio::fs::try_exists(&tombstone_path).await.unwrap(),
+            "certificate replay ordering tombstoned a disk-only unfinished reducer"
+        );
+        drop(server);
+
+        let restarted =
+            boxed_party_server_new(local, scenario, state.path(), &signing_seed, &bootstrap_secret)
+                .await
+                .unwrap();
+        let restored = restarted.protocol_session_status(predecessor.session).await.unwrap();
+        assert!(!restored.finalized);
+        assert!(!restored.secret_compacted);
+        assert!(restarted.avss.lock().await.contains_key(&predecessor.session));
+        assert!(tokio::fs::try_exists(&state_path).await.unwrap());
+        assert!(!tokio::fs::try_exists(&tombstone_path).await.unwrap());
+    }
+
+    #[test]
+    fn durable_certificate_is_terminal_for_a_source_only_reshare_dealer() {
+        let scenario = activation_witness_scenario();
+        let old = proactive_epoch_zero_share(&scenario, PartyId(4)).public();
+        let mut target = old.committee.clone();
+        target.epoch = 1;
+        target.members.retain(|member| member.id != PartyId(4));
+        target.validate().unwrap();
+        let transition = AvssTransition {
+            purpose: DealPurpose::Reshare,
+            session: SessionId([0xB8; 32]),
+            key_id: old.key_id,
+            fault_bound: 0,
+            history_parent: EpochHistoryParent::genesis(
+                scenario.quic_network_id().unwrap(),
+                old.key_id,
+            )
+            .unwrap(),
+            old: Some(old.clone()),
+            target,
+            eligible_dealers: old.committee.members.iter().map(|member| member.id).collect(),
+        };
+        let mut run = new_avss_run_for_test(transition.clone());
+        // Party 4 is an old-only dealer and therefore owns no target QUAL/finalization reducer.
+        run.qual = None;
+        let certified =
+            BTreeMap::from([(transition.session, avss_transition_digest(&transition).unwrap())]);
+        assert!(transition.old.as_ref().unwrap().committee.member(PartyId(4)).is_ok());
+        assert!(transition.target.member(PartyId(4)).is_err());
+        assert!(
+            avss_run_is_certificate_terminal(PartyId(4), transition.session, &run, &certified,)
+                .unwrap()
+        );
+
+        let runs = BTreeMap::from([(transition.session, run)]);
+        let mut candidate = transition.clone();
+        candidate.session = SessionId([0xB9; 32]);
+        ensure_avss_live_capacity(PartyId(4), &runs, &certified, &candidate, 1)
+            .expect("a certified source-only dealer must not consume a live reducer slot");
+    }
+
     #[test]
     fn certified_catch_up_runs_do_not_consume_the_live_avss_bound() {
         let target = committee(0, 4, 2);
@@ -12867,29 +22945,53 @@ mod tests {
             certified_candidate.session,
             avss_transition_digest(&certified_candidate).unwrap(),
         );
-        ensure_avss_live_capacity(&runs, &certified, &certified_candidate, MAX_LIVE_AVSS_RUNS)
-            .expect("a certified late-catch-up run does not need a live reducer slot");
+        ensure_avss_live_capacity(
+            PartyId(5),
+            &runs,
+            &certified,
+            &certified_candidate,
+            MAX_LIVE_AVSS_RUNS,
+        )
+        .expect("a certified late-catch-up run does not need a live reducer slot");
 
         let live_candidate = make_run(4, 0).transition;
         assert!(
-            ensure_avss_live_capacity(&runs, &certified, &live_candidate, MAX_LIVE_AVSS_RUNS,)
-                .unwrap_err()
-                .to_string()
-                .contains("too many live AVSS sessions")
+            ensure_avss_live_capacity(
+                PartyId(5),
+                &runs,
+                &certified,
+                &live_candidate,
+                MAX_LIVE_AVSS_RUNS,
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("too many live AVSS sessions")
         );
 
         let removed_live = make_run(2, 0).transition.session;
         runs.remove(&removed_live).unwrap();
-        ensure_avss_live_capacity(&runs, &certified, &live_candidate, MAX_LIVE_AVSS_RUNS)
-            .expect("one freed live slot admits one uncertified reducer");
+        ensure_avss_live_capacity(
+            PartyId(5),
+            &runs,
+            &certified,
+            &live_candidate,
+            MAX_LIVE_AVSS_RUNS,
+        )
+        .expect("one freed live slot admits one uncertified reducer");
 
         let certified_session = make_run(1, 0).transition.session;
         certified.get_mut(&certified_session).unwrap()[0] ^= 1;
         assert!(
-            ensure_avss_live_capacity(&runs, &certified, &live_candidate, MAX_LIVE_AVSS_RUNS,)
-                .unwrap_err()
-                .to_string()
-                .contains("bound to another transition")
+            ensure_avss_live_capacity(
+                PartyId(5),
+                &runs,
+                &certified,
+                &live_candidate,
+                MAX_LIVE_AVSS_RUNS,
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("bound to another transition")
         );
     }
 
@@ -12959,7 +23061,13 @@ mod tests {
         assert!(qual_round_expired(10_000, 11_000, 1_000));
         assert_eq!(qual_backoff_timeout_ms(1_000, 0), 1_000);
         assert_eq!(qual_backoff_timeout_ms(1_000, 3), 8_000);
-        assert_eq!(qual_backoff_timeout_ms(1_000, u8::MAX), MAX_QUAL_BACKOFF_TIMEOUT_MS);
+    }
+
+    #[test]
+    fn qual_pacemaker_backoff_grows_past_an_hour_and_only_saturates_at_u64() {
+        assert_eq!(qual_backoff_timeout_ms(1_000, 13), 8_192_000);
+        assert_eq!(qual_backoff_timeout_ms((u64::MAX / 2) + 1, 1), u64::MAX);
+        assert_eq!(qual_backoff_timeout_ms(2, u8::MAX), u64::MAX);
     }
 
     #[test]
@@ -13133,6 +23241,32 @@ mod tests {
 
     #[test]
     fn quic_rejections_distinguish_ordering_from_terminal_effects() {
+        let missing_index_object = DepositIndexObjectId::from_storage_reference(
+            WalletArtifactRef::for_contents(
+                WalletId([0xd1; 32]),
+                DEPOSIT_INDEX_ARTIFACT_KIND,
+                b"missing index object",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        for error in [
+            DepositServiceError::DepositIndex(DepositIndexError::MissingObject(
+                missing_index_object,
+            )),
+            DepositServiceError::DepositIndexCheckpoint(DepositIndexCheckpointError::DepositIndex(
+                DepositIndexError::MissingObject(missing_index_object),
+            )),
+            DepositServiceError::DepositIndexStore(DepositIndexStoreError::Index(
+                DepositIndexError::MissingObject(missing_index_object),
+            )),
+        ] {
+            assert!(matches!(
+                quic_peer_rejection(error.into()),
+                PeerResponse::Rejected { code: RejectionCode::Internal, retryable: true, .. }
+            ));
+        }
+
         let not_certified = quic_peer_rejection(anyhow::anyhow!(
             "dealer 3 has not locally completed the named AVSS instance"
         ));
@@ -13156,6 +23290,16 @@ mod tests {
             quic_peer_rejection(anyhow::anyhow!("zero refresh is not due yet")),
             PeerResponse::Rejected { code: RejectionCode::Unavailable, retryable: true, .. }
         ));
+        for message in [
+            "deposit genesis preparation crossed an epoch activation",
+            "certified epoch history changed during deposit genesis preparation",
+            "durable deposit registry changed during genesis preparation",
+        ] {
+            assert!(matches!(
+                quic_peer_rejection(anyhow::anyhow!(message)),
+                PeerResponse::Rejected { code: RejectionCode::Unavailable, retryable: true, .. }
+            ));
+        }
 
         for message in [
             "message is from stale round 4; current round is 5",
@@ -13169,6 +23313,7 @@ mod tests {
         }
 
         for error in [
+            DepositServiceError::ColdImportAwaitingCertificate,
             DepositServiceError::HandoffPending,
             DepositServiceError::ConsolidationNotPortable,
             DepositServiceError::ConsolidationNotCertified,
@@ -13179,15 +23324,47 @@ mod tests {
             DepositServiceError::Consensus(ConsensusError::FutureView { message: 2, current: 1 }),
             DepositServiceError::Ledger(LedgerError::TerminalAdmissionRequired),
             DepositServiceError::Worker(DepositWorkerError::AllocationBackfillRequired),
+            DepositServiceError::Worker(DepositWorkerError::DepositObservationAheadOfScanner {
+                local_height: 11,
+                required_height: 12,
+            }),
+            DepositServiceError::DepositObservationAheadOfPortableIndex {
+                local_sequence: 7,
+                required_sequence: 8,
+            },
         ] {
             assert!(matches!(
                 quic_peer_rejection(error.into()),
                 PeerResponse::Rejected { code: RejectionCode::Unavailable, retryable: true, .. }
             ));
         }
+        for error in [
+            DepositServiceError::InvalidDepositIndexCheckpoint,
+            DepositServiceError::InvalidCompactRegistryCheckpoint,
+            DepositServiceError::InvalidArchiveHead,
+        ] {
+            assert!(matches!(
+                quic_peer_rejection(retryable_local_deposit_sync_read(error).into()),
+                PeerResponse::Rejected { code: RejectionCode::Internal, retryable: true, .. }
+            ));
+        }
+        assert!(matches!(
+            quic_peer_rejection(DepositServiceError::InvalidDepositIndexCheckpoint.into()),
+            PeerResponse::Rejected { code: RejectionCode::InvalidRequest, retryable: false, .. }
+        ));
 
         assert!(matches!(
             quic_peer_rejection(DepositServiceError::InvalidPeerMessage.into()),
+            PeerResponse::Rejected { code: RejectionCode::InvalidRequest, retryable: false, .. }
+        ));
+        assert!(matches!(
+            quic_peer_rejection(
+                DepositServiceError::Worker(DepositWorkerError::InvalidDepositObservation).into()
+            ),
+            PeerResponse::Rejected { code: RejectionCode::InvalidRequest, retryable: false, .. }
+        ));
+        assert!(matches!(
+            quic_peer_rejection(DepositServiceError::UnknownDepositAddress.into()),
             PeerResponse::Rejected { code: RejectionCode::InvalidRequest, retryable: false, .. }
         ));
         assert!(matches!(
@@ -13210,6 +23387,113 @@ mod tests {
             quic_peer_rejection(DepositServiceError::ConsolidationRoundClosed.into()),
             PeerResponse::Rejected { code: RejectionCode::Conflict, retryable: false, .. }
         ));
+
+        for retention in [
+            RetentionError::Database("unavailable".to_owned()),
+            RetentionError::BlockingTask("unavailable".to_owned()),
+            RetentionError::InvalidDurableState,
+        ] {
+            assert!(matches!(
+                quic_peer_rejection(
+                    DepositServiceError::DepositIndexStore(DepositIndexStoreError::Retention(
+                        retention
+                    ))
+                    .into()
+                ),
+                PeerResponse::Rejected { code: RejectionCode::Internal, retryable: true, .. }
+            ));
+        }
+        for retention in [
+            RetentionError::ConcurrentMutation,
+            RetentionError::CurrentRootConflict,
+            RetentionError::AuthorizationHandoffRequired,
+            RetentionError::ImportInProgress,
+            RetentionError::SourcePinNotAdvanced,
+        ] {
+            assert!(matches!(
+                quic_peer_rejection(
+                    DepositServiceError::DepositIndexStore(DepositIndexStoreError::Retention(
+                        retention
+                    ))
+                    .into()
+                ),
+                PeerResponse::Rejected { code: RejectionCode::Unavailable, retryable: true, .. }
+            ));
+        }
+        assert!(matches!(
+            quic_peer_rejection(
+                DepositServiceError::DepositIndexStore(DepositIndexStoreError::Retention(
+                    RetentionError::SourcePinQuota,
+                ))
+                .into()
+            ),
+            PeerResponse::Rejected { code: RejectionCode::ResourceExhausted, retryable: true, .. }
+        ));
+        assert!(matches!(
+            quic_peer_rejection(
+                DepositServiceError::DepositIndexStore(DepositIndexStoreError::Retention(
+                    RetentionError::SourcePinConflict,
+                ))
+                .into()
+            ),
+            PeerResponse::Rejected { code: RejectionCode::Conflict, retryable: false, .. }
+        ));
+        assert!(matches!(
+            quic_peer_rejection(
+                DepositServiceError::DepositIndexStore(DepositIndexStoreError::Retention(
+                    RetentionError::InactiveSourceOrRequester,
+                ))
+                .into()
+            ),
+            PeerResponse::Rejected { code: RejectionCode::Unauthorized, retryable: false, .. }
+        ));
+    }
+
+    #[test]
+    fn key_rotation_blocking_capacity_is_bounded_and_retryable() {
+        assert_eq!(MAX_CONCURRENT_KEY_ROTATION_BLOCKING_TASKS, 1);
+        let permits = Arc::new(Semaphore::new(MAX_CONCURRENT_KEY_ROTATION_BLOCKING_TASKS));
+        let first = try_acquire_key_rotation_blocking_permit(&permits).unwrap();
+        let saturated =
+            try_acquire_key_rotation_blocking_permit(&permits).expect_err("second task must fail");
+        assert!(matches!(
+            quic_peer_rejection(saturated),
+            PeerResponse::Rejected { code: RejectionCode::ResourceExhausted, retryable: true, .. }
+        ));
+        drop(first);
+        assert!(try_acquire_key_rotation_blocking_permit(&permits).is_ok());
+    }
+
+    #[test]
+    fn deposit_allocation_admission_is_bounded_and_retryable() {
+        assert_eq!(MAX_CONCURRENT_DEPOSIT_ALLOCATION_ADMISSIONS, 1);
+        let permits = Arc::new(Semaphore::new(MAX_CONCURRENT_DEPOSIT_ALLOCATION_ADMISSIONS));
+        let first = try_acquire_deposit_allocation_admission_permit(&permits).unwrap();
+        let saturated = match try_acquire_deposit_allocation_admission_permit(&permits) {
+            Ok(_) => panic!("a second detached allocation mutation was admitted"),
+            Err(response) => response,
+        };
+        assert_eq!(saturated.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(saturated.headers().get(RETRY_AFTER).unwrap(), "1");
+
+        drop(first);
+        assert!(try_acquire_deposit_allocation_admission_permit(&permits).is_ok());
+    }
+
+    #[test]
+    fn deposit_read_admission_is_bounded_and_retryable() {
+        assert_eq!(MAX_CONCURRENT_DEPOSIT_READ_ADMISSIONS, 1);
+        let permits = Arc::new(Semaphore::new(MAX_CONCURRENT_DEPOSIT_READ_ADMISSIONS));
+        let first = try_acquire_deposit_read_admission_permit(&permits).unwrap();
+        let saturated = match try_acquire_deposit_read_admission_permit(&permits) {
+            Ok(_) => panic!("a second certificate-verifying deposit read was admitted"),
+            Err(response) => response,
+        };
+        assert_eq!(saturated.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(saturated.headers().get(RETRY_AFTER).unwrap(), "1");
+
+        drop(first);
+        assert!(try_acquire_deposit_read_admission_permit(&permits).is_ok());
     }
 
     #[test]
@@ -13249,6 +23533,26 @@ mod tests {
         ] {
             assert!(!is_expected_deposit_reconciliation_gap(&error.into()));
         }
+    }
+
+    #[test]
+    fn target_only_deposit_handoff_role_excludes_source_and_omitted_parties() {
+        let source = committee_for_parties(0, &[1, 2, 3, 4, 5], 3);
+        let target = committee_for_parties(1, &[1, 2, 3, 4, 5, 6], 4);
+
+        assert!(is_target_only_deposit_handoff_member(PartyId(6), &source, &target,));
+        assert!(!is_target_only_deposit_handoff_member(PartyId(1), &source, &target,));
+        assert!(!is_target_only_deposit_handoff_member(PartyId(7), &source, &target,));
+        assert!(
+            is_expected_deposit_reconciliation_gap(
+                &DepositServiceError::CertifiedHandoffUnavailable(1).into(),
+            ),
+            "a correctly pinned target-only replica must permit certificate ingress to continue",
+        );
+        assert!(
+            !is_expected_deposit_reconciliation_gap(&DepositServiceError::WrongRegistry.into()),
+            "an authenticated registry mismatch must remain fail-closed",
+        );
     }
 
     fn historical_replay_seed(party: PartyId) -> [u8; 32] {
@@ -13305,7 +23609,6 @@ mod tests {
                     fault_bound: 0,
                     members: vec![PartyId(1)],
                     eligible_members: vec![PartyId(1)],
-                    old_dealers: vec![],
                 },
                 CommitteeSpec {
                     epoch: 1,
@@ -13314,7 +23617,6 @@ mod tests {
                     fault_bound: 0,
                     members: vec![PartyId(1), PartyId(2)],
                     eligible_members: vec![PartyId(1), PartyId(2)],
-                    old_dealers: vec![PartyId(1)],
                 },
                 CommitteeSpec {
                     epoch: 2,
@@ -13323,7 +23625,6 @@ mod tests {
                     fault_bound: 0,
                     members: vec![PartyId(1)],
                     eligible_members: vec![PartyId(1)],
-                    old_dealers: vec![PartyId(1), PartyId(2)],
                 },
             ],
             funding_blocks: 1,
@@ -13335,8 +23636,95 @@ mod tests {
         }
     }
 
+    /// Minimal committee chain for exercising cold passive-schedule recovery. Party three is
+    /// absent from the first two singleton committees, is selected at epoch two, and can
+    /// therefore authenticate that public history without ever receiving a threshold share.
+    fn cold_passive_schedule_scenario() -> Scenario {
+        let parties = (1_u16..=3)
+            .map(|id| {
+                let party = PartyId(id);
+                let signing_seed = historical_replay_seed(party);
+                let bootstrap = Identity::from_test_secrets(
+                    party,
+                    0,
+                    &signing_seed,
+                    historical_replay_x25519_secret(party, 0),
+                )
+                .unwrap();
+                ScenarioParty {
+                    id: party,
+                    admin_endpoint: format!("http://127.0.0.1:{}", 41_000 + id).parse().unwrap(),
+                    quic_endpoint: format!("quic://127.0.0.1:{}", 42_000 + id).parse().unwrap(),
+                    quic_server_name: format!("p{id}.cold-passive.invalid"),
+                    quic_certificate_file: format!("/tmp/cold-passive-p{id}.der").into(),
+                    monerod_rpc_urls: vec![
+                        format!("http://127.0.0.1:{}", 43_000 + id).parse().unwrap(),
+                    ],
+                    signing_key: Hex32(bootstrap.signing_public_key()),
+                    bootstrap_encryption_key: Hex32(bootstrap.encryption_public_key()),
+                }
+            })
+            .collect();
+        let mut scenario = Scenario {
+            schema_version: crate::config::SCENARIO_SCHEMA_VERSION,
+            demo_only: true,
+            network: NetworkKind::Regtest,
+            deposit_birth_anchor: None,
+            acceptance_monerod_rpc_url: "http://127.0.0.1:18081".parse().unwrap(),
+            parties,
+            committees: vec![
+                CommitteeSpec {
+                    epoch: 0,
+                    operation: Operation::Dkg,
+                    threshold: 1,
+                    fault_bound: 0,
+                    members: vec![PartyId(1)],
+                    eligible_members: vec![PartyId(1)],
+                },
+                CommitteeSpec {
+                    epoch: 1,
+                    operation: Operation::Reshare,
+                    threshold: 1,
+                    fault_bound: 0,
+                    members: vec![PartyId(2)],
+                    eligible_members: vec![PartyId(2)],
+                },
+                CommitteeSpec {
+                    epoch: 2,
+                    operation: Operation::Reshare,
+                    threshold: 1,
+                    fault_bound: 0,
+                    members: vec![PartyId(3)],
+                    eligible_members: vec![PartyId(3)],
+                },
+            ],
+            funding_blocks: 1,
+            confirmation_blocks: 1,
+            deposit_maximum_fee_atomic_units: 1_000_000_000,
+            poll_interval_ms: 10,
+            protocol_timeout_seconds: 10,
+            proactive_refresh_interval_seconds: 1,
+        };
+        // Explicit governance changes permit singleton replacement at f=0. Automatic selection
+        // correctly retains every healthy eligible source member, so it cannot supply this
+        // intentionally alternating, shareless public-history fixture.
+        scenario.committees.extend((3..=u64::from(EPOCH_HISTORY_HOT_ENTRIES) + 3).map(|epoch| {
+            let member = if epoch % 2 == 0 { PartyId(1) } else { PartyId(2) };
+            CommitteeSpec {
+                epoch,
+                operation: Operation::Reshare,
+                threshold: 1,
+                fault_bound: 0,
+                members: vec![member],
+                eligible_members: vec![member],
+            }
+        }));
+        scenario.validate().unwrap();
+        scenario
+    }
+
     fn activation_witness_scenario() -> Scenario {
-        let parties = (1_u16..=4)
+        let parties = (1_u16..=5)
             .map(|id| {
                 let party = PartyId(id);
                 let signing_seed = historical_replay_seed(party);
@@ -13371,11 +23759,10 @@ mod tests {
             committees: vec![CommitteeSpec {
                 epoch: 0,
                 operation: Operation::Dkg,
-                threshold: 2,
+                threshold: 3,
                 fault_bound: 1,
-                members: (1_u16..=4).map(PartyId).collect(),
-                eligible_members: (1_u16..=4).map(PartyId).collect(),
-                old_dealers: Vec::new(),
+                members: (1_u16..=5).map(PartyId).collect(),
+                eligible_members: (1_u16..=5).map(PartyId).collect(),
             }],
             funding_blocks: 1,
             confirmation_blocks: 1,
@@ -13388,48 +23775,46 @@ mod tests {
 
     fn proactive_refresh_scenario() -> Scenario {
         let mut scenario = activation_witness_scenario();
-        scenario.parties.push(activation_witness_extra_party(PartyId(5)));
+        scenario.parties.push(activation_witness_extra_party(PartyId(6)));
         scenario.committees.push(CommitteeSpec {
             epoch: 1,
             operation: Operation::Reshare,
-            threshold: 2,
+            threshold: 3,
             fault_bound: 1,
-            members: (1_u16..=4).map(PartyId).collect(),
-            eligible_members: (1_u16..=5).map(PartyId).collect(),
-            old_dealers: (1_u16..=4).map(PartyId).collect(),
+            members: (1_u16..=5).map(PartyId).collect(),
+            eligible_members: (1_u16..=6).map(PartyId).collect(),
         });
         scenario.proactive_refresh_interval_seconds = 1;
         scenario.validate().unwrap();
         scenario
     }
 
-    /// A proactive-refresh scenario whose successor keeps the full four-member committee (a genuine
-    /// share refresh, `desired_n = 4`) and enrolls a fifth stable identity as an eligible spare.
+    /// A proactive-refresh scenario whose successor keeps the full five-member committee (a genuine
+    /// share refresh, `desired_n = 5`) and enrolls a sixth stable identity as an eligible spare.
     ///
     /// The eligible-target policy's `desired_n + target_fault_bound` Byzantine-liveness floor needs
-    /// at least five eligible identities for a four-member successor at `f = 1`; the spare can
+    /// at least six eligible identities for a five-member successor at `f = 1`; the spare can
     /// replace a single silent candidate without carrying any source/bootstrap receiver key. Unlike
-    /// [`proactive_refresh_scenario`] — whose callers certify an exact `desired_n = 3` advertisement
+    /// [`proactive_refresh_scenario`] — whose callers certify an exact `desired_n = 5` advertisement
     /// set — the refresh-hold and certified-undrained restore tests exercise only the schedule and
-    /// restore paths, so they run against this spare-backed five-eligible pool.
+    /// restore paths, so they run against this spare-backed six-eligible pool.
     fn proactive_refresh_spare_eligible_scenario() -> Scenario {
         let mut scenario = activation_witness_scenario();
-        scenario.parties.push(activation_witness_extra_party(PartyId(5)));
+        scenario.parties.push(activation_witness_extra_party(PartyId(6)));
         scenario.committees.push(CommitteeSpec {
             epoch: 1,
             operation: Operation::Reshare,
-            threshold: 2,
+            threshold: 3,
             fault_bound: 1,
-            members: (1_u16..=4).map(PartyId).collect(),
-            eligible_members: (1_u16..=5).map(PartyId).collect(),
-            old_dealers: (1_u16..=4).map(PartyId).collect(),
+            members: (1_u16..=5).map(PartyId).collect(),
+            eligible_members: (1_u16..=6).map(PartyId).collect(),
         });
         scenario.proactive_refresh_interval_seconds = 1;
         scenario.validate().unwrap();
         scenario
     }
 
-    /// Build one additional deterministic scenario party beyond the four `activation_witness`
+    /// Build one additional deterministic scenario party beyond the five `activation_witness`
     /// members, mirroring their exact stable-key derivation so the eligibility reference key
     /// resolves identically. The party is enrolled only as an eligible spare and is never a genesis
     /// committee member or desired successor.
@@ -13472,7 +23857,7 @@ mod tests {
                 scenario,
                 state_directory,
                 &signing_seed,
-                &bootstrap_x25519_secret,
+                Some(&bootstrap_x25519_secret),
                 None,
                 false,
                 false,
@@ -13488,9 +23873,9 @@ mod tests {
         let mut scenario = activation_witness_scenario();
         // The dynamic tests carry no epoch-1 committee spec, so `key_rotation_context_for_source`
         // takes the policy fallback: the eligible pool is every scenario party and `desired_n` is
-        // the four-member source size. The tightened `desired_n + f` floor needs a fifth stable
+        // the five-member source size. The tightened `desired_n + f` floor needs a sixth stable
         // identity, enrolled here as an eligible spare that never joins the source committee.
-        scenario.parties.push(activation_witness_extra_party(PartyId(5)));
+        scenario.parties.push(activation_witness_extra_party(PartyId(6)));
         scenario.proactive_refresh_interval_seconds = 1;
         scenario.validate().unwrap();
         scenario
@@ -13527,7 +23912,13 @@ mod tests {
             target: scenario.genesis_committee().unwrap(),
             eligible_dealers: Vec::new(),
         };
-        let certificate = historical_activation_request(&transition, share.public(), 0xD0, None);
+        let certificate = historical_activation_request(
+            &transition,
+            share.public(),
+            0xD0,
+            server.receiver_keys.read().unwrap().commitment(),
+            None,
+        );
         server
             .persist_activation_certificate(
                 &certificate.transition,
@@ -13539,6 +23930,7 @@ mod tests {
         server.store.save(share, &mut OsRng).await.unwrap();
         server.epochs.write().await.insert(0, share.clone());
         *server.active_epoch.write().await = Some(0);
+        server.deposit_activation_revision.store(1, Ordering::Release);
         server.activations.write().await.insert(
             0,
             InstallResponse {
@@ -13556,6 +23948,7 @@ mod tests {
         transition: &AvssTransition,
         public: EpochPublic,
         transcript_byte: u8,
+        receiver_keys: ReceiverKeyAccumulatorCommitment,
         key_rotation_digest: Option<[u8; 32]>,
     ) -> ActivateEpochRequest {
         let activation_digest = public.activation_digest().unwrap();
@@ -13567,6 +23960,7 @@ mod tests {
             avss_transition_digest(transition).unwrap(),
             activation_digest,
             [transcript_byte; 32],
+            receiver_keys,
             key_rotation_digest,
         )
         .unwrap();
@@ -13604,6 +23998,43 @@ mod tests {
         ActivateEpochRequest { transition: transition.clone(), value, acknowledgements }
     }
 
+    /// Build a deterministic, full-degree public Shamir polynomial for a new committee while
+    /// retaining the source constant point. Tests which exercise certificate/history scheduling
+    /// need no secret successor share, but the public value must satisfy the same threshold-key
+    /// validation as a real proactive resharing output.
+    fn same_key_public_for_committee(
+        source: &EpochPublic,
+        committee: Committee,
+        domain: u64,
+    ) -> EpochPublic {
+        let mut coefficients = vec![source.group_key().unwrap()];
+        for degree in 1..committee.threshold {
+            let scalar = Scalar::from(domain.wrapping_add(u64::from(degree)));
+            coefficients.push(ED25519_BASEPOINT_POINT * scalar);
+        }
+        let verification_shares = committee
+            .members
+            .iter()
+            .map(|member| {
+                let x = Scalar::from(u64::from(committee.frost_index(member.id).unwrap()));
+                let mut coefficients = coefficients.iter().rev();
+                let mut evaluation = coefficients.next().unwrap().clone();
+                for coefficient in coefficients {
+                    evaluation = evaluation * x + coefficient.clone();
+                }
+                (member.id, PointBytes::from(evaluation))
+            })
+            .collect();
+        let public = EpochPublic {
+            key_id: source.key_id,
+            committee,
+            verification_shares,
+            group_key: source.group_key,
+        };
+        public.validate().unwrap();
+        public
+    }
+
     #[tokio::test]
     async fn certified_undrained_avss_run_restores_without_pacemaker_work_and_drains() {
         let scenario = proactive_refresh_spare_eligible_scenario();
@@ -13637,7 +24068,13 @@ mod tests {
             target: scenario.genesis_committee().unwrap(),
             eligible_dealers: Vec::new(),
         };
-        let certificate = historical_activation_request(&transition, share.public(), 0xC7, None);
+        let certificate = historical_activation_request(
+            &transition,
+            share.public(),
+            0xC7,
+            server.receiver_keys.read().unwrap().commitment(),
+            None,
+        );
         server
             .persist_activation_certificate(
                 &transition,
@@ -13816,11 +24253,12 @@ mod tests {
 
     fn certified_key_rotation_for_roles(
         context: &KeyRotationContext,
+        receiver_keys: &ReceiverKeyAccumulatorStore,
         target_identities: &[Identity],
         advertisers: &[PartyId],
         witnesses: &[PartyId],
     ) -> KeyRotationCertificate {
-        let advertisements = advertisers
+        let advertisements: Vec<SignedEnvelope> = advertisers
             .iter()
             .map(|party| {
                 let identity =
@@ -13829,7 +24267,51 @@ mod tests {
                 crate::key_rotation::sign_key_advertisement(context, &capability).unwrap()
             })
             .collect();
-        let value = crate::key_rotation::KeyRotationValue::new(context, advertisements).unwrap();
+        let selected = advertisements
+            .iter()
+            .map(|advertisement| {
+                crate::key_rotation::verify_key_advertisement(context, advertisement)
+                    .map(|verified| (verified.party, verified.next_key))
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        let (history_update, _) = receiver_keys.preview(context.target_epoch(), &selected).unwrap();
+        let retained_source =
+            advertisers.iter().filter(|party| context.source().member(**party).is_ok()).count();
+        let authorization = if retained_source < context.primary_source_overlap() {
+            Some(
+                crate::key_rotation::FallbackAuthorization::new(
+                    context,
+                    context
+                        .source()
+                        .members
+                        .iter()
+                        .take(context.source_quorum())
+                        .map(|member| {
+                            let identity = Identity::from_test_secrets(
+                                member.id,
+                                context.source().epoch,
+                                &historical_replay_seed(member.id),
+                                historical_replay_x25519_secret(member.id, context.source().epoch),
+                            )
+                            .unwrap();
+                            crate::key_rotation::sign_selection_fallback_vote(context, &identity)
+                                .unwrap()
+                        })
+                        .collect(),
+                )
+                .unwrap(),
+            )
+        } else {
+            None
+        };
+        let value = crate::key_rotation::KeyRotationValue::new_with_authorization(
+            context,
+            advertisements,
+            history_update,
+            authorization,
+        )
+        .unwrap();
         let value = value.to_consensus_value(context).unwrap();
         let consensus = context.consensus_context().unwrap();
         let witnesses = witnesses
@@ -13867,8 +24349,13 @@ mod tests {
     ) -> (KeyRotationContext, KeyRotationCertificate, Committee) {
         let context = server.key_rotation_context_for_source(source).unwrap().unwrap();
         let identities = historical_target_identities(&context);
-        let certificate =
-            certified_key_rotation_for_roles(&context, &identities, advertisers, witnesses);
+        let certificate = certified_key_rotation_for_roles(
+            &context,
+            &server.receiver_keys.read().unwrap(),
+            &identities,
+            advertisers,
+            witnesses,
+        );
         let target = certificate.verify(&context).unwrap();
         if let Some(identity) = identities.iter().find(|identity| {
             identity.party() == server.party
@@ -13878,7 +24365,11 @@ mod tests {
         }) {
             server
                 .protocol_store
-                .save_epoch_identity_secret(&identity.export_encryption_secret(), &mut OsRng)
+                .save_epoch_identity_candidate_secret(
+                    &context,
+                    &identity.export_encryption_secret(),
+                    &mut OsRng,
+                )
                 .await
                 .unwrap();
         }
@@ -13887,6 +24378,2342 @@ mod tests {
             .await
             .unwrap();
         (context, certificate, target)
+    }
+
+    /// Append the same authenticated public successor to independent shareless observers. Each
+    /// observer certifies its own durable receiver-key artifact so restart exercises the normal
+    /// local stores rather than a copied fixture.
+    async fn append_shareless_historical_successor(
+        observers: &[Arc<PartyServer>],
+        source: &EpochPublic,
+        advertisers: &[PartyId],
+        witnesses: &[PartyId],
+        epoch: u64,
+    ) -> ActivateEpochRequest {
+        let mut expected = None;
+        for observer in observers {
+            let (context, certificate, target) =
+                install_historical_key_rotation(observer, source, advertisers, witnesses).await;
+            assert_eq!(context.target_epoch(), epoch);
+            let transition = observer
+                .configured_proactive_refresh_transition(source)
+                .unwrap()
+                .expect("certified receiver-key rotation must materialize its AVSS transition");
+            assert_eq!(transition.target, target);
+            let public =
+                same_key_public_for_committee(source, target, 0xC01D_0000_u64.wrapping_add(epoch));
+            let request = historical_activation_request(
+                &transition,
+                public,
+                0x80_u8.wrapping_add(u8::try_from(epoch).unwrap()),
+                certificate.resulting_receiver_keys(&context).unwrap(),
+                Some(certificate.semantic_digest(&context).unwrap()),
+            );
+            if let Some(expected) = expected.as_ref() {
+                assert_eq!(
+                    &request, expected,
+                    "independent observers derived different epoch-{epoch} certificates"
+                );
+            } else {
+                expected = Some(request.clone());
+            }
+            observer
+                .persist_activation_certificate(
+                    &request.transition,
+                    &request.value,
+                    &request.acknowledgements,
+                )
+                .await
+                .unwrap();
+            observer.remember_certified_deposit_target(&request.value).await.unwrap();
+        }
+        expected.expect("at least one observer is required")
+    }
+
+    #[tokio::test]
+    async fn cold_passive_schedule_preserves_selected_boundary_across_restart() {
+        let scenario = cold_passive_schedule_scenario();
+        let state = tempfile::tempdir().unwrap();
+        let local = PartyId(3);
+        let observer_state = state.path().join("observer");
+        let selected_genesis_state = state.path().join("selected-genesis");
+        let observer = PartyServer::new(
+            local,
+            scenario.clone(),
+            &observer_state,
+            &historical_replay_seed(local),
+            None::<&[u8; 32]>,
+        )
+        .await
+        .unwrap();
+        let selected_genesis = PartyServer::new(
+            PartyId(1),
+            scenario.clone(),
+            &selected_genesis_state,
+            &historical_replay_seed(PartyId(1)),
+            &historical_replay_x25519_secret(PartyId(1), 0),
+        )
+        .await
+        .unwrap();
+        let observers = [observer.clone(), selected_genesis.clone()];
+        let genesis_share = proactive_epoch_zero_share(&scenario, PartyId(1));
+        let (key_id, session) = canonical_dkg_identity(&scenario).unwrap();
+        let transition = AvssTransition {
+            purpose: DealPurpose::Dkg,
+            session,
+            key_id,
+            fault_bound: 0,
+            history_parent: EpochHistoryParent::genesis(
+                scenario.quic_network_id().unwrap(),
+                key_id,
+            )
+            .unwrap(),
+            old: None,
+            target: scenario.genesis_committee().unwrap(),
+            eligible_dealers: Vec::new(),
+        };
+        let genesis = historical_activation_request(
+            &transition,
+            genesis_share.public(),
+            0xD0,
+            observer.receiver_keys.read().unwrap().commitment(),
+            None,
+        );
+        for replica in &observers {
+            replica
+                .persist_activation_certificate(
+                    &genesis.transition,
+                    &genesis.value,
+                    &genesis.acknowledgements,
+                )
+                .await
+                .unwrap();
+            replica.remember_certified_deposit_target(&genesis.value).await.unwrap();
+        }
+        observer.reconcile_proactive_refresh_schedule_from_history(10_000).await.unwrap();
+        let first = append_shareless_historical_successor(
+            &observers,
+            &genesis.value.public,
+            &[PartyId(2)],
+            &[PartyId(1)],
+            1,
+        )
+        .await;
+        observer.reconcile_proactive_refresh_schedule_from_history(20_000).await.unwrap();
+        let schedule = observer.proactive_refresh_schedule.lock().await.clone().unwrap();
+        assert_eq!(schedule.source_epoch, 1);
+        assert_eq!(schedule.target_epoch, Some(2));
+        assert_eq!(schedule.due_unix_ms, Some(21_000));
+
+        // A trusted hot source must not reacquire the proof-verification permit. That permit is
+        // also needed by incoming certificates; repeated scheduler reads must leave it available
+        // for the next ceremony instead of starving consensus behind already verified work.
+        let verification_count =
+            observer.certified_key_rotation_registration_verifications.load(Ordering::Acquire);
+        let permit = observer.key_rotation_blocking_permits.clone().acquire_owned().await.unwrap();
+        for _ in 0..3 {
+            let source = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                observer.scheduled_key_rotation_source(),
+            )
+            .await
+            .expect("cached schedule source waited for the rotation verification permit")
+            .unwrap();
+            assert_eq!(source, first.value.public);
+        }
+        drop(permit);
+        assert_eq!(
+            observer.certified_key_rotation_registration_verifications.load(Ordering::Acquire),
+            verification_count,
+            "cached schedule source reverified its receiver-key certificate"
+        );
+
+        // Epoch two selects this observer, but only public history arrives: it never stages a
+        // share. Advance through the production 64-entry window so the schedule, selected
+        // boundary, and predecessor are all genuinely cold on disk.
+        let tip = u64::from(EPOCH_HISTORY_HOT_ENTRIES) + 3;
+        let mut public = first.value.public.clone();
+        for epoch in 2..=tip {
+            let advertiser = if epoch == 2 {
+                local
+            } else if epoch % 2 == 0 {
+                PartyId(1)
+            } else {
+                PartyId(2)
+            };
+            let request = append_shareless_historical_successor(
+                &observers,
+                &public,
+                &[advertiser],
+                &[public.committee.members[0].id],
+                epoch,
+            )
+            .await;
+            public = request.value.public;
+        }
+        assert_eq!(observer.epoch_history.read().await.cold_through(), Some(3));
+        assert!(!observer.deposit_targets.read().await.contains_key(&1));
+        assert!(!observer.history_links.read().unwrap().contains_key(&0));
+
+        // Remove the two optional execution pins. Arbitrary authenticated cold reads must work
+        // with only the hot suffix and must not repopulate either capability registry.
+        observer.certified_key_rotations.write().unwrap().retain(|epoch, _| *epoch >= 3);
+        observer.history_links.write().unwrap().retain(|epoch, _| *epoch >= 3);
+        let rotation_keys =
+            observer.certified_key_rotations.read().unwrap().keys().copied().collect::<Vec<_>>();
+        let links = observer.history_links.read().unwrap().clone();
+        for epoch in 0..=3 {
+            assert_eq!(
+                observer.authenticated_epoch_activation_value(epoch).await.unwrap().epoch,
+                epoch
+            );
+        }
+        assert_eq!(
+            observer.certified_key_rotations.read().unwrap().keys().copied().collect::<Vec<_>>(),
+            rotation_keys
+        );
+        assert_eq!(*observer.history_links.read().unwrap(), links);
+        assert_eq!(observer.scheduled_key_rotation_source().await.unwrap(), first.value.public);
+        assert!(observer.certified_key_rotations.read().unwrap().contains_key(&1));
+        assert!(observer.certified_key_rotations.read().unwrap().contains_key(&2));
+        observer.prune_hot_epoch_records_after_history_cas(3).await.unwrap();
+        assert!(observer.certified_key_rotations.read().unwrap().contains_key(&1));
+        assert!(observer.certified_key_rotations.read().unwrap().contains_key(&2));
+        assert!(observer.history_links.read().unwrap().contains_key(&1));
+        assert!(
+            observer.certified_key_rotations.read().unwrap().len()
+                <= MAX_SCHEDULE_PINNED_EPOCH_RECORDS
+        );
+        assert!(observer.history_links.read().unwrap().len() <= MAX_SCHEDULE_PINNED_EPOCH_RECORDS);
+        observer.reconcile_proactive_refresh_schedule_from_history(100_000).await.unwrap();
+        assert_eq!(
+            observer.proactive_refresh_schedule.lock().await.clone(),
+            Some(schedule.clone())
+        );
+        drop(observers);
+        drop(observer);
+        drop(selected_genesis);
+
+        let restarted = PartyServer::new(
+            local,
+            scenario.clone(),
+            &observer_state,
+            &historical_replay_seed(local),
+            None::<&[u8; 32]>,
+        )
+        .await
+        .unwrap();
+        assert_eq!(restarted.epoch_history_catchup_parent().await.unwrap().epoch(), Some(tip));
+        assert_eq!(restarted.scheduled_key_rotation_source().await.unwrap(), first.value.public);
+        restarted.start_due_proactive_refresh(100_000).await.unwrap();
+        assert_eq!(restarted.proactive_refresh_schedule.lock().await.clone(), Some(schedule));
+        assert_eq!(*restarted.active_epoch.read().await, None);
+        assert!(restarted.staged.read().await.is_empty());
+        assert!(restarted.epochs.read().await.is_empty());
+        assert!(!tokio::fs::try_exists(restarted.store.share_path(2)).await.unwrap());
+
+        // With no saved schedule, a selected but shareless genesis is the first boundary. A
+        // reverse scan of hot targets would incorrectly choose a much later non-member epoch.
+        let restarted_genesis = PartyServer::new(
+            PartyId(1),
+            scenario,
+            &selected_genesis_state,
+            &historical_replay_seed(PartyId(1)),
+            &historical_replay_x25519_secret(PartyId(1), 0),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            restarted_genesis.epoch_history_catchup_parent().await.unwrap().epoch(),
+            Some(tip)
+        );
+        assert!(restarted_genesis.proactive_refresh_schedule.lock().await.is_none());
+        assert_eq!(*restarted_genesis.active_epoch.read().await, None);
+        assert!(restarted_genesis.staged.read().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn certified_rotation_outputs_are_cached_across_epoch_replays_and_restart() {
+        const REPLAYS_PER_OPERATION: usize = 8;
+
+        let scenario = proactive_refresh_scenario();
+        let local = PartyId(1);
+        let state = tempfile::tempdir().unwrap();
+        let signing_seed = historical_replay_seed(local);
+        let encryption_secret = historical_replay_x25519_secret(local, 0);
+        let server = PartyServer::new(
+            local,
+            scenario.clone(),
+            state.path(),
+            &signing_seed,
+            &encryption_secret,
+        )
+        .await
+        .unwrap();
+        let source_share = proactive_epoch_zero_share(&scenario, local);
+        install_proactive_epoch_zero(&server, &source_share).await;
+        server.arm_proactive_refresh_for_activation(&source_share.public(), 40_000).await.unwrap();
+        let (context, certificate, _) = install_historical_key_rotation(
+            &server,
+            &source_share.public(),
+            &[PartyId(1), PartyId(2), PartyId(3), PartyId(4), PartyId(5)],
+            &[PartyId(1), PartyId(2), PartyId(3), PartyId(4)],
+        )
+        .await;
+        let target_epoch = context.target_epoch();
+        let expected_receiver_keys = certificate.resulting_receiver_keys(&context).unwrap();
+        let expected_semantic_digest = certificate.semantic_digest(&context).unwrap();
+
+        assert_eq!(
+            server.certified_key_rotation_registration_verifications.load(Ordering::Acquire),
+            1,
+            "initial registration must verify the durable certificate exactly once"
+        );
+        // Activate, Retire, and Observe all use these same two registry lookups. Exercise enough
+        // sender-bound equivalents to catch an accidental return to certificate re-verification.
+        for _operation in
+            [EpochOperation::Activate, EpochOperation::Retire, EpochOperation::Observe]
+        {
+            for _ in 0..REPLAYS_PER_OPERATION {
+                assert_eq!(
+                    server.receiver_key_commitment_for_epoch(target_epoch).unwrap(),
+                    expected_receiver_keys
+                );
+                assert_eq!(
+                    server.key_rotation_semantic_digest(target_epoch).unwrap(),
+                    Some(expected_semantic_digest)
+                );
+            }
+        }
+        assert_eq!(
+            server.certified_key_rotation_registration_verifications.load(Ordering::Acquire),
+            1,
+            "epoch replay lookups must not re-enter certificate verification"
+        );
+        drop(server);
+
+        let restarted =
+            PartyServer::new(local, scenario, state.path(), &signing_seed, &encryption_secret)
+                .await
+                .unwrap();
+        assert_eq!(
+            restarted.certified_key_rotation_registration_verifications.load(Ordering::Acquire),
+            1,
+            "restart must authenticate the durable certificate once"
+        );
+        for _ in 0..REPLAYS_PER_OPERATION {
+            assert_eq!(
+                restarted.receiver_key_commitment_for_epoch(target_epoch).unwrap(),
+                expected_receiver_keys
+            );
+            assert_eq!(
+                restarted.key_rotation_semantic_digest(target_epoch).unwrap(),
+                Some(expected_semantic_digest)
+            );
+        }
+        assert_eq!(
+            restarted.certified_key_rotation_registration_verifications.load(Ordering::Acquire),
+            1,
+            "post-restart replay lookups must use cached verified outputs"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_activation_retries_promote_receiver_keys_exactly_once() {
+        const CALLERS: usize = 16;
+
+        let scenario = proactive_refresh_scenario();
+        let local = PartyId(1);
+        let state = tempfile::tempdir().unwrap();
+        let server = PartyServer::new(
+            local,
+            scenario.clone(),
+            state.path(),
+            &historical_replay_seed(local),
+            &historical_replay_x25519_secret(local, 0),
+        )
+        .await
+        .unwrap();
+        let source_share = proactive_epoch_zero_share(&scenario, local);
+        install_proactive_epoch_zero(&server, &source_share).await;
+        let (context, certificate, target) = install_historical_key_rotation(
+            &server,
+            &source_share.public(),
+            &[PartyId(1), PartyId(2), PartyId(3), PartyId(4), PartyId(5)],
+            &[PartyId(1), PartyId(2), PartyId(3), PartyId(4)],
+        )
+        .await;
+        let transition = server
+            .configured_proactive_refresh_transition(&source_share.public())
+            .unwrap()
+            .unwrap();
+        let selected = transition
+            .eligible_dealers
+            .iter()
+            .copied()
+            .take(usize::from(target.n() - transition.fault_bound))
+            .collect::<Vec<_>>();
+        let outputs = selected
+            .iter()
+            .map(|dealer| {
+                let polynomial =
+                    SecretPolynomial::random_zero_constant(target.threshold, &mut OsRng).unwrap();
+                make_dkg_output(*dealer, &polynomial, &target, local).unwrap()
+            })
+            .collect();
+        let successor_share = aggregate_zero_share_refresh(
+            &source_share,
+            target,
+            local,
+            transition.fault_bound,
+            &selected,
+            outputs,
+        )
+        .unwrap();
+        let response = server.stage(transition, successor_share, [0xA4; 32]).await.unwrap();
+        let value = activation_value(&response);
+        let expected = certificate.resulting_receiver_keys(&context).unwrap();
+        assert_eq!(value.history_link.receiver_keys(), expected);
+
+        let barrier = Arc::new(tokio::sync::Barrier::new(CALLERS));
+        let mut calls = Vec::with_capacity(CALLERS);
+        for _ in 0..CALLERS {
+            let server = server.clone();
+            let value = value.clone();
+            let barrier = barrier.clone();
+            calls.push(tokio::spawn(async move {
+                barrier.wait().await;
+                server.promote_receiver_keys_after_history_cas(&value).await
+            }));
+        }
+        for call in calls {
+            call.await.unwrap().unwrap();
+        }
+        let receiver_keys = server.receiver_keys.read().unwrap();
+        assert_eq!(receiver_keys.commitment(), expected);
+        assert_eq!(receiver_keys.staged_update(), None);
+    }
+
+    struct StagedTargetOnlySuccessorFixture {
+        server: Arc<PartyServer>,
+        epoch_one_activation: ActivateEpochRequest,
+        epoch_two_activation: ActivateEpochRequest,
+        epoch_two_context: KeyRotationContext,
+        epoch_two_certificate: KeyRotationCertificate,
+        epoch_two_manifest: EpochHistoryCatchupManifest,
+        epoch_two_activation_bytes: Vec<u8>,
+        epoch_two_rotation_bytes: Vec<u8>,
+    }
+
+    fn staged_target_only_successor_fixture(
+        state_directory: &std::path::Path,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = StagedTargetOnlySuccessorFixture> + '_>>
+    {
+        Box::pin(async move {
+            let mut scenario = proactive_refresh_scenario();
+            scenario.committees.push(CommitteeSpec {
+                epoch: 2,
+                operation: Operation::Reshare,
+                threshold: 3,
+                fault_bound: 1,
+                members: (1_u16..=5).map(PartyId).collect(),
+                eligible_members: (1_u16..=6).map(PartyId).collect(),
+            });
+            scenario.validate().unwrap();
+            let source_party = PartyId(1);
+            let joiner = PartyId(6);
+            let old_committee = scenario.genesis_committee().unwrap();
+            let (key_id, _) = canonical_dkg_identity(&scenario).unwrap();
+            let dkg_polynomials = old_committee
+                .members
+                .iter()
+                .map(|member| {
+                    (
+                        member.id,
+                        SecretPolynomial::random(old_committee.threshold, &mut OsRng).unwrap(),
+                    )
+                })
+                .collect::<BTreeMap<_, _>>();
+            let epoch_zero_shares = old_committee
+                .members
+                .iter()
+                .map(|recipient| {
+                    let outputs = dkg_polynomials
+                        .iter()
+                        .map(|(dealer, polynomial)| {
+                            make_dkg_output(*dealer, polynomial, &old_committee, recipient.id)
+                                .unwrap()
+                        })
+                        .collect();
+                    (
+                        recipient.id,
+                        aggregate_dkg(key_id, old_committee.clone(), recipient.id, outputs)
+                            .unwrap(),
+                    )
+                })
+                .collect::<BTreeMap<_, _>>();
+            let epoch_zero_public = epoch_zero_shares[&source_party].public();
+
+            let source = PartyServer::new(
+                source_party,
+                scenario.clone(),
+                state_directory.join("source"),
+                &historical_replay_seed(source_party),
+                &historical_replay_x25519_secret(source_party, 0),
+            )
+            .await
+            .unwrap();
+            install_proactive_epoch_zero(&source, &epoch_zero_shares[&source_party]).await;
+
+            let server = PartyServer::new(
+                joiner,
+                scenario.clone(),
+                state_directory.join("joiner"),
+                &historical_replay_seed(joiner),
+                None::<&[u8; 32]>,
+            )
+            .await
+            .unwrap();
+            let (manifest, activation, rotation) =
+                historical_epoch_catchup_bundle(&source, 0).await;
+            server
+                .apply_epoch_history_catchup(source_party, manifest, activation, rotation)
+                .await
+                .unwrap();
+            assert_eq!(*server.active_epoch.read().await, None);
+
+            let (context_one, certificate_one, target_one) = install_historical_key_rotation(
+                &server,
+                &epoch_zero_public,
+                &[PartyId(1), PartyId(2), PartyId(3), PartyId(4), joiner],
+                &[PartyId(1), PartyId(2), PartyId(3), PartyId(4)],
+            )
+            .await;
+            assert!(target_one.member(joiner).is_ok());
+            assert!(target_one.member(PartyId(5)).is_err());
+            let transition_one = server
+                .configured_proactive_refresh_transition(&epoch_zero_public)
+                .unwrap()
+                .unwrap();
+            assert_eq!(transition_one.purpose, DealPurpose::Reshare);
+            assert_eq!(transition_one.target, target_one);
+            let selected_one = old_committee
+                .members
+                .iter()
+                .take(usize::from(old_committee.threshold))
+                .map(|member| member.id)
+                .collect::<Vec<_>>();
+            let polynomials_one = selected_one
+                .iter()
+                .map(|dealer| {
+                    (
+                        *dealer,
+                        make_proactive_reshare_polynomial(
+                            &epoch_zero_shares[dealer],
+                            *dealer,
+                            target_one.threshold,
+                            &mut OsRng,
+                        )
+                        .unwrap(),
+                    )
+                })
+                .collect::<BTreeMap<_, _>>();
+            let epoch_one_shares = target_one
+                .members
+                .iter()
+                .map(|recipient| {
+                    let outputs = polynomials_one
+                        .iter()
+                        .map(|(dealer, polynomial)| {
+                            make_dkg_output(*dealer, polynomial, &target_one, recipient.id).unwrap()
+                        })
+                        .collect();
+                    (
+                        recipient.id,
+                        aggregate_proactive_reshare_from_public(
+                            &epoch_zero_public,
+                            target_one.clone(),
+                            recipient.id,
+                            &selected_one,
+                            outputs,
+                        )
+                        .unwrap(),
+                    )
+                })
+                .collect::<BTreeMap<_, _>>();
+            let response_one = server
+                .stage(transition_one.clone(), epoch_one_shares[&joiner].clone(), [0xE1; 32])
+                .await
+                .unwrap();
+            let epoch_one_activation = historical_activation_request(
+                &transition_one,
+                response_one.public.clone(),
+                0xE1,
+                certificate_one.resulting_receiver_keys(&context_one).unwrap(),
+                Some(certificate_one.semantic_digest(&context_one).unwrap()),
+            );
+            assert_eq!(activation_value(&response_one), epoch_one_activation.value);
+            let mut run_one = new_avss_run(&server, transition_one.clone()).unwrap();
+            run_one.finalized = Some(response_one.clone());
+            run_one.activation_acknowledgements = epoch_one_activation
+                .acknowledgements
+                .iter()
+                .cloned()
+                .map(|acknowledgement| (acknowledgement.from, acknowledgement))
+                .collect();
+            server.persist_avss_run(&run_one).await.unwrap();
+            server.avss.lock().await.insert(transition_one.session, run_one);
+            server.persist_pending_activation_authority(&epoch_one_activation).await.unwrap();
+            server
+                .arm_proactive_refresh_for_pending_activation(&epoch_one_activation.value, 100_000)
+                .await
+                .unwrap();
+            server
+                .persist_activation_certificate(
+                    &epoch_one_activation.transition,
+                    &epoch_one_activation.value,
+                    &epoch_one_activation.acknowledgements,
+                )
+                .await
+                .unwrap();
+            assert!(server.staged.read().await.contains_key(&1));
+            assert_eq!(*server.active_epoch.read().await, None);
+            assert_eq!(
+                server.proactive_refresh_schedule.lock().await.as_ref().unwrap().phase,
+                ProactiveRefreshSchedulePhase::PendingActivation
+            );
+
+            let epoch_one_public = response_one.public;
+            let context_two =
+                server.key_rotation_context_for_source(&epoch_one_public).unwrap().unwrap();
+            let identities_two = historical_target_identities(&context_two);
+            let certificate_two = certified_key_rotation_for_roles(
+                &context_two,
+                &server.receiver_keys.read().unwrap(),
+                &identities_two,
+                &[PartyId(1), PartyId(2), PartyId(3), PartyId(4), PartyId(5)],
+                &[PartyId(1), PartyId(2), PartyId(3), PartyId(4)],
+            );
+            let target_two = certificate_two.verify(&context_two).unwrap();
+            assert!(target_two.member(joiner).is_err());
+            let history_parent = server.certified_history_parent(&epoch_one_public).unwrap();
+            let transition_two = AvssTransition {
+                purpose: DealPurpose::Reshare,
+                session: canonical_reshare_session(&epoch_one_public, &target_two, history_parent)
+                    .unwrap(),
+                key_id: epoch_one_public.key_id,
+                fault_bound: context_two.target_fault_bound(),
+                history_parent,
+                old: Some(epoch_one_public.clone()),
+                target: target_two.clone(),
+                eligible_dealers: epoch_one_public
+                    .committee
+                    .members
+                    .iter()
+                    .map(|member| member.id)
+                    .collect(),
+            };
+            assert_eq!(transition_two.purpose, DealPurpose::Reshare);
+            assert_eq!(transition_two.target, target_two);
+            let selected_two = epoch_one_public
+                .committee
+                .members
+                .iter()
+                .take(usize::from(epoch_one_public.committee.threshold))
+                .map(|member| member.id)
+                .collect::<Vec<_>>();
+            let polynomials_two = selected_two
+                .iter()
+                .map(|dealer| {
+                    (
+                        *dealer,
+                        make_proactive_reshare_polynomial(
+                            &epoch_one_shares[dealer],
+                            *dealer,
+                            target_two.threshold,
+                            &mut OsRng,
+                        )
+                        .unwrap(),
+                    )
+                })
+                .collect::<BTreeMap<_, _>>();
+            let recipient = target_two.members[0].id;
+            let outputs_two = polynomials_two
+                .iter()
+                .map(|(dealer, polynomial)| {
+                    make_dkg_output(*dealer, polynomial, &target_two, recipient).unwrap()
+                })
+                .collect();
+            let epoch_two_share = aggregate_proactive_reshare_from_public(
+                &epoch_one_public,
+                target_two,
+                recipient,
+                &selected_two,
+                outputs_two,
+            )
+            .unwrap();
+            let epoch_two_activation = historical_activation_request(
+                &transition_two,
+                epoch_two_share.public(),
+                0xE2,
+                certificate_two.resulting_receiver_keys(&context_two).unwrap(),
+                Some(certificate_two.semantic_digest(&context_two).unwrap()),
+            );
+            let epoch_two_rotation_bytes = certificate_two.encode(&context_two).unwrap();
+            let epoch_two_record = ActivationCertificateRecord {
+                transition: epoch_two_activation.transition.clone(),
+                value: epoch_two_activation.value.clone(),
+                acknowledgements: epoch_two_activation.acknowledgements.clone(),
+            };
+            let epoch_two_activation_bytes = postcard::to_allocvec(&epoch_two_record).unwrap();
+            let network = scenario.quic_network_id().unwrap();
+            let activation_ref = EpochHistoryObjectRef::for_contents(
+                network,
+                crate::epoch_history::EpochHistoryObjectKind::ActivationCertificate,
+                &epoch_two_activation_bytes,
+            )
+            .unwrap();
+            let rotation_ref = EpochHistoryObjectRef::for_contents(
+                network,
+                crate::epoch_history::EpochHistoryObjectKind::KeyRotationCertificate,
+                &epoch_two_rotation_bytes,
+            )
+            .unwrap();
+            let epoch_two_manifest = EpochHistoryCatchupManifest::new(
+                transition_two.history_parent,
+                epoch_two_activation.value.history_link,
+                activation_ref,
+                Some(rotation_ref),
+            )
+            .unwrap();
+
+            StagedTargetOnlySuccessorFixture {
+                server,
+                epoch_one_activation,
+                epoch_two_activation,
+                epoch_two_context: context_two,
+                epoch_two_certificate: certificate_two,
+                epoch_two_manifest,
+                epoch_two_activation_bytes,
+                epoch_two_rotation_bytes,
+            }
+        })
+    }
+
+    #[tokio::test]
+    async fn target_only_joiner_activates_staged_epoch_before_immediate_successor_retirement() {
+        let state = tempfile::tempdir().unwrap();
+        let fixture = staged_target_only_successor_fixture(state.path()).await;
+        let server = fixture.server;
+        server
+            .finalize_certified_key_rotation(
+                fixture.epoch_two_context,
+                fixture.epoch_two_certificate,
+                false,
+            )
+            .await
+            .unwrap();
+
+        boxed_retire_epoch(State(server.clone()), Json(fixture.epoch_two_activation.clone()))
+            .await
+            .unwrap();
+
+        assert!(
+            !server.staged.read().await.contains_key(&1),
+            "successor retirement stranded the joiner's staged predecessor"
+        );
+        assert_eq!(*server.active_epoch.read().await, None);
+        assert!(!server.epochs.read().await.contains_key(&1));
+        assert!(
+            server
+                .store
+                .load_retirement(1, fixture.epoch_one_activation.value.public.committee.digest(),)
+                .await
+                .unwrap()
+                .is_some(),
+            "immediate successor retirement did not durably erase the activated joiner share"
+        );
+        let schedule = server.proactive_refresh_schedule.lock().await.clone().unwrap();
+        assert_eq!(schedule.phase, ProactiveRefreshSchedulePhase::Armed);
+        assert_eq!(schedule.source_epoch, 2);
+        assert_eq!(
+            schedule.source_activation,
+            fixture.epoch_two_activation.value.activation_digest
+        );
+    }
+
+    #[tokio::test]
+    async fn history_catchup_rejects_staged_predecessor_without_side_effects_then_retries() {
+        let state = tempfile::tempdir().unwrap();
+        let fixture = staged_target_only_successor_fixture(state.path()).await;
+        let server = fixture.server;
+        let before_parent = server.epoch_history.read().await.parent().unwrap();
+        let before_targets = server.deposit_targets.read().await.clone();
+        let before_rotations =
+            server.certified_key_rotations.read().unwrap().keys().copied().collect::<Vec<_>>();
+
+        let error = server
+            .apply_epoch_history_catchup(
+                PartyId(1),
+                fixture.epoch_two_manifest,
+                fixture.epoch_two_activation_bytes.clone(),
+                Some(fixture.epoch_two_rotation_bytes.clone()),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("locally staged predecessor"),
+            "unexpected staged-predecessor catch-up rejection: {error}"
+        );
+        assert_eq!(server.epoch_history.read().await.parent().unwrap(), before_parent);
+        assert_eq!(*server.deposit_targets.read().await, before_targets);
+        assert_eq!(
+            server.certified_key_rotations.read().unwrap().keys().copied().collect::<Vec<_>>(),
+            before_rotations,
+            "rejected catch-up registered its future receiver-key decision"
+        );
+        assert!(
+            server
+                .protocol_store
+                .load_activation_certificate(
+                    fixture.epoch_two_activation.value.epoch,
+                    fixture.epoch_two_activation.value.activation_digest,
+                )
+                .await
+                .is_err(),
+            "rejected catch-up persisted its future activation certificate"
+        );
+
+        let _installed =
+            boxed_activate_epoch(State(server.clone()), Json(fixture.epoch_one_activation.clone()))
+                .await
+                .unwrap();
+        assert_eq!(*server.active_epoch.read().await, Some(1));
+        server
+            .apply_epoch_history_catchup(
+                PartyId(1),
+                fixture.epoch_two_manifest,
+                fixture.epoch_two_activation_bytes,
+                Some(fixture.epoch_two_rotation_bytes),
+            )
+            .await
+            .unwrap();
+        assert_eq!(server.epoch_history.read().await.tip_epoch(), Some(2));
+        assert!(
+            server.deposit_targets.read().await.contains_key(&2),
+            "successful retry did not publish the certified successor target"
+        );
+        assert!(!server.staged.read().await.contains_key(&1));
+    }
+
+    #[tokio::test]
+    async fn equivalent_rotation_exact_tip_retry_uses_local_canonical_certificate() {
+        let state = tempfile::tempdir().unwrap();
+        let fixture = staged_target_only_successor_fixture(state.path()).await;
+        let server = fixture.server;
+        let canonical = fixture.epoch_two_certificate;
+        let context = fixture.epoch_two_context;
+        let target_identities = historical_target_identities(&context);
+        let alternate = certified_key_rotation_for_roles(
+            &context,
+            &server.receiver_keys.read().unwrap(),
+            &target_identities,
+            &[PartyId(1), PartyId(2), PartyId(3), PartyId(4), PartyId(5)],
+            &[PartyId(2), PartyId(3), PartyId(4), PartyId(6)],
+        );
+        assert_ne!(alternate, canonical);
+        assert!(alternate.proves_same_decision(&canonical, &context).unwrap());
+
+        // Simulate learning canonical witness subset A directly before history catch-up relays
+        // equivalent subset B. The first local representation must remain authoritative for
+        // staging, history archival, retry identity, and restart.
+        server
+            .protocol_store
+            .save_key_rotation_certificate(&context, &canonical, &mut OsRng)
+            .await
+            .unwrap();
+        let _ = boxed_activate_epoch(State(server.clone()), Json(fixture.epoch_one_activation))
+            .await
+            .unwrap();
+        let (stale_manifest, stale_activation, stale_rotation) =
+            historical_epoch_catchup_bundle(&server, 1).await;
+
+        let alternate_bytes = alternate.encode(&context).unwrap();
+        let network = server.scenario.quic_network_id().unwrap();
+        let activation_reference = EpochHistoryObjectRef::for_contents(
+            network,
+            crate::epoch_history::EpochHistoryObjectKind::ActivationCertificate,
+            &fixture.epoch_two_activation_bytes,
+        )
+        .unwrap();
+        let alternate_reference = EpochHistoryObjectRef::for_contents(
+            network,
+            crate::epoch_history::EpochHistoryObjectKind::KeyRotationCertificate,
+            &alternate_bytes,
+        )
+        .unwrap();
+        let alternate_manifest = EpochHistoryCatchupManifest::new(
+            fixture.epoch_two_manifest.parent(),
+            fixture.epoch_two_manifest.link(),
+            activation_reference,
+            Some(alternate_reference),
+        )
+        .unwrap();
+        server
+            .apply_epoch_history_catchup(
+                PartyId(1),
+                alternate_manifest,
+                fixture.epoch_two_activation_bytes.clone(),
+                Some(alternate_bytes.clone()),
+            )
+            .await
+            .unwrap();
+
+        let (canonical_manifest, _, _) =
+            historical_epoch_catchup_bundle(&server, context.target_epoch()).await;
+        assert_eq!(canonical_manifest.link(), alternate_manifest.link());
+        assert_ne!(
+            canonical_manifest.key_rotation_certificate(),
+            alternate_manifest.key_rotation_certificate(),
+            "test did not create distinct equivalent witness representations"
+        );
+        server
+            .apply_epoch_history_catchup(
+                PartyId(1),
+                alternate_manifest,
+                fixture.epoch_two_activation_bytes,
+                Some(alternate_bytes.clone()),
+            )
+            .await
+            .expect("semantic exact-tip retry rejected an equivalent witness subset");
+
+        let stale_error = server
+            .apply_epoch_history_catchup(
+                PartyId(1),
+                stale_manifest,
+                stale_activation,
+                stale_rotation,
+            )
+            .await
+            .expect_err("a valid certificate for an older link was accepted as the current tip");
+        assert!(
+            stale_error
+                .to_string()
+                .contains("epoch-history catch-up no longer extends the local tip"),
+            "unexpected stale-link rejection: {stale_error}"
+        );
+
+        let durable =
+            server.protocol_store.load_key_rotation_certificate(&context).await.unwrap().unwrap();
+        assert_eq!(durable, canonical);
+        let (_, _, archived_rotation) =
+            historical_epoch_catchup_bundle(&server, context.target_epoch()).await;
+        let archived_rotation = archived_rotation.unwrap();
+        assert_eq!(
+            KeyRotationCertificate::decode_embedded(&archived_rotation).unwrap(),
+            canonical,
+            "history archived the relay's equivalent witness subset instead of local canonical A"
+        );
+        assert_ne!(archived_rotation, alternate_bytes);
+
+        let scenario = server.scenario.clone();
+        drop(server);
+        let joiner = PartyId(6);
+        let joiner_state = state.path().join("joiner");
+        let joiner_seed = historical_replay_seed(joiner);
+        let restarted =
+            boxed_non_genesis_party_server_new(joiner, scenario, &joiner_state, &joiner_seed)
+                .await
+                .unwrap();
+        let restored = restarted
+            .certified_key_rotations
+            .read()
+            .unwrap()
+            .get(&context.target_epoch())
+            .cloned()
+            .unwrap();
+        assert_eq!(restored.certificate, canonical);
+        assert_eq!(
+            restored.semantic_digest,
+            alternate.semantic_digest(&context).unwrap(),
+            "restart changed the witness-independent decision identity"
+        );
+        let (_, _, restarted_rotation) =
+            historical_epoch_catchup_bundle(&restarted, context.target_epoch()).await;
+        assert_eq!(
+            KeyRotationCertificate::decode_embedded(&restarted_rotation.unwrap()).unwrap(),
+            canonical
+        );
+    }
+
+    async fn source_only_retirement_fixture(
+        scenario: &Scenario,
+        state_directory: &std::path::Path,
+        local: PartyId,
+        deposit: Option<PartyDepositConfig>,
+    ) -> (Arc<PartyServer>, KeyRotationContext, ActivateEpochRequest) {
+        let signing_seed = historical_replay_seed(local);
+        let bootstrap_x25519_secret = historical_replay_x25519_secret(local, 0);
+        let server = match deposit {
+            Some(deposit) => {
+                PartyServer::new_with_deposits(
+                    local,
+                    scenario.clone(),
+                    state_directory,
+                    &signing_seed,
+                    &bootstrap_x25519_secret,
+                    deposit,
+                )
+                .await
+            }
+            None => {
+                PartyServer::new(
+                    local,
+                    scenario.clone(),
+                    state_directory,
+                    &signing_seed,
+                    &bootstrap_x25519_secret,
+                )
+                .await
+            }
+        }
+        .unwrap();
+        let old_committee = scenario.genesis_committee().unwrap();
+        let (key_id, _) = canonical_dkg_identity(scenario).unwrap();
+        let dkg_polynomials = old_committee
+            .members
+            .iter()
+            .map(|member| {
+                (member.id, SecretPolynomial::random(old_committee.threshold, &mut OsRng).unwrap())
+            })
+            .collect::<BTreeMap<_, _>>();
+        let old_shares = old_committee
+            .members
+            .iter()
+            .map(|recipient| {
+                let outputs = dkg_polynomials
+                    .iter()
+                    .map(|(dealer, polynomial)| {
+                        make_dkg_output(*dealer, polynomial, &old_committee, recipient.id).unwrap()
+                    })
+                    .collect();
+                (
+                    recipient.id,
+                    aggregate_dkg(key_id, old_committee.clone(), recipient.id, outputs).unwrap(),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let old_share = old_shares[&local].clone();
+        install_proactive_epoch_zero(&server, &old_share).await;
+        let old_public = old_share.public();
+
+        // A successor history append permanently supersedes the predecessor reducer. Retain the
+        // same durable genesis reducer that the live protocol would still have before activation,
+        // so the fixture reaches the real history-CAS and cleanup paths.
+        let genesis_transition = canonical_dkg_transition(scenario).unwrap();
+        let mut genesis_run = new_avss_run(&server, genesis_transition.clone()).unwrap();
+        genesis_run.finalized = Some(
+            server.activations.read().await.get(&0).cloned().expect("active genesis response"),
+        );
+        server.persist_avss_run(&genesis_run).await.unwrap();
+        server.avss.lock().await.insert(genesis_transition.session, genesis_run);
+        assert!(
+            server.compact_certified_avss_transition(&genesis_transition).await.unwrap(),
+            "certified genesis reducer did not compact before source retirement"
+        );
+
+        const SOURCE_ARMED_AT: u64 = 40_000;
+        const SOURCE_DUE: u64 = SOURCE_ARMED_AT + 1_000;
+        server.arm_proactive_refresh_for_activation(&old_public, SOURCE_ARMED_AT).await.unwrap();
+        server.ensure_key_rotation_started(&old_public, SOURCE_DUE).await.unwrap();
+        let live_context = server
+            .key_rotation
+            .lock()
+            .await
+            .as_ref()
+            .expect("source receiver-key round must be live")
+            .round
+            .context()
+            .clone();
+        assert!(
+            server.protocol_store.load_key_rotation_round(&live_context).await.unwrap().is_some(),
+            "source receiver-key round must be durable before successor certification"
+        );
+
+        // Party four is an old source member and an eligible candidate, but the certified exact
+        // target selects the four other old members plus the spare. Its only successor ingress is
+        // therefore Retire, rather than local activation.
+        assert_eq!(local, PartyId(4));
+        let (context, certificate, target) = install_historical_key_rotation(
+            &server,
+            &old_public,
+            &[PartyId(1), PartyId(2), PartyId(3), PartyId(5), PartyId(6)],
+            &[PartyId(1), PartyId(2), PartyId(3), PartyId(5)],
+        )
+        .await;
+        assert_eq!(context, live_context);
+        assert!(target.member(local).is_err(), "fixture local party was not removed");
+        // Give the source reducer the same terminal certificate it would learn over QUIC and
+        // checkpoint that state before activation. Reducer retirement deliberately requires the
+        // active snapshot and immutable certificate to agree byte-for-byte.
+        let source_identity = server.identity(context.source().epoch).unwrap();
+        {
+            let mut live = server.key_rotation.lock().await;
+            let runtime = live.as_mut().expect("source receiver-key round disappeared");
+            let step = {
+                let receiver_keys = server.receiver_keys.read().unwrap();
+                runtime
+                    .round
+                    .handle_wire(
+                        PartyId(1),
+                        KeyRotationWire::Certificate(certificate.clone()),
+                        &source_identity,
+                        &receiver_keys,
+                    )
+                    .unwrap()
+            };
+            assert_eq!(step.committed, Some(certificate.clone()));
+            let revision = runtime.revision.checked_add(1).unwrap();
+            server
+                .protocol_store
+                .save_key_rotation_round(&context, revision, &runtime.round, &mut OsRng)
+                .await
+                .unwrap();
+            runtime.revision = revision;
+        }
+
+        let transition =
+            server.configured_proactive_refresh_transition(&old_public).unwrap().unwrap();
+        assert_eq!(transition.target, target);
+        let selected_dealers = [PartyId(1), PartyId(2), PartyId(3)];
+        let polynomials = selected_dealers
+            .iter()
+            .map(|dealer| {
+                (
+                    *dealer,
+                    make_proactive_reshare_polynomial(
+                        &old_shares[dealer],
+                        *dealer,
+                        target.threshold,
+                        &mut OsRng,
+                    )
+                    .unwrap(),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let successor_recipient = PartyId(1);
+        let outputs = selected_dealers
+            .iter()
+            .map(|dealer| {
+                make_dkg_output(*dealer, &polynomials[dealer], &target, successor_recipient)
+                    .unwrap()
+            })
+            .collect();
+        let successor_public = aggregate_proactive_reshare(
+            &old_shares[&successor_recipient],
+            target,
+            successor_recipient,
+            &selected_dealers,
+            outputs,
+        )
+        .unwrap()
+        .public();
+        let activation = historical_activation_request(
+            &transition,
+            successor_public,
+            0xE4,
+            certificate.resulting_receiver_keys(&context).unwrap(),
+            Some(certificate.semantic_digest(&context).unwrap()),
+        );
+        (server, context, activation)
+    }
+
+    #[tokio::test]
+    async fn terminal_reshare_rotation_restart_restores_schedule_before_launching_avss() {
+        let scenario = proactive_refresh_scenario();
+        let local = PartyId(4);
+        let state = tempfile::tempdir().unwrap();
+        let (server, context, activation) =
+            source_only_retirement_fixture(&scenario, state.path(), local, None).await;
+        assert!(
+            server
+                .key_rotation
+                .lock()
+                .await
+                .as_ref()
+                .is_some_and(|live| live.round.certificate().is_some())
+        );
+        let receiver_only = new_avss_run(&server, activation.transition.clone()).unwrap();
+        assert!(
+            receiver_only.dealer_outbound.is_none(),
+            "receiver-only fixture unexpectedly contains a local dealer outbox"
+        );
+        server.persist_avss_run(&receiver_only).await.unwrap();
+        assert!(
+            server.avss.lock().await.insert(activation.transition.session, receiver_only).is_none()
+        );
+        drop(server);
+
+        let restarted = PartyServer::new(
+            local,
+            scenario,
+            state.path(),
+            &historical_replay_seed(local),
+            &historical_replay_x25519_secret(local, 0),
+        )
+        .await
+        .unwrap();
+        let schedule = restarted.proactive_refresh_schedule.lock().await.clone().unwrap();
+        assert_eq!(schedule.phase, ProactiveRefreshSchedulePhase::Armed);
+        assert_eq!(schedule.source_epoch, context.source().epoch);
+        assert!(
+            restarted.avss.lock().await.get(&activation.transition.session).is_some_and(|run| {
+                run.transition == activation.transition && run.dealer_outbound.is_some()
+            }),
+            "terminal restored rotation did not launch its certified resharing transition"
+        );
+    }
+
+    #[tokio::test]
+    async fn source_only_retire_closes_predecessor_rotation_and_replay_preserves_successor_schedule()
+     {
+        let scenario = proactive_refresh_scenario();
+        let local = PartyId(4);
+        let state = tempfile::tempdir().unwrap();
+        let (server, context, activation) =
+            source_only_retirement_fixture(&scenario, state.path(), local, None).await;
+
+        boxed_retire_epoch(State(server.clone()), Json(activation.clone())).await.unwrap();
+        assert!(
+            server.key_rotation.lock().await.is_none(),
+            "removed source retained the predecessor receiver-key reducer"
+        );
+        assert!(matches!(
+            server.protocol_store.load_key_rotation_round(&context).await,
+            Err(StoreError::KeyRotationRoundRetired(key))
+                if key.target_epoch == context.target_epoch()
+                    && key.context_digest == context.digest()
+        ));
+        let successor_schedule = server
+            .proactive_refresh_schedule
+            .lock()
+            .await
+            .clone()
+            .expect("source-only Retire must arm the successor's fixed interval");
+        assert_eq!(successor_schedule.source_epoch, activation.value.epoch);
+        assert_eq!(successor_schedule.source_activation, activation.value.activation_digest);
+        assert_eq!(
+            successor_schedule.target_epoch,
+            activation.value.epoch.checked_add(1),
+            "removed source lost eligibility for the next receiver-key rotation"
+        );
+
+        boxed_retire_epoch(State(server.clone()), Json(activation)).await.unwrap();
+        assert_eq!(
+            server.proactive_refresh_schedule.lock().await.clone(),
+            Some(successor_schedule),
+            "an authenticated Retire replay regressed or moved the successor schedule"
+        );
+        assert!(server.key_rotation.lock().await.is_none());
+        assert!(matches!(
+            server.protocol_store.load_key_rotation_round(&context).await,
+            Err(StoreError::KeyRotationRoundRetired(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn source_retirement_promotes_the_adjacent_deferred_schedule_without_deadlock() {
+        let scenario = proactive_refresh_scenario();
+        let state = tempfile::tempdir().unwrap();
+        let (server, _, activation) =
+            source_only_retirement_fixture(&scenario, state.path(), PartyId(4), None).await;
+        server
+            .persist_activation_certificate(
+                &activation.transition,
+                &activation.value,
+                &activation.acknowledgements,
+            )
+            .await
+            .unwrap();
+        server.remember_certified_deposit_target(&activation.value).await.unwrap();
+        server.reconcile_proactive_refresh_schedule_from_history(90_000).await.unwrap();
+        let primary = server.proactive_refresh_schedule.lock().await.clone().unwrap();
+        let deferred = primary.deferred_observer.expect("adjacent observer was not deferred");
+        assert_eq!(primary.source_epoch + 1, deferred.source_epoch);
+        let expected = server
+            .promoted_observer_schedule(deferred, primary.rotation_certificate_delivered_through);
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            boxed_retire_epoch(State(server.clone()), Json(activation)),
+        )
+        .await
+        .expect("source retirement deadlocked while promoting its adjacent observer")
+        .unwrap();
+        assert_eq!(server.proactive_refresh_schedule.lock().await.as_ref(), Some(&expected));
+        assert!(server.epochs.read().await.is_empty());
+        let durable = server
+            .protocol_store
+            .load_proactive_refresh_schedule(scenario.quic_network_id().unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(decode_postcard_exact::<ProactiveRefreshSchedule>(&durable).unwrap(), expected);
+    }
+
+    #[tokio::test]
+    async fn cancelled_retirement_remains_discoverable_and_core_retries_without_deposits() {
+        let scenario = proactive_refresh_scenario();
+        let local = PartyId(4);
+        let state = tempfile::tempdir().unwrap();
+        let (server, _context, activation) =
+            source_only_retirement_fixture(&scenario, state.path(), local, None).await;
+        let old = activation.transition.old.as_ref().unwrap();
+        let retirement = ShareRetirement::for_certified_successor(
+            old.committee.epoch,
+            old.committee.digest(),
+            activation.value.epoch,
+            activation.value.activation_digest,
+        )
+        .unwrap();
+        server
+            .persist_activation_certificate(
+                &activation.transition,
+                &activation.value,
+                &activation.acknowledgements,
+            )
+            .await
+            .unwrap();
+
+        // Cancel precisely while volatile publication is blocked. No storage mutation may
+        // precede acquisition of all guards, and the predecessor must remain a retry candidate.
+        let held_activations = server.activations.write().await;
+        let retiring = {
+            let server = Arc::clone(&server);
+            tokio::spawn(async move { server.retire_local_epoch_share(retirement).await })
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while server.epochs.try_read().is_ok() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("retirement never reached the blocked publication guard");
+        retiring.abort();
+        assert!(retiring.await.unwrap_err().is_cancelled());
+        drop(held_activations);
+        assert!(server.epochs.read().await.contains_key(&old.committee.epoch));
+        assert_eq!(
+            server
+                .store
+                .load_retirement(old.committee.epoch, old.committee.digest())
+                .await
+                .unwrap(),
+            None
+        );
+
+        // Simulate cancellation after marker durability but before volatile removal. The same
+        // core timer must finish marker replay without deposits, peer replay, or process restart.
+        server.store.retire_share(retirement).await.unwrap();
+        server.progress_protocols(1, std::time::Duration::from_millis(10)).await.unwrap();
+        assert!(!server.epochs.read().await.contains_key(&old.committee.epoch));
+        assert!(!server.activations.read().await.contains_key(&old.committee.epoch));
+        assert_eq!(*server.active_epoch.read().await, None);
+        assert_eq!(
+            server
+                .store
+                .load_retirement(old.committee.epoch, old.committee.digest())
+                .await
+                .unwrap(),
+            Some(retirement)
+        );
+        server.progress_protocols(1, std::time::Duration::from_millis(10)).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn retirement_marker_replay_retires_the_drained_certified_transition() {
+        let scenario = proactive_refresh_scenario();
+        let local = PartyId(4);
+        let state = tempfile::tempdir().unwrap();
+        let (server, _context, activation) =
+            source_only_retirement_fixture(&scenario, state.path(), local, None).await;
+        let old = activation.transition.old.as_ref().unwrap();
+        let session = activation.transition.session;
+
+        let drained = new_avss_run(&server, activation.transition.clone()).unwrap();
+        assert!(peer_outbox_is_empty(&drained));
+        server.persist_avss_run(&drained).await.unwrap();
+        assert!(server.avss.lock().await.insert(session, drained).is_none());
+        let context = avss_transition_digest(&activation.transition).unwrap();
+        let state_path = server.protocol_store.session_state_path(session, context);
+        let tombstone_path = server.protocol_store.session_tombstone_path(session);
+        assert!(tokio::fs::try_exists(&state_path).await.unwrap());
+        assert!(!tokio::fs::try_exists(&tombstone_path).await.unwrap());
+
+        // Leave the share-retirement marker durable while the source identity is still leased.
+        // The replay must finish every idempotent cleanup step, including the certified,
+        // fully-drained AVSS session that normal execution had not yet reached.
+        let held_identity = server.identity(old.committee.epoch).unwrap();
+        let first_error =
+            boxed_retire_epoch(State(server.clone()), Json(activation.clone())).await.unwrap_err();
+        assert!(
+            format!("{:#}", first_error.0).contains("epoch identity leases are still live"),
+            "Retire failed before the identity-drain cancellation cut: {:#}",
+            first_error.0
+        );
+        assert!(server.avss.lock().await.contains_key(&session));
+        assert!(tokio::fs::try_exists(&state_path).await.unwrap());
+        assert!(!tokio::fs::try_exists(&tombstone_path).await.unwrap());
+
+        drop(held_identity);
+        boxed_retire_epoch(State(server.clone()), Json(activation)).await.unwrap();
+        assert!(!server.avss.lock().await.contains_key(&session));
+        assert!(!tokio::fs::try_exists(state_path).await.unwrap());
+        assert!(tokio::fs::try_exists(tombstone_path).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn retirement_marker_replay_reauthorizes_late_genesis_before_source_identity_erasure() {
+        let scenario = proactive_refresh_scenario();
+        let local = PartyId(4);
+        let state = tempfile::tempdir().unwrap();
+        let chain = Arc::new(GatedDepositChain::default());
+        let backend = Arc::new(
+            ReconnectingMoneroDaemon::new(
+                ["http://127.0.0.1:9"],
+                NetworkKind::Regtest,
+                MoneroRpcLimits {
+                    request_timeout: std::time::Duration::from_millis(50),
+                    ..Default::default()
+                },
+            )
+            .unwrap(),
+        );
+        let (server, _context, activation) = source_only_retirement_fixture(
+            &scenario,
+            state.path(),
+            local,
+            Some(PartyDepositConfig {
+                private_view_scalar: Zeroizing::new(Scalar::from(7_u64).to_bytes()),
+                birth_anchor: None,
+                worker: DepositWorkerConfig::default(),
+                chain_source: chain.clone(),
+                consolidation_backend: backend.clone(),
+                chain_readiness: backend.readiness(),
+            }),
+        )
+        .await;
+        let old = activation.transition.old.clone().unwrap();
+        let old_epoch = old.committee.epoch;
+        let old_member = old.committee.member(local).unwrap();
+        let expected_retirement = ShareRetirement::for_certified_successor(
+            old_epoch,
+            old.committee.digest(),
+            activation.value.epoch,
+            activation.value.activation_digest,
+        )
+        .unwrap();
+
+        // Keep one transport-identity lease alive so Retire reaches the crash boundary after the
+        // share tombstone rename but before the source X25519 secret can be destroyed.
+        let held_identity = server.identity(old_epoch).unwrap();
+        let first_error =
+            boxed_retire_epoch(State(server.clone()), Json(activation.clone())).await.unwrap_err();
+        assert!(
+            format!("{:#}", first_error.0).contains("epoch identity leases are still live"),
+            "Retire failed before reaching the identity-drain cut: {:#}",
+            first_error.0
+        );
+        assert_eq!(
+            server.store.load_retirement(old_epoch, old.committee.digest()).await.unwrap(),
+            Some(expected_retirement),
+            "the cancellation cut did not leave the authenticated share tombstone durable"
+        );
+        assert!(
+            server
+                .protocol_store
+                .load_epoch_identity_retirement(old_epoch, old_member.encryption_key)
+                .await
+                .unwrap()
+                .is_none(),
+            "the failed Retire erased the source transport secret"
+        );
+
+        // A cancellation immediately after the share-marker rename can leave the in-memory
+        // identity selectable. Restore that exact placement rather than manufacturing a new
+        // identity, then let a delayed canonical genesis publish behind the same fence.
+        let retiring_identity = server
+            .retiring_identities
+            .write()
+            .unwrap()
+            .remove(&old_epoch)
+            .flatten()
+            .expect("failed Retire did not retain the leased source identity");
+        assert!(Arc::ptr_eq(&held_identity, &retiring_identity));
+        assert!(server.identities.write().unwrap().insert(old_epoch, retiring_identity).is_none());
+
+        let initializing = {
+            let server = server.clone();
+            tokio::spawn(async move { server.ensure_deposit_initialized().await })
+        };
+        chain.wait_until_polled().await;
+        assert!(
+            server
+                .store
+                .load_retirement(old_epoch, old.committee.digest())
+                .await
+                .unwrap()
+                .is_some(),
+            "late genesis preparation replaced the existing share tombstone"
+        );
+        chain.release();
+        initializing.await.unwrap().unwrap();
+        assert_eq!(
+            server.deposit.as_ref().unwrap().active_epoch().await.unwrap(),
+            old_epoch,
+            "late canonical genesis did not publish at the retired source epoch"
+        );
+        assert!(server.deposit.as_ref().unwrap().local_runtime_ready());
+
+        let replay_error =
+            boxed_retire_epoch(State(server.clone()), Json(activation)).await.unwrap_err();
+        assert!(
+            format!("{:#}", replay_error.0).contains("handoff"),
+            "share-marker replay was not stopped by the newly durable deposit obligation: {:#}",
+            replay_error.0
+        );
+        let full_identity = server.identity(old_epoch).unwrap();
+        assert_eq!(full_identity.encryption_public_key(), old_member.encryption_key);
+        assert_eq!(
+            server.deposit_consensus_signer(old_epoch).await.unwrap().scope(),
+            EnvelopeSignerScope::Full,
+            "share-marker replay downgraded the still-live source identity"
+        );
+        assert!(
+            server
+                .protocol_store
+                .load_epoch_identity_retirement(old_epoch, old_member.encryption_key)
+                .await
+                .unwrap()
+                .is_none(),
+            "share-marker replay erased X25519 before reauthorizing late genesis"
+        );
+        assert_eq!(
+            server.store.load_retirement(old_epoch, old.committee.digest()).await.unwrap(),
+            Some(expected_retirement),
+            "failed replay altered the original authenticated share tombstone"
+        );
+        drop(full_identity);
+        drop(held_identity);
+    }
+
+    #[tokio::test]
+    async fn restart_repairs_source_only_retirement_after_schedule_before_rotation_cleanup_crash() {
+        let scenario = proactive_refresh_scenario();
+        let local = PartyId(4);
+        let state = tempfile::tempdir().unwrap();
+        let (server, context, activation) =
+            source_only_retirement_fixture(&scenario, state.path(), local, None).await;
+
+        // Reproduce the live Retire write order through its explicit crash cut: the successor
+        // activation/history certificate and next fixed deadline are durable, while the old share
+        // and receiver-key reducer remain live because cleanup has not run yet.
+        server
+            .persist_activation_certificate(
+                &activation.transition,
+                &activation.value,
+                &activation.acknowledgements,
+            )
+            .await
+            .unwrap();
+        server.remember_certified_deposit_target(&activation.value).await.unwrap();
+        let old = activation.transition.old.as_ref().unwrap();
+        server
+            .deposit_targets
+            .write()
+            .await
+            .entry(old.committee.epoch)
+            .or_insert_with(|| old.clone());
+        const SUCCESSOR_ARMED_AT: u64 = 90_000;
+        const SUCCESSOR_DUE: u64 = SUCCESSOR_ARMED_AT + 1_000;
+        server
+            .arm_proactive_refresh_for_activation(&activation.value.public, SUCCESSOR_ARMED_AT)
+            .await
+            .unwrap();
+        let crash_schedule =
+            server.proactive_refresh_schedule.lock().await.clone().expect("successor schedule");
+        assert_eq!(crash_schedule.source_epoch, activation.value.epoch);
+        assert_eq!(crash_schedule.due_unix_ms, Some(SUCCESSOR_DUE));
+        assert!(server.key_rotation.lock().await.is_some());
+        assert!(server.protocol_store.load_key_rotation_round(&context).await.unwrap().is_some());
+        drop(server);
+
+        let restarted = PartyServer::new(
+            local,
+            scenario,
+            state.path(),
+            &historical_replay_seed(local),
+            &historical_replay_x25519_secret(local, 0),
+        )
+        .await
+        .unwrap();
+        assert!(
+            restarted.key_rotation.lock().await.is_none(),
+            "restart reloaded a receiver-key reducer whose successor was already certified"
+        );
+        assert!(matches!(
+            restarted.protocol_store.load_key_rotation_round(&context).await,
+            Err(StoreError::KeyRotationRoundRetired(key))
+                if key.target_epoch == context.target_epoch()
+                    && key.context_digest == context.digest()
+        ));
+        assert_eq!(
+            restarted.proactive_refresh_schedule.lock().await.clone(),
+            Some(crash_schedule),
+            "restart cleanup moved or regressed the already durable successor schedule"
+        );
+    }
+
+    #[tokio::test]
+    async fn passive_observer_defers_future_schedule_until_durable_source_retirement() {
+        let scenario = proactive_refresh_scenario();
+        let local = PartyId(4);
+        let state = tempfile::tempdir().unwrap();
+        let (server, _context_one, activation_one) =
+            source_only_retirement_fixture(&scenario, state.path(), local, None).await;
+
+        // Reproduce the Retire crash window: epoch one is certified and scheduled, but the
+        // removed source party still has its active epoch-zero share. A later passive epoch-two
+        // certificate must not replace this adjacent primary schedule.
+        server
+            .persist_activation_certificate(
+                &activation_one.transition,
+                &activation_one.value,
+                &activation_one.acknowledgements,
+            )
+            .await
+            .unwrap();
+        server.remember_certified_deposit_target(&activation_one.value).await.unwrap();
+        const EPOCH_ONE_ARMED_AT: u64 = 90_000;
+        server
+            .arm_proactive_refresh_for_activation(&activation_one.value.public, EPOCH_ONE_ARMED_AT)
+            .await
+            .unwrap();
+        let mut primary = server.proactive_refresh_schedule.lock().await.clone().unwrap();
+        primary.rotation_certificate_delivered_through.insert(PartyId(1), 1);
+        server.persist_proactive_refresh_schedule(primary.clone()).await.unwrap();
+
+        let epoch_one_public = activation_one.value.public.clone();
+        let (context_two, certificate_two, target_two) = install_historical_key_rotation(
+            &server,
+            &epoch_one_public,
+            &[PartyId(1), PartyId(2), PartyId(3), PartyId(5), PartyId(6)],
+            &[PartyId(1), PartyId(2), PartyId(3), PartyId(5)],
+        )
+        .await;
+        assert!(target_two.member(local).is_err());
+        let transition_two =
+            server.configured_proactive_refresh_transition(&epoch_one_public).unwrap().unwrap();
+        assert_eq!(transition_two.target, target_two);
+        let epoch_two_public =
+            same_key_public_for_committee(&epoch_one_public, target_two, 0xE2_0000);
+        let activation_two = historical_activation_request(
+            &transition_two,
+            epoch_two_public,
+            0xE2,
+            certificate_two.resulting_receiver_keys(&context_two).unwrap(),
+            Some(certificate_two.semantic_digest(&context_two).unwrap()),
+        );
+
+        // Reproduce a production timeout after the activation/history CAS and target publication
+        // but before the passive schedule candidate. No old catch-up bundle is replayed: the
+        // production reconciler must derive the missing bounded candidate from authenticated
+        // durable history before another protocol tick or Next request can advance it again.
+        server
+            .persist_activation_certificate(
+                &activation_two.transition,
+                &activation_two.value,
+                &activation_two.acknowledgements,
+            )
+            .await
+            .unwrap();
+        server.remember_certified_deposit_target(&activation_two.value).await.unwrap();
+        assert_eq!(
+            server.proactive_refresh_schedule.lock().await.clone(),
+            Some(primary.clone()),
+            "history-only crash cut unexpectedly published an observer candidate"
+        );
+        const EPOCH_TWO_RECONCILED_AT: u64 = 100_000;
+        server
+            .reconcile_proactive_refresh_schedule_from_history(EPOCH_TWO_RECONCILED_AT)
+            .await
+            .unwrap();
+        let epoch_two_schedule = server.proactive_refresh_schedule.lock().await.clone().unwrap();
+        assert_eq!(epoch_two_schedule.source_epoch, activation_one.value.epoch);
+        assert_eq!(epoch_two_schedule.due_unix_ms, primary.due_unix_ms);
+        assert_eq!(
+            epoch_two_schedule.rotation_certificate_delivered_through,
+            primary.rotation_certificate_delivered_through
+        );
+        let epoch_two_deferred =
+            epoch_two_schedule.deferred_observer.expect("missing epoch-two candidate");
+        assert_eq!(epoch_two_deferred.source_epoch, activation_two.value.epoch);
+        assert_eq!(epoch_two_deferred.source_activation, activation_two.value.activation_digest);
+        assert_eq!(
+            epoch_two_deferred.source_history_root,
+            activation_two.value.history_link.root().unwrap()
+        );
+        let epoch_two_due = epoch_two_deferred.due_unix_ms.expect("epoch two must be scheduled");
+        assert_eq!(epoch_two_due, EPOCH_TWO_RECONCILED_AT + 1_000);
+        assert!(
+            epoch_two_deferred
+                .selection_fallback_due_unix_ms
+                .is_some_and(|fallback| fallback > epoch_two_due)
+        );
+
+        // A later runtime reconciliation must retain the first fixed deadline and exact sealed
+        // history endpoint byte-for-byte.
+        server
+            .reconcile_proactive_refresh_schedule_from_history(EPOCH_TWO_RECONCILED_AT + 50_000)
+            .await
+            .unwrap();
+        assert_eq!(
+            server.proactive_refresh_schedule.lock().await.clone(),
+            Some(epoch_two_schedule.clone()),
+            "passive replay moved the first observed deadline or history cursor"
+        );
+
+        // Advance the single sealed endpoint once more. This replacement authenticates only the
+        // epoch-two-to-epoch-three suffix, while the stored epoch-two history root vouches for the
+        // already-checked prefix from the still-live primary.
+        let epoch_two_public = activation_two.value.public.clone();
+        let (context_three, certificate_three, target_three) = install_historical_key_rotation(
+            &server,
+            &epoch_two_public,
+            &[PartyId(1), PartyId(2), PartyId(3), PartyId(5), PartyId(6)],
+            &[PartyId(1), PartyId(2), PartyId(3), PartyId(5)],
+        )
+        .await;
+        assert!(target_three.member(local).is_err());
+        let transition_three =
+            server.configured_proactive_refresh_transition(&epoch_two_public).unwrap().unwrap();
+        let epoch_three_public =
+            same_key_public_for_committee(&epoch_two_public, target_three, 0xE3_0000);
+        let activation_three = historical_activation_request(
+            &transition_three,
+            epoch_three_public,
+            0xE3,
+            certificate_three.resulting_receiver_keys(&context_three).unwrap(),
+            Some(certificate_three.semantic_digest(&context_three).unwrap()),
+        );
+        observe_epoch_certificate(&server, activation_three.clone()).await.unwrap();
+        let deferred_schedule = server.proactive_refresh_schedule.lock().await.clone().unwrap();
+        assert_eq!(deferred_schedule.source_epoch, activation_one.value.epoch);
+        assert_eq!(deferred_schedule.due_unix_ms, primary.due_unix_ms);
+        assert_eq!(
+            deferred_schedule.rotation_certificate_delivered_through,
+            primary.rotation_certificate_delivered_through
+        );
+        let deferred = deferred_schedule.deferred_observer.expect("missing epoch-three candidate");
+        assert_eq!(deferred.source_epoch, activation_three.value.epoch);
+        assert_eq!(deferred.source_activation, activation_three.value.activation_digest);
+        assert_eq!(
+            deferred.source_history_root,
+            activation_three.value.history_link.root().unwrap()
+        );
+        assert_ne!(deferred.source_history_root, epoch_two_deferred.source_history_root);
+        let first_epoch_three_due =
+            deferred.due_unix_ms.expect("epoch three must retain a refresh deadline");
+        assert!(
+            deferred
+                .selection_fallback_due_unix_ms
+                .is_some_and(|fallback| fallback > first_epoch_three_due)
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        observe_epoch_certificate(&server, activation_three.clone()).await.unwrap();
+        assert_eq!(
+            server.proactive_refresh_schedule.lock().await.clone(),
+            Some(deferred_schedule.clone()),
+            "newest passive replay moved its first deadline or sealed endpoint"
+        );
+
+        // Advance durable history once more into a committee which selected this party, but do
+        // not stage or activate its share. Reconciliation may retain the latest safe epoch-three
+        // endpoint; it must never skip the missing epoch-four signer even when invoked again from
+        // the production Next-request hook.
+        let epoch_three_public = activation_three.value.public.clone();
+        let (context_four, certificate_four, target_four) = install_historical_key_rotation(
+            &server,
+            &epoch_three_public,
+            &[PartyId(1), PartyId(2), PartyId(3), PartyId(4), PartyId(5)],
+            &[PartyId(1), PartyId(2), PartyId(3), PartyId(5)],
+        )
+        .await;
+        assert!(target_four.member(local).is_ok());
+        let transition_four =
+            server.configured_proactive_refresh_transition(&epoch_three_public).unwrap().unwrap();
+        let epoch_four_public =
+            same_key_public_for_committee(&epoch_three_public, target_four, 0xE4_0000);
+        let activation_four = historical_activation_request(
+            &transition_four,
+            epoch_four_public,
+            0xE4,
+            certificate_four.resulting_receiver_keys(&context_four).unwrap(),
+            Some(certificate_four.semantic_digest(&context_four).unwrap()),
+        );
+        server
+            .persist_activation_certificate(
+                &activation_four.transition,
+                &activation_four.value,
+                &activation_four.acknowledgements,
+            )
+            .await
+            .unwrap();
+        server.remember_certified_deposit_target(&activation_four.value).await.unwrap();
+        assert!(!server.staged.read().await.contains_key(&activation_four.value.epoch));
+        assert!(!server.epochs.read().await.contains_key(&activation_four.value.epoch));
+        server
+            .reconcile_proactive_refresh_schedule_from_history(EPOCH_TWO_RECONCILED_AT + 60_000)
+            .await
+            .unwrap();
+        assert_eq!(
+            server.proactive_refresh_schedule.lock().await.clone(),
+            Some(deferred_schedule.clone()),
+            "history reconciliation skipped a locally selected epoch"
+        );
+        let parent = server.epoch_history_catchup_parent().await.unwrap();
+        assert_eq!(parent.epoch(), Some(activation_four.value.epoch));
+        assert_eq!(
+            server.proactive_refresh_schedule.lock().await.clone(),
+            Some(deferred_schedule.clone()),
+            "Next-request reconciliation skipped a locally selected epoch"
+        );
+
+        // Force the same portable-state fail-closed condition which exposed the production race:
+        // a present but unauthentic wallet record blocks certificate-replay retirement without
+        // making PartyServer construction fail. This gives the real constructor the exact durable
+        // e0-share/e1-primary/e3-deferred crash cut to restore. Once asserted, removing this
+        // deliberately malformed temp-fixture record proves snapshot absence to ordinary Retire.
+        let private_view_scalar = Zeroizing::new(Scalar::from(7_u64).to_bytes());
+        let deriver = DepositAddressDeriver::new(
+            NetworkKind::Regtest,
+            activation_one.value.public.group_key_bytes(),
+            &private_view_scalar,
+        )
+        .unwrap();
+        let snapshot_store =
+            WalletSnapshotStore::new(state.path(), local, &historical_replay_seed(local)).unwrap();
+        let malformed_snapshot =
+            snapshot_store.wallet_snapshot_path(WalletId(deriver.wallet_id().0));
+        tokio::fs::create_dir_all(malformed_snapshot.parent().unwrap()).await.unwrap();
+        tokio::fs::write(&malformed_snapshot, [0xA5; 32]).await.unwrap();
+        let chain = Arc::new(BlockingDepositChain::default());
+        let backend = Arc::new(
+            ReconnectingMoneroDaemon::new(
+                ["http://127.0.0.1:9"],
+                NetworkKind::Regtest,
+                MoneroRpcLimits {
+                    request_timeout: std::time::Duration::from_millis(50),
+                    ..Default::default()
+                },
+            )
+            .unwrap(),
+        );
+        drop(server);
+        let restarted = boxed_party_server_new_with_deposits(
+            local,
+            scenario.clone(),
+            state.path(),
+            &historical_replay_seed(local),
+            &historical_replay_x25519_secret(local, 0),
+            PartyDepositConfig {
+                private_view_scalar: private_view_scalar.clone(),
+                birth_anchor: None,
+                worker: DepositWorkerConfig::default(),
+                chain_source: chain.clone(),
+                consolidation_backend: backend.clone(),
+                chain_readiness: backend.readiness(),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(*restarted.active_epoch.read().await, Some(0));
+        assert!(
+            restarted
+                .store
+                .load_if_active(
+                    0,
+                    activation_one.transition.old.as_ref().unwrap().committee.digest()
+                )
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(
+            restarted.proactive_refresh_schedule.lock().await.clone(),
+            Some(deferred_schedule.clone())
+        );
+        tokio::fs::remove_file(&malformed_snapshot).await.unwrap();
+
+        // The ordinary Retire reducer authenticates and reads back the durable tombstone before
+        // promoting. Promotion consumes the candidate exactly once, clears its live rotation
+        // state, and carries the primary delivery cursor without moving either deadline.
+        boxed_retire_epoch(State(restarted.clone()), Json(activation_one.clone())).await.unwrap();
+        let promoted = restarted.proactive_refresh_schedule.lock().await.clone().unwrap();
+        assert_eq!(promoted.source_epoch, deferred.source_epoch);
+        assert_eq!(promoted.source_activation, deferred.source_activation);
+        assert_eq!(promoted.target_epoch, deferred.target_epoch);
+        assert_eq!(promoted.due_unix_ms, deferred.due_unix_ms);
+        assert_eq!(
+            promoted.selection_fallback_due_unix_ms,
+            deferred.selection_fallback_due_unix_ms
+        );
+        assert_eq!(
+            promoted.rotation_certificate_delivered_through,
+            primary.rotation_certificate_delivered_through
+        );
+        assert!(promoted.deferred_observer.is_none());
+        assert!(promoted.rotation_view.is_none());
+        assert!(
+            restarted
+                .store
+                .load_retirement(
+                    0,
+                    activation_one.transition.old.as_ref().unwrap().committee.digest()
+                )
+                .await
+                .unwrap()
+                .is_some()
+        );
+
+        drop(restarted);
+        let restarted_after_promotion = boxed_party_server_new_with_deposits(
+            local,
+            scenario,
+            state.path(),
+            &historical_replay_seed(local),
+            &historical_replay_x25519_secret(local, 0),
+            PartyDepositConfig {
+                private_view_scalar,
+                birth_anchor: None,
+                worker: DepositWorkerConfig::default(),
+                chain_source: chain,
+                consolidation_backend: backend.clone(),
+                chain_readiness: backend.readiness(),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            restarted_after_promotion.proactive_refresh_schedule.lock().await.clone(),
+            Some(promoted),
+            "restart changed the exactly promoted observer schedule"
+        );
+    }
+
+    async fn historical_epoch_catchup_bundle(
+        source: &PartyServer,
+        epoch: u64,
+    ) -> (EpochHistoryCatchupManifest, Vec<u8>, Option<Vec<u8>>) {
+        let state = source.epoch_history.read().await.clone();
+        let (entry, mut loaded) =
+            source.epoch_history_entry(&state, epoch).await.unwrap().expect("history entry");
+        let manifest = entry.catchup_manifest().unwrap();
+        let activation = source
+            .load_epoch_history_object(entry.activation_certificate(), &mut loaded)
+            .await
+            .unwrap();
+        let rotation = match entry.key_rotation_certificate() {
+            Some(reference) => {
+                Some(source.load_epoch_history_object(reference, &mut loaded).await.unwrap())
+            }
+            None => None,
+        };
+        (manifest, activation, rotation)
+    }
+
+    #[tokio::test]
+    async fn certified_target_only_joiner_does_not_restart_terminal_rotation() {
+        let scenario = proactive_refresh_scenario();
+        let state = tempfile::tempdir().unwrap();
+        let source_party = PartyId(1);
+        let source_state = state.path().join("source");
+        let source_seed = historical_replay_seed(source_party);
+        let source_bootstrap = historical_replay_x25519_secret(source_party, 0);
+        let source_server = boxed_party_server_new(
+            source_party,
+            scenario.clone(),
+            &source_state,
+            &source_seed,
+            &source_bootstrap,
+        )
+        .await
+        .unwrap();
+        let source_share = proactive_epoch_zero_share(&scenario, source_party);
+        install_proactive_epoch_zero(&source_server, &source_share).await;
+        let source_public = source_share.public();
+
+        // Exercise both terminal outcomes for a target-only eligible party. A selected joiner has
+        // a promoted certified identity which must never regain advertisement authority; an
+        // omitted joiner has erased its candidate and must never regenerate it for the decided
+        // ceremony.
+        let cases = [
+            ("selected", [2_u16, 3, 4, 5, 6].into_iter().map(PartyId).collect::<Vec<_>>(), true),
+            ("omitted", [1_u16, 2, 3, 4, 5].into_iter().map(PartyId).collect::<Vec<_>>(), false),
+        ];
+        for (label, advertisers, selected) in cases {
+            let joiner = PartyId(6);
+            let joiner_state = state.path().join(label);
+            let joiner_seed = historical_replay_seed(joiner);
+            let server = boxed_non_genesis_party_server_new(
+                joiner,
+                scenario.clone(),
+                &joiner_state,
+                &joiner_seed,
+            )
+            .await
+            .unwrap();
+            let (manifest, activation, rotation) =
+                historical_epoch_catchup_bundle(&source_server, 0).await;
+            server
+                .apply_epoch_history_catchup(source_party, manifest, activation, rotation)
+                .await
+                .unwrap();
+
+            let context = server.key_rotation_context_for_source(&source_public).unwrap().unwrap();
+            assert!(context.source().member(joiner).is_err());
+            assert!(context.target_policy().eligible().member(joiner).is_ok());
+            let target_identities = historical_target_identities(&context);
+            let candidate =
+                target_identities.iter().find(|identity| identity.party() == joiner).unwrap();
+            server
+                .protocol_store
+                .save_epoch_identity_candidate_secret(
+                    &context,
+                    &candidate.export_encryption_secret(),
+                    &mut OsRng,
+                )
+                .await
+                .unwrap();
+            let candidate_path = server.protocol_store.epoch_identity_path(context.target_epoch());
+            let schedule = server.proactive_refresh_schedule.lock().await.clone().unwrap();
+            assert_eq!(schedule.source_epoch, source_public.committee.epoch);
+            assert_eq!(schedule.target_epoch, Some(context.target_epoch()));
+            let due = schedule.due_unix_ms.unwrap();
+
+            drive_protocols(&server, due, std::time::Duration::from_millis(10)).await.unwrap();
+            assert!(
+                server.joining_key_rotation.lock().await.is_some(),
+                "{label} target-only joiner did not start its advertisement fanout"
+            );
+            assert!(
+                server.pending_key_rotation_peer_messages(usize::MAX).await.iter().any(|message| {
+                    message.target_epoch == context.target_epoch()
+                        && message.id.kind
+                            == crate::key_rotation::KeyRotationDeliveryKind::Advertisement
+                }),
+                "{label} target-only joiner has no pending advertisement"
+            );
+            let stale_joining = server
+                .joining_key_rotation
+                .lock()
+                .await
+                .clone()
+                .expect("target-only joining state disappeared");
+
+            let certificate = certified_key_rotation_for_roles(
+                &context,
+                &server.receiver_keys.read().unwrap(),
+                &target_identities,
+                &advertisers,
+                &[PartyId(1), PartyId(2), PartyId(3), PartyId(4)],
+            );
+            assert_eq!(certificate.verify(&context).unwrap().member(joiner).is_ok(), selected);
+            server
+                .handle_key_rotation_wire(
+                    source_party,
+                    KeyRotationWire::Certificate(certificate.clone()),
+                    due,
+                )
+                .await
+                .unwrap();
+            assert!(
+                server.joining_key_rotation.lock().await.is_none(),
+                "{label} target-only advertisement state survived certification"
+            );
+            {
+                let rotations = server.certified_key_rotations.read().unwrap();
+                assert_eq!(
+                    rotations.get(&context.target_epoch()).unwrap().context,
+                    context,
+                    "{label} target-only certificate registered another context"
+                );
+            }
+            assert_eq!(
+                server.proactive_refresh_schedule.lock().await.clone(),
+                Some(schedule.clone()),
+                "{label} receiver-key certification advanced the AVSS activation schedule"
+            );
+            assert_eq!(server.identity(context.target_epoch()).is_ok(), selected);
+            let certified_record = if selected {
+                Some(tokio::fs::read(&candidate_path).await.unwrap())
+            } else {
+                assert!(
+                    !tokio::fs::try_exists(&candidate_path).await.unwrap(),
+                    "omitted target-only candidate survived certification"
+                );
+                None
+            };
+            assert!(
+                server.pending_key_rotation_peer_messages(usize::MAX).await.iter().all(|message| {
+                    message.id.kind != crate::key_rotation::KeyRotationDeliveryKind::Advertisement
+                }),
+                "{label} target-only advertisement survived certification"
+            );
+
+            // Model cancellation after the durable certificate registry was published but before
+            // finalization cleared the volatile target-only advertiser. Both terminal fast paths
+            // must reconcile that exact stale state; otherwise its signed advertisement retries
+            // can survive indefinitely and conflict with a later eligibility re-entry.
+            *server.joining_key_rotation.lock().await = Some(stale_joining.clone());
+            assert!(
+                server.pending_key_rotation_peer_messages(usize::MAX).await.iter().all(|message| {
+                    message.id.kind != crate::key_rotation::KeyRotationDeliveryKind::Advertisement
+                }),
+                "{label} certified registry exposed stale joining advertisements"
+            );
+            server.ensure_key_rotation_started(&source_public, due).await.unwrap();
+            assert!(
+                server.joining_key_rotation.lock().await.is_none(),
+                "{label} certified due-tick fast path retained stale joining state"
+            );
+            *server.joining_key_rotation.lock().await = Some(stale_joining);
+            server
+                .handle_key_rotation_wire(
+                    source_party,
+                    KeyRotationWire::Certificate(certificate),
+                    due,
+                )
+                .await
+                .unwrap();
+            assert!(
+                server.joining_key_rotation.lock().await.is_none(),
+                "{label} duplicate certificate fast path retained stale joining state"
+            );
+
+            // This is the live post-certificate/pre-activation cut which previously attempted to
+            // reconstruct advertisement authority from the certified epoch identity.
+            drive_protocols(&server, due.saturating_add(1), std::time::Duration::from_millis(10))
+                .await
+                .unwrap();
+            assert!(
+                server.pending_key_rotation_peer_messages(usize::MAX).await.iter().all(|message| {
+                    message.id.kind != crate::key_rotation::KeyRotationDeliveryKind::Advertisement
+                }),
+                "{label} target-only terminal rotation restarted its live advertisement fanout"
+            );
+            if let Some(certified_record) = certified_record.as_ref() {
+                assert_eq!(
+                    tokio::fs::read(&candidate_path).await.unwrap(),
+                    *certified_record,
+                    "selected target-only identity changed after terminal retry"
+                );
+            } else {
+                assert!(
+                    !tokio::fs::try_exists(&candidate_path).await.unwrap(),
+                    "omitted target-only candidate was regenerated after terminal retry"
+                );
+            }
+            drop(server);
+
+            // The volatile joining marker is absent on reconstruction. The authenticated
+            // certificate registry is the durable terminal marker while the source schedule
+            // remains armed until successor AVSS activation.
+            let restarted = boxed_non_genesis_party_server_new(
+                joiner,
+                scenario.clone(),
+                &joiner_state,
+                &joiner_seed,
+            )
+            .await
+            .unwrap();
+            assert_eq!(*restarted.active_epoch.read().await, None);
+            assert_eq!(
+                restarted.proactive_refresh_schedule.lock().await.clone(),
+                Some(schedule.clone())
+            );
+            assert_eq!(
+                restarted
+                    .certified_key_rotations
+                    .read()
+                    .unwrap()
+                    .get(&context.target_epoch())
+                    .unwrap()
+                    .context,
+                context
+            );
+            assert!(restarted.joining_key_rotation.lock().await.is_none());
+            drive_protocols(
+                &restarted,
+                due.saturating_add(2),
+                std::time::Duration::from_millis(10),
+            )
+            .await
+            .unwrap();
+            assert!(
+                restarted.pending_key_rotation_peer_messages(usize::MAX).await.iter().all(
+                    |message| {
+                        message.id.kind
+                            != crate::key_rotation::KeyRotationDeliveryKind::Advertisement
+                    }
+                ),
+                "{label} target-only terminal rotation restarted after reconstruction"
+            );
+            assert_eq!(restarted.identity(context.target_epoch()).is_ok(), selected);
+            if let Some(certified_record) = certified_record {
+                assert_eq!(
+                    tokio::fs::read(&candidate_path).await.unwrap(),
+                    certified_record,
+                    "selected target-only identity changed across restart"
+                );
+            } else {
+                assert!(
+                    !tokio::fs::try_exists(&candidate_path).await.unwrap(),
+                    "omitted target-only candidate was regenerated across restart"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn authenticated_history_catchup_erases_an_omitted_candidate_before_registry_replay() {
+        let scenario = proactive_refresh_scenario();
+        let state = tempfile::tempdir().unwrap();
+        let source_party = PartyId(1);
+        let source_server = PartyServer::new(
+            source_party,
+            scenario.clone(),
+            state.path().join("source"),
+            &historical_replay_seed(source_party),
+            &historical_replay_x25519_secret(source_party, 0),
+        )
+        .await
+        .unwrap();
+        let source_share = proactive_epoch_zero_share(&scenario, source_party);
+        install_proactive_epoch_zero(&source_server, &source_share).await;
+        let source_public = source_share.public();
+        // The successor history CAS must durably supersede the predecessor AVSS session. Model the
+        // live source's retained epoch-zero reducer so this fixture exercises the real append path.
+        let genesis_transition = canonical_dkg_transition(&scenario).unwrap();
+        let genesis_run = new_avss_run(&source_server, genesis_transition).unwrap();
+        source_server.persist_avss_run(&genesis_run).await.unwrap();
+        let (context, certificate, target) = install_historical_key_rotation(
+            &source_server,
+            &source_public,
+            &[PartyId(1), PartyId(2), PartyId(3), PartyId(4), PartyId(5)],
+            &[PartyId(1), PartyId(2), PartyId(3), PartyId(4)],
+        )
+        .await;
+        assert!(
+            target.member(PartyId(6)).is_err(),
+            "the spare must be omitted by the certified exact-size selection"
+        );
+        let transition =
+            source_server.configured_proactive_refresh_transition(&source_public).unwrap().unwrap();
+        let mut successor_public = source_public.clone();
+        successor_public.committee = target;
+        successor_public.validate().unwrap();
+        let activation = historical_activation_request(
+            &transition,
+            successor_public,
+            0xA5,
+            certificate.resulting_receiver_keys(&context).unwrap(),
+            Some(certificate.semantic_digest(&context).unwrap()),
+        );
+        source_server
+            .persist_activation_certificate(
+                &transition,
+                &activation.value,
+                &activation.acknowledgements,
+            )
+            .await
+            .unwrap();
+
+        let omitted = PartyId(6);
+        let omitted_state = state.path().join("omitted");
+        let omitted_server = PartyServer::new(
+            omitted,
+            scenario.clone(),
+            &omitted_state,
+            &historical_replay_seed(omitted),
+            None::<&[u8; 32]>,
+        )
+        .await
+        .unwrap();
+        let (manifest, activation, rotation) =
+            historical_epoch_catchup_bundle(&source_server, 0).await;
+        omitted_server
+            .apply_epoch_history_catchup(source_party, manifest, activation, rotation)
+            .await
+            .unwrap();
+
+        let omitted_context =
+            omitted_server.key_rotation_context_for_source(&source_public).unwrap().unwrap();
+        assert_eq!(omitted_context, context);
+        let omitted_identity = historical_target_identities(&omitted_context)
+            .into_iter()
+            .find(|identity| identity.party() == omitted)
+            .unwrap();
+        omitted_server
+            .protocol_store
+            .save_epoch_identity_candidate_secret(
+                &omitted_context,
+                &omitted_identity.export_encryption_secret(),
+                &mut OsRng,
+            )
+            .await
+            .unwrap();
+        let candidate_path =
+            omitted_server.protocol_store.epoch_identity_path(context.target_epoch());
+        assert!(tokio::fs::try_exists(&candidate_path).await.unwrap());
+
+        let (manifest, activation, rotation) =
+            historical_epoch_catchup_bundle(&source_server, 1).await;
+        omitted_server
+            .apply_epoch_history_catchup(source_party, manifest, activation, rotation)
+            .await
+            .unwrap();
+        assert!(
+            !tokio::fs::try_exists(&candidate_path).await.unwrap(),
+            "history catch-up registered the certificate without erasing its omitted candidate"
+        );
+        assert!(omitted_server.certified_key_rotations.read().unwrap().contains_key(&1));
+
+        // Once registered, direct certificate gossip takes the immutable fast path. The candidate
+        // must therefore already be absent before this replay, and must remain absent after restart
+        // while the exact rotation is restored from the authenticated hot/cold history machinery.
+        omitted_server
+            .handle_key_rotation_wire(
+                source_party,
+                KeyRotationWire::Certificate(certificate),
+                u64::MAX - 1,
+            )
+            .await
+            .unwrap();
+        assert!(!tokio::fs::try_exists(&candidate_path).await.unwrap());
+        drop(omitted_server);
+
+        let restarted = PartyServer::new(
+            omitted,
+            scenario,
+            &omitted_state,
+            &historical_replay_seed(omitted),
+            None::<&[u8; 32]>,
+        )
+        .await
+        .unwrap();
+        assert!(!tokio::fs::try_exists(&candidate_path).await.unwrap());
+        assert!(restarted.certified_key_rotations.read().unwrap().contains_key(&1));
     }
 
     #[tokio::test]
@@ -13909,8 +26736,8 @@ mod tests {
         install_historical_key_rotation(
             &server,
             &source,
+            &[PartyId(1), PartyId(2), PartyId(3), PartyId(4), PartyId(5)],
             &[PartyId(1), PartyId(2), PartyId(3), PartyId(4)],
-            &[PartyId(1), PartyId(2), PartyId(3)],
         )
         .await;
         let transition = server
@@ -13932,26 +26759,24 @@ mod tests {
             server.proactive_refresh_schedule.lock().await.clone(),
             Some(ProactiveRefreshSchedule {
                 version: PROACTIVE_REFRESH_SCHEDULE_VERSION,
+                phase: ProactiveRefreshSchedulePhase::Armed,
                 source_epoch: 0,
                 source_activation: source.activation_digest().unwrap(),
                 target_epoch: Some(1),
                 due_unix_ms: Some(DUE),
+                selection_fallback_due_unix_ms: Some(DUE + 10_000),
                 rotation_view: None,
                 rotation_view_started_unix_ms: None,
                 rotation_timeout_exponent: 0,
                 rotation_certificate_delivered_through: BTreeMap::new(),
+                deferred_observer: None,
             })
         );
 
         server.progress_protocols(DUE - 1, std::time::Duration::from_millis(10)).await.unwrap();
         assert!(!server.avss.lock().await.contains_key(&transition.session));
-        assert!(
-            server
-                .ensure_refresh_due_for_live_ingress(&transition, DUE - 1)
-                .await
-                .unwrap_err()
-                .to_string()
-                .contains("not due yet")
+        server.ensure_refresh_due_for_live_ingress(&transition, DUE - 1).await.expect(
+            "the exact durable receiver-key certificate must survive a backwards-clock restart",
         );
 
         server.progress_protocols(DUE, std::time::Duration::from_millis(10)).await.unwrap();
@@ -14033,6 +26858,15 @@ mod tests {
         let share = proactive_epoch_zero_share(&scenario, local);
         install_proactive_epoch_zero(&server, &share).await;
         let source = share.public();
+        install_historical_key_rotation(
+            &server,
+            &source,
+            &[PartyId(1), PartyId(2), PartyId(3), PartyId(4), PartyId(5)],
+            &[PartyId(1), PartyId(2), PartyId(3), PartyId(4)],
+        )
+        .await;
+        let held_transition =
+            server.configured_proactive_refresh_transition(&source).unwrap().unwrap();
         server.arm_proactive_refresh_for_activation(&source, 40_000).await.unwrap();
         assert_eq!(
             server
@@ -14042,6 +26876,18 @@ mod tests {
                 .as_ref()
                 .and_then(|schedule| schedule.due_unix_ms),
             Some(ACCEPTANCE_PROACTIVE_REFRESH_HELD_DUE_UNIX_MS)
+        );
+        assert!(
+            server
+                .ensure_refresh_due_for_live_ingress(
+                    &held_transition,
+                    ACCEPTANCE_PROACTIVE_REFRESH_HELD_DUE_UNIX_MS,
+                )
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("is held"),
+            "the reserved hold marker was admitted as an ordinary elapsed deadline"
         );
         server
             .progress_protocols(
@@ -14129,7 +26975,6 @@ mod tests {
             fault_bound: 0,
             members: vec![local],
             eligible_members: vec![local],
-            old_dealers: vec![local],
         });
         scenario.proactive_refresh_interval_seconds = 1;
         scenario.validate().unwrap();
@@ -14214,6 +27059,600 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn concurrent_key_rotation_ingress_and_ack_linearize_one_revision_chain() {
+        let scenario = dynamic_refresh_scenario();
+        let local = PartyId(1);
+        let state = tempfile::tempdir().unwrap();
+        let server = PartyServer::new(
+            local,
+            scenario.clone(),
+            state.path(),
+            &historical_replay_seed(local),
+            &historical_replay_x25519_secret(local, 0),
+        )
+        .await
+        .unwrap();
+        let share = proactive_epoch_zero_share(&scenario, local);
+        install_proactive_epoch_zero(&server, &share).await;
+        let source = share.public();
+        const ARMED_AT: u64 = 12_000;
+        const DUE: u64 = ARMED_AT + 1_000;
+        server.arm_proactive_refresh_for_activation(&source, ARMED_AT).await.unwrap();
+        drive_protocols(&server, DUE, std::time::Duration::from_millis(50)).await.unwrap();
+
+        let context = server.key_rotation_context_for_source(&source).unwrap().unwrap();
+        let pending = {
+            let live = server.key_rotation.lock().await;
+            let live = live.as_ref().expect("due key rotation was not started");
+            assert_eq!(live.revision, 0);
+            assert_eq!(live.round.advertisement_count(), 1);
+            live.round.pending_messages(usize::MAX)
+        };
+        let acknowledged = pending
+            .iter()
+            .find(|message| {
+                message.id.context == context.digest()
+                    && message.id.kind
+                        == crate::key_rotation::KeyRotationDeliveryKind::Advertisement
+                    && message.id.recipient == PartyId(4)
+            })
+            .expect("local advertisement outbox is empty")
+            .id;
+        let retained = pending
+            .iter()
+            .find(|message| {
+                message.id.context == context.digest()
+                    && message.id.kind
+                        == crate::key_rotation::KeyRotationDeliveryKind::Advertisement
+                    && message.id != acknowledged
+            })
+            .expect("local advertisement outbox has no independent recipient")
+            .id;
+
+        let peer_wires = [PartyId(2), PartyId(3)].map(|peer| {
+            let target = Identity::from_test_secrets(
+                peer,
+                context.target_epoch(),
+                &historical_replay_seed(peer),
+                historical_replay_x25519_secret(peer, context.target_epoch()),
+            )
+            .unwrap();
+            let capability = historical_advertisement_capability(&target);
+            let wire = crate::key_rotation::sign_key_advertisement(&context, &capability).unwrap();
+            (peer, target.encryption_public_key(), KeyRotationWire::Advertisement(wire))
+        });
+
+        // Queue all three mutations behind the exact round fence. Once released, their order is
+        // intentionally unspecified, but every mutation must re-read the published predecessor
+        // and extend one strict durable revision chain.
+        let held_mutation = server.key_rotation_mutation.lock().await;
+        let barrier = Arc::new(tokio::sync::Barrier::new(4));
+        let mut tasks = Vec::new();
+        for (peer, _, wire) in peer_wires.clone() {
+            let server = server.clone();
+            let barrier = barrier.clone();
+            tasks.push(tokio::spawn(async move {
+                barrier.wait().await;
+                server.handle_key_rotation_wire(peer, wire, DUE).await
+            }));
+        }
+        let ack_server = server.clone();
+        let ack_barrier = barrier.clone();
+        let ack = tokio::spawn(async move {
+            ack_barrier.wait().await;
+            ack_server.acknowledge_key_rotation_peer_messages(&[acknowledged]).await
+        });
+        barrier.wait().await;
+        drop(held_mutation);
+
+        for task in tasks {
+            task.await.unwrap().unwrap();
+        }
+        ack.await.unwrap().unwrap();
+
+        let (round, revision) = {
+            let live = server.key_rotation.lock().await;
+            let live = live.as_ref().expect("linearized rotation disappeared");
+            (live.round.clone(), live.revision)
+        };
+        assert_eq!(revision, 3, "three distinct mutations did not each advance the revision");
+        for (peer, public_key, _) in peer_wires {
+            assert_eq!(
+                round.advertised_key(peer).unwrap(),
+                Some(public_key),
+                "a concurrent authenticated advertisement was lost"
+            );
+        }
+        assert_eq!(round.advertisement_count(), 3);
+        assert!(round.certificate().is_none());
+        let pending = round.pending_messages(usize::MAX);
+        assert!(
+            pending.iter().all(|message| message.id != acknowledged),
+            "the exact successful-delivery ACK was lost"
+        );
+        assert!(
+            pending.iter().any(|message| message.id == retained),
+            "ACK cleanup erased an unrelated recipient"
+        );
+        let durable = server
+            .protocol_store
+            .load_key_rotation_round(&context)
+            .await
+            .unwrap()
+            .expect("linearized rotation was not durable");
+        assert_eq!(durable.metadata.revision, revision);
+        assert_eq!(durable.round, round);
+
+        let mut forged = acknowledged;
+        forged.digest[0] ^= 1;
+        server.acknowledge_key_rotation_peer_messages(&[acknowledged, forged]).await.unwrap();
+        let live = server.key_rotation.lock().await;
+        let live = live.as_ref().unwrap();
+        assert_eq!(
+            live.revision, revision,
+            "duplicate or forged ACK advanced the durable revision"
+        );
+        assert_eq!(live.round, round);
+    }
+
+    #[test]
+    fn maximum_scenario_party_cursor_fits_the_durable_refresh_schedule() {
+        let delivered = (0..MAX_SCENARIO_PARTIES)
+            .map(|offset| {
+                let offset = u16::try_from(offset).unwrap();
+                (PartyId(u16::MAX - offset), u64::MAX)
+            })
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(delivered.len(), MAX_SCENARIO_PARTIES);
+
+        let schedule = ProactiveRefreshSchedule {
+            version: PROACTIVE_REFRESH_SCHEDULE_VERSION,
+            phase: ProactiveRefreshSchedulePhase::Armed,
+            source_epoch: u64::MAX - 3,
+            source_activation: [u8::MAX; 32],
+            target_epoch: Some(u64::MAX - 2),
+            due_unix_ms: Some(u64::MAX - 1),
+            selection_fallback_due_unix_ms: Some(u64::MAX),
+            rotation_view: Some(u64::MAX),
+            rotation_view_started_unix_ms: Some(u64::MAX),
+            rotation_timeout_exponent: u8::MAX,
+            rotation_certificate_delivered_through: delivered,
+            deferred_observer: Some(DeferredObserverRefreshSchedule {
+                source_epoch: u64::MAX - 1,
+                source_activation: [u8::MAX; 32],
+                source_history_root: [u8::MAX; 32],
+                target_epoch: Some(u64::MAX),
+                due_unix_ms: Some(u64::MAX - 1),
+                selection_fallback_due_unix_ms: Some(u64::MAX),
+            }),
+        };
+        let encoded = postcard::to_allocvec(&schedule).unwrap();
+        assert!(
+            encoded.len() <= MAX_REFRESH_SCHEDULE_BYTES,
+            "maximum configured proactive-refresh cursor encoded to {} bytes; durable maximum is {MAX_REFRESH_SCHEDULE_BYTES}",
+            encoded.len()
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_ambiguous_schedule_save_retries_before_the_next_mutation() {
+        let scenario = dynamic_refresh_scenario();
+        let local = PartyId(1);
+        let state = tempfile::tempdir().unwrap();
+        let server = PartyServer::new(
+            local,
+            scenario.clone(),
+            state.path(),
+            &historical_replay_seed(local),
+            &historical_replay_x25519_secret(local, 0),
+        )
+        .await
+        .unwrap();
+        let share = proactive_epoch_zero_share(&scenario, local);
+        install_proactive_epoch_zero(&server, &share).await;
+        server.arm_proactive_refresh_for_activation(&share.public(), 14_000).await.unwrap();
+
+        let mut replacement = server.proactive_refresh_schedule.lock().await.clone().unwrap();
+        replacement
+            .rotation_certificate_delivered_through
+            .insert(PartyId(2), replacement.target_epoch.unwrap());
+        let (durable_sender, durable) = tokio::sync::oneshot::channel();
+        let (release, release_receiver) = tokio::sync::oneshot::channel();
+        *server.proactive_refresh_schedule_publication_gate.lock().await =
+            Some(ProactiveRefreshSchedulePublicationGate {
+                durable: durable_sender,
+                release: release_receiver,
+                inject_ambiguous_save_error_once: true,
+            });
+
+        let publishing_server = server.clone();
+        let published_schedule = replacement.clone();
+        let publication = tokio::spawn(async move {
+            publishing_server.persist_proactive_refresh_schedule(published_schedule).await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), durable)
+            .await
+            .expect("retried schedule replacement did not reach the publication cut")
+            .expect("schedule publication task disappeared before its durable retry");
+
+        let durable_bytes = server
+            .protocol_store
+            .load_proactive_refresh_schedule(scenario.quic_network_id().unwrap())
+            .await
+            .unwrap()
+            .expect("schedule replacement did not reach durable storage");
+        assert_eq!(
+            decode_postcard_exact::<ProactiveRefreshSchedule>(&durable_bytes).unwrap(),
+            replacement
+        );
+        assert!(
+            server.proactive_refresh_schedule.try_lock().is_err(),
+            "post-replacement volatile slot was released before publication"
+        );
+
+        // Dropping the caller's JoinHandle cannot cancel the detached save-to-RAM linearization.
+        // The owned live guard also prevents the next writer from deriving a stale replacement.
+        publication.abort();
+        assert!(publication.await.unwrap_err().is_cancelled());
+        release.send(()).expect("schedule publication gate disappeared");
+        let published = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            server.proactive_refresh_schedule.lock(),
+        )
+        .await
+        .expect("detached schedule publication did not release its live slot");
+        assert_eq!(published.as_ref(), Some(&replacement));
+        drop(published);
+
+        let mut successor = replacement;
+        successor
+            .rotation_certificate_delivered_through
+            .insert(PartyId(3), successor.target_epoch.unwrap());
+        server.persist_proactive_refresh_schedule(successor.clone()).await.unwrap();
+        assert_eq!(
+            server.proactive_refresh_schedule.lock().await.as_ref(),
+            Some(&successor),
+            "the next exact mutation did not extend the detached publication"
+        );
+        let durable_bytes = server
+            .protocol_store
+            .load_proactive_refresh_schedule(scenario.quic_network_id().unwrap())
+            .await
+            .unwrap()
+            .expect("successor schedule disappeared");
+        assert_eq!(
+            decode_postcard_exact::<ProactiveRefreshSchedule>(&durable_bytes).unwrap(),
+            successor
+        );
+    }
+
+    #[tokio::test]
+    async fn detached_schedule_publication_retains_the_party_state_lease() {
+        let scenario = dynamic_refresh_scenario();
+        let local = PartyId(1);
+        let state = tempfile::tempdir().unwrap();
+        let signing_seed = historical_replay_seed(local);
+        let bootstrap_secret = historical_replay_x25519_secret(local, 0);
+        let server =
+            PartyServer::new(local, scenario, state.path(), &signing_seed, &bootstrap_secret)
+                .await
+                .unwrap();
+        let share = proactive_epoch_zero_share(&server.scenario, local);
+        install_proactive_epoch_zero(&server, &share).await;
+        server.arm_proactive_refresh_for_activation(&share.public(), 14_000).await.unwrap();
+
+        let mut replacement = server.proactive_refresh_schedule.lock().await.clone().unwrap();
+        replacement
+            .rotation_certificate_delivered_through
+            .insert(PartyId(2), replacement.target_epoch.unwrap());
+        let (durable_sender, durable) = tokio::sync::oneshot::channel();
+        let (release, release_receiver) = tokio::sync::oneshot::channel();
+        *server.proactive_refresh_schedule_publication_gate.lock().await =
+            Some(ProactiveRefreshSchedulePublicationGate {
+                durable: durable_sender,
+                release: release_receiver,
+                inject_ambiguous_save_error_once: false,
+            });
+
+        let live_schedule = Arc::clone(&server.proactive_refresh_schedule);
+        let publishing_server = server.clone();
+        let expected = replacement.clone();
+        let publication = tokio::spawn(async move {
+            publishing_server.persist_proactive_refresh_schedule(replacement).await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), durable)
+            .await
+            .expect("schedule replacement did not reach the publication cut")
+            .expect("schedule publication task disappeared before its durable replacement");
+        publication.abort();
+        assert!(publication.await.unwrap_err().is_cancelled());
+        drop(server);
+
+        let error = PartyStateLease::acquire(state.path(), local)
+            .await
+            .expect_err("detached schedule publication released the party-state lease");
+        assert!(matches!(
+            error,
+            StoreError::PartyStateLeaseHeld { party, .. } if party == local
+        ));
+
+        release.send(()).expect("schedule publication gate disappeared");
+        let published =
+            tokio::time::timeout(std::time::Duration::from_secs(5), live_schedule.lock())
+                .await
+                .expect("detached schedule publication did not release its live slot");
+        assert_eq!(published.as_ref(), Some(&expected));
+        drop(published);
+        PartyStateLease::acquire(state.path(), local)
+            .await
+            .expect("party-state lease was not released after detached publication completed");
+    }
+
+    #[tokio::test]
+    async fn cancelled_view_change_publishes_its_durable_revision_before_the_next_mutation() {
+        let scenario = dynamic_refresh_scenario();
+        let local = PartyId(1);
+        let state = tempfile::tempdir().unwrap();
+        let server = PartyServer::new(
+            local,
+            scenario.clone(),
+            state.path(),
+            &historical_replay_seed(local),
+            &historical_replay_x25519_secret(local, 0),
+        )
+        .await
+        .unwrap();
+        let share = proactive_epoch_zero_share(&scenario, local);
+        install_proactive_epoch_zero(&server, &share).await;
+        let source = share.public();
+        const ARMED_AT: u64 = 14_000;
+        const DUE: u64 = ARMED_AT + 1_000;
+        const BASE_TIMEOUT_MS: u64 = 1_000;
+        server.arm_proactive_refresh_for_activation(&source, ARMED_AT).await.unwrap();
+        drive_protocols(&server, DUE, std::time::Duration::from_millis(BASE_TIMEOUT_MS))
+            .await
+            .unwrap();
+
+        let context = server.key_rotation_context_for_source(&source).unwrap().unwrap();
+        let target_identities = historical_target_identities(&context);
+        // Fill the selected committee so view zero is live, but withhold every remote BA vote.
+        for peer in [PartyId(2), PartyId(3), PartyId(4), PartyId(5)] {
+            let target =
+                target_identities.iter().find(|identity| identity.party() == peer).unwrap();
+            let advertisement = crate::key_rotation::sign_key_advertisement(
+                &context,
+                &historical_advertisement_capability(target),
+            )
+            .unwrap();
+            server
+                .handle_key_rotation_wire(peer, KeyRotationWire::Advertisement(advertisement), DUE)
+                .await
+                .unwrap();
+        }
+        let (base_revision, base_round) = {
+            let live = server.key_rotation.lock().await;
+            let live = live.as_ref().expect("due key rotation disappeared");
+            assert!(live.round.certificate().is_none());
+            (live.revision, live.round.clone())
+        };
+
+        let (durable_sender, durable) = tokio::sync::oneshot::channel();
+        let (release, release_receiver) = tokio::sync::oneshot::channel();
+        *server.key_rotation_view_publication_gate.lock().await =
+            Some(KeyRotationViewPublicationGate {
+                durable: durable_sender,
+                release: release_receiver,
+            });
+        let changing_server = server.clone();
+        let change = tokio::spawn(async move {
+            changing_server
+                .progress_key_rotation_view_change(DUE + BASE_TIMEOUT_MS, BASE_TIMEOUT_MS)
+                .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), durable)
+            .await
+            .expect("view-change CAS did not reach the publication cut")
+            .expect("view-change publication task disappeared before its durable CAS");
+
+        let successor_revision = base_revision.checked_add(1).unwrap();
+        let durable = server
+            .protocol_store
+            .load_key_rotation_round(&context)
+            .await
+            .unwrap()
+            .expect("view-change CAS did not persist a reducer");
+        assert_eq!(durable.metadata.revision, successor_revision);
+        assert_ne!(durable.round, base_round);
+        {
+            let live = server.key_rotation.lock().await;
+            let live = live.as_ref().unwrap();
+            assert_eq!(
+                (live.revision, &live.round),
+                (base_revision, &base_round),
+                "volatile publication crossed the held post-CAS test cut"
+            );
+        }
+
+        // Cancelling the caller drops its JoinHandle, not the detached task which owns the exact
+        // round-mutation fence and the only authoritative N -> N+1 publication.
+        change.abort();
+        assert!(change.await.unwrap_err().is_cancelled());
+        release.send(()).expect("view-change publication gate disappeared");
+        let published = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            server.key_rotation_mutation.lock(),
+        )
+        .await
+        .expect("detached view-change publication did not release its mutation fence");
+        drop(published);
+
+        let acknowledged = {
+            let live = server.key_rotation.lock().await;
+            let live = live.as_ref().unwrap();
+            assert_eq!(live.revision, successor_revision);
+            assert_eq!(live.round, durable.round);
+            live.round
+                .pending_messages(usize::MAX)
+                .first()
+                .expect("published view change has no durable retry")
+                .id
+        };
+        server.acknowledge_key_rotation_peer_messages(&[acknowledged]).await.unwrap();
+        let live = server.key_rotation.lock().await;
+        let live = live.as_ref().unwrap();
+        assert_eq!(
+            live.revision,
+            successor_revision.checked_add(1).unwrap(),
+            "the next exact mutation did not extend the published revision"
+        );
+        let durable = server
+            .protocol_store
+            .load_key_rotation_round(&context)
+            .await
+            .unwrap()
+            .expect("ACK successor revision disappeared");
+        assert_eq!(durable.metadata.revision, live.revision);
+        assert_eq!(durable.round, live.round);
+    }
+
+    #[tokio::test]
+    async fn key_rotation_start_releases_reducer_before_persisting_view_anchor() {
+        let scenario = dynamic_refresh_scenario();
+        let local = PartyId(1);
+        let state = tempfile::tempdir().unwrap();
+        let server = PartyServer::new(
+            local,
+            scenario.clone(),
+            state.path(),
+            &historical_replay_seed(local),
+            &historical_replay_x25519_secret(local, 0),
+        )
+        .await
+        .unwrap();
+        let share = proactive_epoch_zero_share(&scenario, local);
+        install_proactive_epoch_zero(&server, &share).await;
+        let source = share.public();
+        const ARMED_AT: u64 = 15_000;
+        const DUE: u64 = ARMED_AT + 1_000;
+        server.arm_proactive_refresh_for_activation(&source, ARMED_AT).await.unwrap();
+
+        // Hold the schedule mutation fence at the exact point where a first-time start persists
+        // its view anchor. The reducer must remain independently observable: otherwise the
+        // temporary `key_rotation` guard is being held across the schedule write, inverting the
+        // lock order used by `progress_key_rotation_view_change`.
+        let schedule_mutation = server.proactive_refresh_schedule_mutation.lock().await;
+        let starting_server = server.clone();
+        let starting_source = source.clone();
+        let start = tokio::spawn(async move {
+            starting_server.ensure_key_rotation_started(&starting_source, DUE).await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if let Ok(live) = server.key_rotation.try_lock()
+                    && live.is_some()
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect(
+            "key-rotation reducer remained locked while its view anchor waited on schedule storage",
+        );
+        drop(schedule_mutation);
+        start.await.unwrap().unwrap();
+
+        let schedule = server.proactive_refresh_schedule.lock().await.clone().unwrap();
+        assert_eq!(schedule.rotation_view, Some(0));
+        assert_eq!(schedule.rotation_view_started_unix_ms, Some(DUE));
+    }
+
+    #[tokio::test]
+    async fn due_tick_finishes_a_terminal_live_rotation_after_registration_cancellation() {
+        let scenario = dynamic_refresh_scenario();
+        let local = PartyId(1);
+        let state = tempfile::tempdir().unwrap();
+        let server = PartyServer::new(
+            local,
+            scenario.clone(),
+            state.path(),
+            &historical_replay_seed(local),
+            &historical_replay_x25519_secret(local, 0),
+        )
+        .await
+        .unwrap();
+        let share = proactive_epoch_zero_share(&scenario, local);
+        install_proactive_epoch_zero(&server, &share).await;
+        let source = share.public();
+        const ARMED_AT: u64 = 16_000;
+        const DUE: u64 = ARMED_AT + 1_000;
+        server.arm_proactive_refresh_for_activation(&source, ARMED_AT).await.unwrap();
+        server.ensure_key_rotation_started(&source, DUE).await.unwrap();
+
+        let context = server.key_rotation_context_for_source(&source).unwrap().unwrap();
+        let target_identities = historical_target_identities(&context);
+        let certificate = certified_key_rotation_for_roles(
+            &context,
+            &server.receiver_keys.read().unwrap(),
+            &target_identities,
+            &[PartyId(2), PartyId(3), PartyId(4), PartyId(5), PartyId(6)],
+            &[PartyId(1), PartyId(2), PartyId(3), PartyId(4)],
+        );
+        let source_identity = server.identity(context.source().epoch).unwrap();
+        {
+            let mut live = server.key_rotation.lock().await;
+            let runtime = live.as_mut().expect("due rotation disappeared");
+            let step = {
+                let receiver_keys = server.receiver_keys.read().unwrap();
+                runtime
+                    .round
+                    .handle_wire(
+                        PartyId(2),
+                        KeyRotationWire::Certificate(certificate.clone()),
+                        &source_identity,
+                        &receiver_keys,
+                    )
+                    .unwrap()
+            };
+            assert_eq!(step.committed, Some(certificate.clone()));
+            let revision = runtime.revision.checked_add(1).unwrap();
+            server
+                .protocol_store
+                .save_key_rotation_round(&context, revision, &runtime.round, &mut OsRng)
+                .await
+                .unwrap();
+            runtime.revision = revision;
+        }
+        drop(source_identity);
+
+        // Model cancellation inside finalization after the standalone certificate became durable
+        // but before registry publication or AVSS launch.
+        server
+            .protocol_store
+            .save_key_rotation_certificate(&context, &certificate, &mut OsRng)
+            .await
+            .unwrap();
+        assert!(!server.certified_key_rotations.read().unwrap().contains_key(&1));
+        assert!(server.configured_proactive_refresh_transition(&source).unwrap().is_none());
+
+        server.ensure_key_rotation_started(&source, DUE).await.unwrap();
+        let transition = server
+            .configured_proactive_refresh_transition(&source)
+            .unwrap()
+            .expect("due retry did not register the terminal receiver-key decision");
+        assert!(
+            server
+                .avss
+                .lock()
+                .await
+                .get(&transition.session)
+                .is_some_and(|run| run.dealer_outbound.is_some()),
+            "due retry did not launch the certified successor AVSS"
+        );
+    }
+
+    #[tokio::test]
     async fn dynamic_rotation_round_and_view_anchor_restore_exactly() {
         let scenario = dynamic_refresh_scenario();
         let local = PartyId(1);
@@ -14265,6 +27704,71 @@ mod tests {
         assert_eq!(schedule.rotation_view_started_unix_ms, Some(DUE));
     }
 
+    #[tokio::test]
+    async fn selection_fallback_vote_is_deadline_gated_persisted_and_restored() {
+        let scenario = dynamic_refresh_scenario();
+        let local = PartyId(1);
+        let state = tempfile::tempdir().unwrap();
+        const ARMED_AT: u64 = 25_000;
+        const DUE: u64 = ARMED_AT + 1_000;
+        let fallback_due = DUE + scenario.protocol_timeout_seconds.checked_mul(1_000).unwrap();
+
+        let server = boxed_party_server_new(
+            local,
+            scenario.clone(),
+            state.path(),
+            &historical_replay_seed(local),
+            &historical_replay_x25519_secret(local, 0),
+        )
+        .await
+        .unwrap();
+        let share = proactive_epoch_zero_share(&scenario, local);
+        install_proactive_epoch_zero(&server, &share).await;
+        let source = share.public();
+        server.arm_proactive_refresh_for_activation(&source, ARMED_AT).await.unwrap();
+        drive_protocols(&server, DUE, std::time::Duration::from_secs(60)).await.unwrap();
+        {
+            let schedule = server.proactive_refresh_schedule.lock().await.clone().unwrap();
+            assert_eq!(schedule.selection_fallback_due_unix_ms, Some(fallback_due));
+        }
+        drive_protocols(&server, fallback_due - 1, std::time::Duration::from_secs(60))
+            .await
+            .unwrap();
+        assert_eq!(
+            server.key_rotation.lock().await.as_ref().unwrap().round.fallback_vote_count(),
+            0,
+            "fallback authority was signed before its immutable deadline"
+        );
+
+        drive_protocols(&server, fallback_due, std::time::Duration::from_secs(60)).await.unwrap();
+        let (context, encoded, revision) = {
+            let live = server.key_rotation.lock().await;
+            let live = live.as_ref().unwrap();
+            assert_eq!(live.round.fallback_vote_count(), 1);
+            assert!(live.round.pending_messages(usize::MAX).iter().any(|message| message.id.kind
+                == crate::key_rotation::KeyRotationDeliveryKind::FallbackVote));
+            (live.round.context().clone(), live.round.encode().unwrap(), live.revision)
+        };
+        assert!(revision > 0);
+        drop(server);
+
+        let restarted = boxed_party_server_new(
+            local,
+            scenario,
+            state.path(),
+            &historical_replay_seed(local),
+            &historical_replay_x25519_secret(local, 0),
+        )
+        .await
+        .unwrap();
+        let live = restarted.key_rotation.lock().await;
+        let live = live.as_ref().expect("fallback-authorized round must restore");
+        assert_eq!(live.round.context(), &context);
+        assert_eq!(live.round.encode().unwrap(), encoded);
+        assert_eq!(live.revision, revision);
+        assert_eq!(live.round.fallback_vote_count(), 1);
+    }
+
     /// Drive one autonomous protocol tick without inflating the caller's stack frame.
     ///
     /// `PartyServer::progress_protocols` lowers to a ~265 KiB future. A test that drives several
@@ -14305,6 +27809,41 @@ mod tests {
         ))
     }
 
+    fn boxed_party_server_new_with_deposits<'a>(
+        party: PartyId,
+        scenario: Scenario,
+        state_directory: &'a std::path::Path,
+        signing_seed: &'a [u8; 32],
+        bootstrap_x25519_secret: &'a [u8; 32],
+        deposit: PartyDepositConfig,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<Arc<PartyServer>>> + 'a>>
+    {
+        Box::pin(PartyServer::new_with_deposits(
+            party,
+            scenario,
+            state_directory.to_path_buf(),
+            signing_seed,
+            bootstrap_x25519_secret,
+            deposit,
+        ))
+    }
+
+    fn boxed_non_genesis_party_server_new<'a>(
+        party: PartyId,
+        scenario: Scenario,
+        state_directory: &'a std::path::Path,
+        signing_seed: &'a [u8; 32],
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<Arc<PartyServer>>> + 'a>>
+    {
+        Box::pin(PartyServer::new(
+            party,
+            scenario,
+            state_directory.to_path_buf(),
+            signing_seed,
+            None::<&[u8; 32]>,
+        ))
+    }
+
     #[tokio::test]
     async fn dynamic_rotation_backoff_survives_views_and_restart_until_delta_is_synchronous() {
         let scenario = dynamic_refresh_scenario();
@@ -14334,10 +27873,10 @@ mod tests {
             .await
             .unwrap();
 
-        // The local durable advertisement plus three authenticated remote advertisements fills the
-        // four-member selected committee and starts BA without relying on transport timing in this
+        // The local durable advertisement plus four authenticated remote advertisements fills the
+        // five-member selected committee and starts BA without relying on transport timing in this
         // deterministic-clock test.
-        for peer in [PartyId(2), PartyId(3), PartyId(4)] {
+        for peer in [PartyId(2), PartyId(3), PartyId(4), PartyId(5)] {
             let target =
                 target_identities.iter().find(|identity| identity.party() == peer).unwrap();
             let advertisement = crate::key_rotation::sign_key_advertisement(
@@ -14372,7 +27911,7 @@ mod tests {
                     &context,
                     0,
                     1,
-                    &[PartyId(1), PartyId(2), PartyId(3)],
+                    &[PartyId(1), PartyId(2), PartyId(3), PartyId(4)],
                 )),
                 view_one_started,
             )
@@ -14488,7 +28027,7 @@ mod tests {
                     &context,
                     1,
                     2,
-                    &[PartyId(1), PartyId(2), PartyId(3)],
+                    &[PartyId(1), PartyId(2), PartyId(3), PartyId(4)],
                 )),
                 view_two_started,
             )
@@ -14529,9 +28068,10 @@ mod tests {
         }
         let certificate = certified_key_rotation_for_roles(
             &context,
+            &restarted.receiver_keys.read().unwrap(),
             &target_identities,
-            &[PartyId(2), PartyId(3), PartyId(4), PartyId(5)],
-            &[PartyId(1), PartyId(2), PartyId(3)],
+            &[PartyId(2), PartyId(3), PartyId(4), PartyId(5), PartyId(6)],
+            &[PartyId(1), PartyId(2), PartyId(3), PartyId(4)],
         );
         restarted
             .handle_key_rotation_wire(
@@ -14601,7 +28141,7 @@ mod tests {
         let context_one = server.key_rotation_context_for_source(&source).unwrap().unwrap();
         // Every selected member, including the local party, rotates to an independently fresh
         // epoch-one receiver key; a successor may never carry a source key forward.
-        let epoch_one_identities = (1_u16..=4)
+        let epoch_one_identities = (1_u16..=5)
             .map(|party| {
                 let party = PartyId(party);
                 Identity::from_test_secrets(
@@ -14615,13 +28155,15 @@ mod tests {
             .collect::<Vec<_>>();
         let certificate_one = certified_key_rotation_for_roles(
             &context_one,
+            &server.receiver_keys.read().unwrap(),
             &epoch_one_identities,
+            &[PartyId(1), PartyId(2), PartyId(3), PartyId(4), PartyId(5)],
             &[PartyId(1), PartyId(2), PartyId(3), PartyId(4)],
-            &[PartyId(1), PartyId(2), PartyId(3)],
         );
         server
             .protocol_store
-            .save_epoch_identity_secret(
+            .save_epoch_identity_candidate_secret(
+                &context_one,
                 &epoch_one_identities[3].export_encryption_secret(),
                 &mut OsRng,
             )
@@ -14637,7 +28179,39 @@ mod tests {
             .into_iter()
             .find(|message| message.id.recipient == PartyId(1))
             .expect("the first immutable certificate must remain retryable");
+        assert_eq!(
+            first_for_one,
+            crate::key_rotation::pending_key_rotation_certificate(
+                &context_one,
+                &certificate_one,
+                PartyId(1),
+            )
+            .unwrap(),
+            "the cached certificate retry must preserve the verified wire and exact message ID"
+        );
+        assert!(
+            server
+                .certified_key_rotations
+                .read()
+                .unwrap()
+                .get(&context_one.target_epoch())
+                .unwrap()
+                .certificate_message_id_for(PartyId(99))
+                .is_none(),
+            "the cached retry template must not authorize a nonparticipant recipient"
+        );
         assert_eq!(first_for_one.id.context, context_one.digest());
+        let mut forged_id = first_for_one.id;
+        forged_id.digest[0] ^= 1;
+        server.acknowledge_key_rotation_peer_messages(&[forged_id]).await.unwrap();
+        assert!(
+            server
+                .pending_key_rotation_peer_messages(usize::MAX)
+                .await
+                .iter()
+                .any(|message| message.id == first_for_one.id),
+            "a non-exact certificate ACK must not advance the cached delivery cursor"
+        );
         server.acknowledge_key_rotation_peer_messages(&[first_for_one.id]).await.unwrap();
         assert!(
             server
@@ -14658,10 +28232,6 @@ mod tests {
         let mut public_one = source.clone();
         public_one.committee = target_one.clone();
         public_one.validate().unwrap();
-        let rearmed = server.proactive_refresh_schedule_for(&public_one, 20_000).unwrap();
-        assert_eq!(rearmed.source_epoch, 1);
-        assert_eq!(rearmed.target_epoch, Some(2));
-        assert_eq!(rearmed.due_unix_ms, Some(21_000));
         let transition_one = dynamic_avss_transition(
             &source,
             target_one,
@@ -14673,8 +28243,15 @@ mod tests {
             &transition_one,
             public_one.clone(),
             0xE1,
+            certificate_one.resulting_receiver_keys(&context_one).unwrap(),
             Some(certificate_one.semantic_digest(&context_one).unwrap()),
         );
+        let rearmed = server
+            .proactive_refresh_schedule_for_pending_activation(&activation_one.value, 20_000)
+            .unwrap();
+        assert_eq!(rearmed.source_epoch, 1);
+        assert_eq!(rearmed.target_epoch, Some(2));
+        assert_eq!(rearmed.due_unix_ms, Some(21_000));
         server
             .persist_activation_certificate(
                 &transition_one,
@@ -14699,7 +28276,7 @@ mod tests {
             .unwrap();
 
         let context_two = server.key_rotation_context_for_source(&public_one).unwrap().unwrap();
-        let epoch_two_identities = (1_u16..=4)
+        let epoch_two_identities = (1_u16..=5)
             .map(|party| {
                 let party = PartyId(party);
                 Identity::from_test_secrets(
@@ -14713,13 +28290,15 @@ mod tests {
             .collect::<Vec<_>>();
         let certificate_two = certified_key_rotation_for_roles(
             &context_two,
+            &server.receiver_keys.read().unwrap(),
             &epoch_two_identities,
+            &[PartyId(1), PartyId(2), PartyId(3), PartyId(4), PartyId(5)],
             &[PartyId(1), PartyId(2), PartyId(3), PartyId(4)],
-            &[PartyId(1), PartyId(2), PartyId(3)],
         );
         server
             .protocol_store
-            .save_epoch_identity_secret(
+            .save_epoch_identity_candidate_secret(
+                &context_two,
                 &epoch_two_identities[3].export_encryption_secret(),
                 &mut OsRng,
             )
@@ -14828,8 +28407,8 @@ mod tests {
             install_historical_key_rotation(
                 &server,
                 &source,
+                &[PartyId(1), PartyId(2), PartyId(3), PartyId(4), PartyId(5)],
                 &[PartyId(1), PartyId(2), PartyId(3), PartyId(4)],
-                &[PartyId(1), PartyId(2), PartyId(3)],
             )
             .await;
             server.arm_proactive_refresh_for_activation(&source, ARMED_AT).await.unwrap();
@@ -14918,8 +28497,8 @@ mod tests {
             let (rotation_context, rotation_certificate, target) = install_historical_key_rotation(
                 &server,
                 &old_share.public(),
+                &[PartyId(1), PartyId(2), PartyId(3), PartyId(4), PartyId(5)],
                 &[PartyId(1), PartyId(2), PartyId(3), PartyId(4)],
-                &[PartyId(1), PartyId(2), PartyId(3)],
             )
             .await;
             server.arm_proactive_refresh_for_activation(&old_share.public(), 80_000).await.unwrap();
@@ -14964,6 +28543,7 @@ mod tests {
                 &transition,
                 response.public.clone(),
                 0xE2,
+                response.history_link.receiver_keys(),
                 Some(rotation_certificate.semantic_digest(&rotation_context).unwrap()),
             );
             assert_eq!(activation_value(&response), activation.value);
@@ -14978,7 +28558,10 @@ mod tests {
             server.avss.lock().await.insert(transition.session, run);
 
             server
-                .arm_proactive_refresh_for_activation(&response.public, SUCCESSOR_ARMED_AT)
+                .arm_proactive_refresh_for_pending_activation(
+                    &activation_value(&response),
+                    SUCCESSOR_ARMED_AT,
+                )
                 .await
                 .unwrap();
             assert_eq!(
@@ -15000,6 +28583,7 @@ mod tests {
         let reconciled = restarted.proactive_refresh_schedule.lock().await.clone().unwrap();
         assert_eq!(reconciled.source_epoch, 1);
         assert_eq!(reconciled.target_epoch, Some(2));
+        assert_eq!(reconciled.phase, ProactiveRefreshSchedulePhase::PendingActivation);
         assert_eq!(
             reconciled.due_unix_ms,
             Some(SUCCESSOR_DUE),
@@ -15011,14 +28595,22 @@ mod tests {
             "adjacent activation crash recovery must not roll back certificate ACK cursors"
         );
 
+        let completion_started = unix_time_millis().unwrap();
         drive_protocols(&restarted, SUCCESSOR_DUE, std::time::Duration::from_millis(10))
             .await
             .unwrap();
         assert_eq!(*restarted.active_epoch.read().await, Some(1));
+        let armed = restarted.proactive_refresh_schedule.lock().await.clone().unwrap();
+        assert_eq!(armed.phase, ProactiveRefreshSchedulePhase::Armed);
+        assert!(
+            armed.due_unix_ms.unwrap()
+                >= completion_started + scenario.proactive_refresh_interval_seconds * 1_000,
+            "activation retry did not re-arm a complete successor interval"
+        );
         assert_eq!(
-            restarted.proactive_refresh_schedule.lock().await.as_ref().unwrap().due_unix_ms,
-            Some(SUCCESSOR_DUE),
-            "activation retry moved the already persisted successor deadline"
+            armed.rotation_certificate_delivered_through.get(&PartyId(2)),
+            Some(&1),
+            "activation completion rolled back certificate ACK cursors"
         );
     }
 
@@ -15039,11 +28631,11 @@ mod tests {
             .unwrap();
             let old_share = proactive_epoch_zero_share(&scenario, local);
             install_proactive_epoch_zero(&server, &old_share).await;
-            let (_, _, target) = install_historical_key_rotation(
+            let (context, certificate, target) = install_historical_key_rotation(
                 &server,
                 &old_share.public(),
+                &[PartyId(1), PartyId(2), PartyId(3), PartyId(4), PartyId(5)],
                 &[PartyId(1), PartyId(2), PartyId(3), PartyId(4)],
-                &[PartyId(1), PartyId(2), PartyId(3)],
             )
             .await;
 
@@ -15053,7 +28645,21 @@ mod tests {
             let mut unstaged_successor = old_share.public();
             unstaged_successor.committee = target;
             unstaged_successor.validate().unwrap();
-            server.arm_proactive_refresh_for_activation(&unstaged_successor, 90_000).await.unwrap();
+            let transition = server
+                .configured_proactive_refresh_transition(&old_share.public())
+                .unwrap()
+                .unwrap();
+            let activation = historical_activation_request(
+                &transition,
+                unstaged_successor,
+                0xE3,
+                certificate.resulting_receiver_keys(&context).unwrap(),
+                Some(certificate.semantic_digest(&context).unwrap()),
+            );
+            server
+                .arm_proactive_refresh_for_pending_activation(&activation.value, 90_000)
+                .await
+                .unwrap();
         }
 
         let error = PartyServer::new(
@@ -15067,7 +28673,7 @@ mod tests {
         .err()
         .expect("an unstaged adjacent successor schedule restored");
         assert!(
-            error.to_string().contains("lacks its restored staged share"),
+            error.to_string().contains("lacks its reconstructed active share"),
             "unexpected fail-closed recovery error: {error}"
         );
     }
@@ -15093,8 +28699,8 @@ mod tests {
         let (_, _, refreshed_target) = install_historical_key_rotation(
             &server,
             &source,
+            &[PartyId(1), PartyId(2), PartyId(3), PartyId(4), PartyId(5)],
             &[PartyId(1), PartyId(2), PartyId(3), PartyId(4)],
-            &[PartyId(1), PartyId(2), PartyId(3)],
         )
         .await;
         assert!(server.configured_proactive_refresh_transition(&source).unwrap().is_some());
@@ -15109,18 +28715,17 @@ mod tests {
                         .is_ok_and(|old| old.encryption_key != member.encryption_key)
                 })
                 .count(),
-            4,
+            5,
             "every same-committee refresh advertisement must select an independently fresh key"
         );
 
-        // The configured shrink pops the last member and drops the fault bound, giving epoch one an
-        // explicit three-member target backed by the five-identity eligible pool. It is a distinct
+        // The configured shrink keeps the first three members and drops the fault bound, giving
+        // epoch one an explicit three-member target backed by the six-identity eligible pool. It is a distinct
         // committee configuration, so it derives its own genesis identity and source share.
         let mut membership_change = base.clone();
-        membership_change.committees[1].members.pop();
+        membership_change.committees[1].members.truncate(3);
         membership_change.committees[1].fault_bound = 0;
         membership_change.validate().unwrap();
-        let configured_old_dealers = membership_change.committees[1].old_dealers.clone();
         let shrink_source_share = proactive_epoch_zero_share(&membership_change, local);
         let shrink_source = shrink_source_share.public();
         let state = tempfile::tempdir().unwrap();
@@ -15138,7 +28743,7 @@ mod tests {
             &server,
             &shrink_source,
             &[PartyId(1), PartyId(2), PartyId(3)],
-            &[PartyId(1), PartyId(2), PartyId(3)],
+            &[PartyId(1), PartyId(2), PartyId(3), PartyId(4)],
         )
         .await;
         let transition =
@@ -15146,7 +28751,11 @@ mod tests {
         assert_eq!(transition.purpose, DealPurpose::Reshare);
         assert_eq!(transition.target.epoch, 1);
         assert_eq!(transition.target.members.len(), 3);
-        assert_eq!(transition.eligible_dealers, configured_old_dealers);
+        assert_eq!(
+            transition.eligible_dealers,
+            shrink_source.committee.members.iter().map(|member| member.id).collect::<Vec<_>>(),
+            "reshare dealer eligibility must use every actual certified source member"
+        );
         assert_eq!(
             transition.session,
             canonical_reshare_session(
@@ -15222,7 +28831,8 @@ mod tests {
 
     #[tokio::test]
     async fn activation_certificate_keeps_first_valid_witness_representation() {
-        let scenario = activation_witness_scenario();
+        let mut scenario = activation_witness_scenario();
+        scenario.parties.push(activation_witness_extra_party(PartyId(6)));
         scenario.validate().unwrap();
         let local = PartyId(1);
         let state = tempfile::tempdir().unwrap();
@@ -15271,8 +28881,10 @@ mod tests {
             eligible_dealers: Vec::new(),
         };
 
-        let all = historical_activation_request(&transition, public.clone(), 0xB1, None);
-        let first = all.acknowledgements[..3].to_vec();
+        let receiver_keys = server.receiver_keys.read().unwrap().commitment();
+        let all =
+            historical_activation_request(&transition, public.clone(), 0xB1, receiver_keys, None);
+        let first = all.acknowledgements[..4].to_vec();
         let alternate = all.acknowledgements[1..].to_vec();
         server.persist_activation_certificate(&transition, &all.value, &first).await.unwrap();
         let certificate_path = server
@@ -15282,8 +28894,9 @@ mod tests {
         server.persist_activation_certificate(&transition, &all.value, &alternate).await.unwrap();
         assert_eq!(tokio::fs::read(&certificate_path).await.unwrap(), first_bytes);
 
-        let mut conflicting = historical_activation_request(&transition, public, 0xB2, None);
-        conflicting.acknowledgements.truncate(3);
+        let mut conflicting =
+            historical_activation_request(&transition, public, 0xB2, receiver_keys, None);
+        conflicting.acknowledgements.truncate(4);
         assert!(
             server
                 .persist_activation_certificate(
@@ -15340,8 +28953,34 @@ mod tests {
         )
         .unwrap();
         let epoch_zero_public = epoch_zero.public();
-        let dkg_certificate =
-            historical_activation_request(&dkg, epoch_zero_public.clone(), 0xA0, None);
+        let dkg_certificate = historical_activation_request(
+            &dkg,
+            epoch_zero_public.clone(),
+            0xA0,
+            server.receiver_keys.read().unwrap().commitment(),
+            None,
+        );
+        // Every key-rotation policy is bound to the receiver-key commitment in its authenticated
+        // source history link. Publish epoch zero before constructing the grow rotation; keeping
+        // the old fixture order would manufacture a rotation from unauthenticated local state.
+        let mut dkg_run = new_avss_run(&server, dkg.clone()).unwrap();
+        dkg_run.finalized = Some(InstallResponse {
+            party: local,
+            epoch: dkg_certificate.value.epoch,
+            public: dkg_certificate.value.public.clone(),
+            activation_digest: dkg_certificate.value.activation_digest,
+            avss_transcript_digest: dkg_certificate.value.avss_transcript_digest,
+            history_link: dkg_certificate.value.history_link,
+        });
+        server.persist_avss_run(&dkg_run).await.unwrap();
+        server
+            .persist_activation_certificate(
+                &dkg_certificate.transition,
+                &dkg_certificate.value,
+                &dkg_certificate.acknowledgements,
+            )
+            .await
+            .unwrap();
         let grow_history_parent = dkg_certificate.value.history_link.successor_parent().unwrap();
 
         let (grow_rotation_context, grow_rotation_certificate, epoch_one_committee) =
@@ -15394,8 +29033,30 @@ mod tests {
             &grow,
             epoch_one_public.clone(),
             0xA1,
+            grow_rotation_certificate.resulting_receiver_keys(&grow_rotation_context).unwrap(),
             Some(grow_rotation_certificate.semantic_digest(&grow_rotation_context).unwrap()),
         );
+        // The receiver-key update remains staged until the matching epoch-history CAS. Persisting
+        // the grow activation promotes that exact certificate-bound root before the shrink round
+        // is allowed to use it as its prior commitment.
+        let mut grow_run = new_avss_run(&server, grow.clone()).unwrap();
+        grow_run.finalized = Some(InstallResponse {
+            party: local,
+            epoch: grow_certificate.value.epoch,
+            public: grow_certificate.value.public.clone(),
+            activation_digest: grow_certificate.value.activation_digest,
+            avss_transcript_digest: grow_certificate.value.avss_transcript_digest,
+            history_link: grow_certificate.value.history_link,
+        });
+        server.persist_avss_run(&grow_run).await.unwrap();
+        server
+            .persist_activation_certificate(
+                &grow_certificate.transition,
+                &grow_certificate.value,
+                &grow_certificate.acknowledgements,
+            )
+            .await
+            .unwrap();
         let shrink_history_parent = grow_certificate.value.history_link.successor_parent().unwrap();
 
         let (shrink_rotation_context, shrink_rotation_certificate, epoch_two_committee) =
@@ -15450,25 +29111,17 @@ mod tests {
             &shrink,
             epoch_two.public(),
             0xA2,
+            shrink_rotation_certificate.resulting_receiver_keys(&shrink_rotation_context).unwrap(),
             Some(shrink_rotation_certificate.semantic_digest(&shrink_rotation_context).unwrap()),
         );
-        // Persist the durable genesis and grow AVSS session state so the successor activations can
-        // durably supersede them; without the live predecessor sessions the epoch-history CAS in
-        // `persist_activation_certificate` has nothing to close.
-        for predecessor in [&dkg, &grow] {
-            let run = new_avss_run(&server, predecessor.clone()).unwrap();
-            server.persist_avss_run(&run).await.unwrap();
-        }
-        for certificate in [&dkg_certificate, &grow_certificate, &shrink_certificate] {
-            server
-                .persist_activation_certificate(
-                    &certificate.transition,
-                    &certificate.value,
-                    &certificate.acknowledgements,
-                )
-                .await
-                .unwrap();
-        }
+        server
+            .persist_activation_certificate(
+                &shrink_certificate.transition,
+                &shrink_certificate.value,
+                &shrink_certificate.acknowledgements,
+            )
+            .await
+            .unwrap();
         server.store.save(&epoch_zero, &mut OsRng).await.unwrap();
         server.store.save(&epoch_one[&local], &mut OsRng).await.unwrap();
         server.store.save(&epoch_two, &mut OsRng).await.unwrap();

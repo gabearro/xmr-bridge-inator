@@ -5,7 +5,7 @@ fn test_encoded_len_for_bytes() {
   // For an encoding of length `l`, we prune to the amount of bytes which encodes with length `l`
   // This assumes length `l` -> amount of bytes has a singular answer, which is tested here
   let mut set = std::collections::HashSet::new();
-  for i in 0 .. BLOCK_LEN {
+  for i in 0..BLOCK_LEN {
     set.insert(encoded_len_for_bytes(i));
   }
   assert_eq!(set.len(), BLOCK_LEN);
@@ -44,8 +44,8 @@ fn base58() {
 fn fuzz_base58() {
   use rand_core::{RngCore as _, OsRng};
 
-  for _ in 0 .. 1000 {
-    for len in 1 .. 200 {
+  for _ in 0..1000 {
+    for len in 1..200 {
       {
         let mut bytes = vec![0; len];
         OsRng.fill_bytes(&mut bytes);

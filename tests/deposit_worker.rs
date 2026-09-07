@@ -27,15 +27,15 @@ use threshold_monero::{
     deposit_consolidation::AttemptBinding,
     deposit_wallet::{
         ChainPoint, DepositAddressDeriver, DepositSubaddressIndex, DepositWalletError,
-        PersistedRootOutput, PersistedWalletOutput, ScannedBlock, SignedSweepTransaction,
-        SweepStatus, derive_sweep_signing_session,
+        PersistedRootOutput, PersistedWalletOutput, ScannedBlock, SignedSweepTransaction, SweepId,
+        SweepStatus, WalletOutputId, derive_sweep_signing_session,
     },
     deposit_worker::{
         CanonicalTransactionKeyImages, ChainFuture, ChainSourceError, DepositBlockScanCursor,
         DepositBlockScanResult, DepositChainSource, DepositOutputBinding,
         DepositOutputIndexBackend, DepositWorkerConfig, DepositWorkerError, DepositWorkerState,
-        FetchedDepositBlock, FetchedDepositBlockEvidence, PreparedSweepIntent,
-        SweepSigningSessionTombstone, root_consolidation_destination_binding,
+        FetchedDepositBlock, FetchedDepositBlockEvidence, PortableOutputBindingStatus,
+        PreparedSweepIntent, SweepSigningSessionTombstone, root_consolidation_destination_binding,
     },
     signing::{CanonicalSignerSet, FrostlassSigner, threshold_group_key},
 };
@@ -485,6 +485,97 @@ impl DepositChainSource for ChunkedMockChain {
     }
 }
 
+#[derive(Clone, Default)]
+struct CompletePrefixThenDeferredChain {
+    scans: Arc<Mutex<Vec<(u64, bool)>>>,
+}
+
+impl CompletePrefixThenDeferredChain {
+    fn scans(&self) -> Vec<(u64, bool)> {
+        self.scans.lock().unwrap().clone()
+    }
+}
+
+impl DepositChainSource for CompletePrefixThenDeferredChain {
+    fn latest_height(&self) -> ChainFuture<'_, u64> {
+        Box::pin(async { Ok(12) })
+    }
+
+    fn block_hash(&self, height: u64) -> ChainFuture<'_, [u8; 32]> {
+        Box::pin(async move {
+            match height {
+                10..=12 => Ok([u8::try_from(height).unwrap(); 32]),
+                _ => Err(ChainSourceError::Rpc(format!("missing mock block {height}"))),
+            }
+        })
+    }
+
+    fn scanned_block_evidence<'a>(
+        &'a self,
+        height: u64,
+        _deriver: &'a DepositAddressDeriver,
+        _output_index: &'a dyn DepositOutputIndexBackend,
+        portable_snapshot: [u8; 32],
+        resume: Option<DepositBlockScanCursor>,
+    ) -> ChainFuture<'a, DepositBlockScanResult> {
+        Box::pin(async move {
+            let resuming = resume.is_some();
+            self.scans.lock().unwrap().push((height, resuming));
+            let mut fetched = match height {
+                11 => block(11, 11, 10),
+                12 => block(12, 12, 11),
+                _ => {
+                    return Err(ChainSourceError::Rpc(format!(
+                        "unexpected mock scan at height {height}"
+                    )));
+                }
+            };
+            if height == 11 {
+                fetched.outputs.push(scanned_output(9, 30, 99));
+            } else if resuming {
+                fetched.outputs.push(scanned_output(11, 32, 101));
+            } else {
+                fetched.outputs.push(scanned_output(10, 31, 100));
+            }
+            match (height, resume) {
+                (11, None) => Ok(DepositBlockScanResult::Complete(
+                    FetchedDepositBlockEvidence {
+                        block: fetched,
+                        transactions: Vec::new(),
+                        transaction_key_images: Vec::new(),
+                        transaction_key_images_complete: true,
+                    },
+                )),
+                (12, None) => Ok(DepositBlockScanResult::Deferred {
+                    next_cursor: DepositBlockScanCursor::new(
+                        fetched.block,
+                        portable_snapshot,
+                        1,
+                        threshold_monero::deposit_output_scanner::DepositTransactionScanCursor::start(
+                        ),
+                        0,
+                    ),
+                    block: fetched,
+                }),
+                (12, Some(cursor))
+                    if cursor.block() == fetched.block
+                        && cursor.portable_snapshot() == portable_snapshot =>
+                {
+                    Ok(DepositBlockScanResult::Complete(FetchedDepositBlockEvidence {
+                        block: fetched,
+                        transactions: Vec::new(),
+                        transaction_key_images: Vec::new(),
+                        transaction_key_images_complete: true,
+                    }))
+                }
+                _ => Err(ChainSourceError::Invalid(
+                    "invalid complete-prefix/deferred resume sequence".to_owned(),
+                )),
+            }
+        })
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 struct MockOutputIndex;
 
@@ -514,6 +605,76 @@ impl DepositOutputIndexBackend for MockOutputIndex {
         _bindings: &'a [DepositOutputBinding],
     ) -> ChainFuture<'a, ()> {
         Box::pin(async { Ok(()) })
+    }
+
+    fn classify_portable_output_bindings<'a>(
+        &'a self,
+        _wallet: threshold_monero::deposit_wallet::DepositWalletId,
+        _portable_snapshot: [u8; 32],
+        bindings: &'a [DepositOutputBinding],
+    ) -> ChainFuture<'a, Vec<PortableOutputBindingStatus>> {
+        Box::pin(
+            async move { Ok(vec![PortableOutputBindingStatus::UnseenUnclaimed; bindings.len()]) },
+        )
+    }
+}
+
+#[derive(Clone, Debug)]
+struct ClassifyingOutputIndex {
+    statuses: Arc<BTreeMap<WalletOutputId, PortableOutputBindingStatus>>,
+}
+
+impl ClassifyingOutputIndex {
+    fn new(
+        statuses: impl IntoIterator<Item = (WalletOutputId, PortableOutputBindingStatus)>,
+    ) -> Self {
+        Self { statuses: Arc::new(statuses.into_iter().collect()) }
+    }
+}
+
+impl DepositOutputIndexBackend for ClassifyingOutputIndex {
+    fn portable_snapshot(
+        &self,
+        _wallet: threshold_monero::deposit_wallet::DepositWalletId,
+    ) -> ChainFuture<'_, [u8; 32]> {
+        Box::pin(async { Ok([1; 32]) })
+    }
+
+    fn preload_subaddress_spend_keys<'a>(
+        &'a self,
+        _wallet: threshold_monero::deposit_wallet::DepositWalletId,
+        _portable_snapshot: [u8; 32],
+        spend_keys: &'a [[u8; 32]],
+    ) -> ChainFuture<'a, Vec<Option<DepositSubaddressIndex>>> {
+        Box::pin(async move { Ok(vec![None; spend_keys.len()]) })
+    }
+
+    fn bind_outputs<'a>(
+        &'a self,
+        _wallet: threshold_monero::deposit_wallet::DepositWalletId,
+        _portable_snapshot: [u8; 32],
+        _bindings: &'a [DepositOutputBinding],
+    ) -> ChainFuture<'a, ()> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn classify_portable_output_bindings<'a>(
+        &'a self,
+        _wallet: threshold_monero::deposit_wallet::DepositWalletId,
+        _portable_snapshot: [u8; 32],
+        bindings: &'a [DepositOutputBinding],
+    ) -> ChainFuture<'a, Vec<PortableOutputBindingStatus>> {
+        Box::pin(async move {
+            Ok(bindings
+                .iter()
+                .map(|binding| {
+                    self.statuses
+                        .get(&binding.output)
+                        .copied()
+                        .unwrap_or(PortableOutputBindingStatus::UnseenUnclaimed)
+                })
+                .collect())
+        })
     }
 }
 
@@ -546,6 +707,17 @@ impl DepositOutputIndexBackend for RejectingBindOutputIndex {
         Box::pin(async {
             Err(ChainSourceError::Invalid("injected local output-index failure".to_owned()))
         })
+    }
+
+    fn classify_portable_output_bindings<'a>(
+        &'a self,
+        _wallet: threshold_monero::deposit_wallet::DepositWalletId,
+        _portable_snapshot: [u8; 32],
+        bindings: &'a [DepositOutputBinding],
+    ) -> ChainFuture<'a, Vec<PortableOutputBindingStatus>> {
+        Box::pin(
+            async move { Ok(vec![PortableOutputBindingStatus::UnseenUnclaimed; bindings.len()]) },
+        )
     }
 }
 
@@ -581,6 +753,17 @@ impl DepositOutputIndexBackend for RecordingOutputIndex {
             self.binding_chunk_lengths.lock().unwrap().push(bindings.len());
             Ok(())
         })
+    }
+
+    fn classify_portable_output_bindings<'a>(
+        &'a self,
+        _wallet: threshold_monero::deposit_wallet::DepositWalletId,
+        _portable_snapshot: [u8; 32],
+        bindings: &'a [DepositOutputBinding],
+    ) -> ChainFuture<'a, Vec<PortableOutputBindingStatus>> {
+        Box::pin(
+            async move { Ok(vec![PortableOutputBindingStatus::UnseenUnclaimed; bindings.len()]) },
+        )
     }
 }
 
@@ -625,6 +808,184 @@ async fn output_bindings_must_commit_before_scanner_cursor_advances() {
         state.tick(&source, &deriver, &RejectingBindOutputIndex).await,
         Err(DepositWorkerError::ChainSource(ChainSourceError::Invalid(message)))
             if message == "injected local output-index failure"
+    ));
+    assert_eq!(state, before);
+}
+
+#[tokio::test]
+async fn portable_claim_owner_is_durable_and_excludes_the_input_after_restart() {
+    let output = scanned_output(9, 30, 99);
+    let mut blocks = vec![block(10, 10, 9)];
+    for height in 11_u64..=20 {
+        let mut next =
+            block(height, u8::try_from(height).unwrap(), u8::try_from(height - 1).unwrap());
+        if height == 11 {
+            next.outputs.push(output.clone());
+        }
+        blocks.push(next);
+    }
+    let source = MockChain::new(blocks);
+    let owner = SweepId([0x41; 32]);
+    let output_index = ClassifyingOutputIndex::new([(
+        output.id(),
+        PortableOutputBindingStatus::UnseenClaimed(owner),
+    )]);
+    let config = DepositWorkerConfig {
+        confirmation_depth: 1,
+        minimum_sweep_atomic_units: 1,
+        ..Default::default()
+    };
+    let (deriver, mut state) = worker(config);
+
+    let tick = state.tick(&source, &deriver, &output_index).await.unwrap();
+    let effect = tick.persistence.unwrap();
+    let events = state.events_after_persist(effect, effect.revision()).unwrap().unwrap();
+    assert_eq!(events.detections.len(), 1);
+    assert_eq!(events.detections[0].output, output.id());
+    state.acknowledge_events(events.id).unwrap();
+    assert!(state.scan_state().output(output.id()).is_some());
+    assert!(state.plan_sweep(7, [0x42; 32]).unwrap().is_none());
+
+    let restored = DepositWorkerState::decode(&state.encode().unwrap(), &deriver).unwrap();
+    assert!(restored.scan_state().output(output.id()).is_some());
+    assert!(restored.plan_sweep(7, [0x42; 32]).unwrap().is_none());
+}
+
+#[tokio::test]
+async fn exact_portable_observation_is_not_emitted_twice_but_remains_sweepable() {
+    let output = scanned_output(10, 31, 100);
+    let mut blocks = vec![block(10, 10, 9)];
+    for height in 11_u64..=20 {
+        let mut next =
+            block(height, u8::try_from(height).unwrap(), u8::try_from(height - 1).unwrap());
+        if height == 11 {
+            next.outputs.push(output.clone());
+        }
+        blocks.push(next);
+    }
+    let source = MockChain::new(blocks);
+    let output_index = ClassifyingOutputIndex::new([(
+        output.id(),
+        PortableOutputBindingStatus::ExactPortableUnclaimed,
+    )]);
+    let config = DepositWorkerConfig {
+        confirmation_depth: 1,
+        minimum_sweep_atomic_units: 1,
+        ..Default::default()
+    };
+    let (deriver, mut state) = worker(config);
+
+    let tick = state.tick(&source, &deriver, &output_index).await.unwrap();
+    assert!(!tick.staged_events);
+    let effect = tick.persistence.unwrap();
+    assert!(state.events_after_persist(effect, effect.revision()).unwrap().is_none());
+    assert_eq!(state.plan_sweep(7, [0x43; 32]).unwrap().unwrap().inputs, vec![output.id()]);
+}
+
+#[tokio::test]
+async fn portable_claim_owner_cannot_replace_a_quarantined_local_signing_family() {
+    let output = scanned_output(12, 33, 102);
+    let mut blocks = vec![block(10, 10, 9)];
+    for height in 11_u64..=20 {
+        let mut next =
+            block(height, u8::try_from(height).unwrap(), u8::try_from(height - 1).unwrap());
+        if height == 11 {
+            next.outputs.push(output.clone());
+        }
+        blocks.push(next);
+    }
+    let source = MockChain::new(blocks);
+    let config = DepositWorkerConfig {
+        confirmation_depth: 1,
+        minimum_sweep_atomic_units: 1,
+        ..Default::default()
+    };
+    let (deriver, mut state) = worker(config);
+    let detection = state.tick(&source, &deriver, &OUTPUT_INDEX).await.unwrap();
+    let effect = detection.persistence.unwrap();
+    let events = state.events_after_persist(effect, effect.revision()).unwrap().unwrap();
+    state.acknowledge_events(events.id).unwrap();
+
+    let destination = root_consolidation_destination_binding(&deriver, config);
+    let plan = state.plan_sweep(7, destination).unwrap().unwrap();
+    let prepared = state
+        .prepare_sweep_from_components(
+            &deriver,
+            &plan,
+            [0x45; 32],
+            vec![with_decoys(&output.wallet_output().unwrap())],
+            FeeRate::new(1, 1).unwrap(),
+        )
+        .unwrap();
+    let committee = single_party_committee();
+    let signers = CanonicalSignerSet::new(&committee, PartyId(1), [PartyId(1)]).unwrap();
+    let group_key = threshold_group_key(&single_party_keys());
+    let session = derive_sweep_signing_session(deriver.wallet_id(), plan.id, 1).unwrap();
+    state.reserve_prepared_sweep(&prepared, &committee, &signers, group_key, session).unwrap();
+    state.release_sweep_for_signing(plan.id).unwrap();
+
+    let mut parent = 10_u8;
+    for height in 11_u64..=20 {
+        let hash = 100_u8 + u8::try_from(height - 11).unwrap();
+        let mut replacement = block(height, hash, parent);
+        if height == 11 {
+            replacement.outputs.push(output.clone());
+        }
+        source.replace(replacement);
+        parent = hash;
+    }
+    let rollback = state.tick(&source, &deriver, &OUTPUT_INDEX).await.unwrap();
+    let effect = rollback.persistence.unwrap();
+    let events = state.events_after_persist(effect, effect.revision()).unwrap().unwrap();
+    assert!(events.rollback.is_some());
+    state.acknowledge_events(events.id).unwrap();
+    assert!(matches!(
+        state.scan_state().sweep(plan.id).unwrap().status,
+        SweepStatus::QuarantinedByReorg { .. }
+    ));
+    assert!(state.scan_state().output(output.id()).is_none());
+
+    let foreign = ClassifyingOutputIndex::new([(
+        output.id(),
+        PortableOutputBindingStatus::UnseenClaimed(SweepId([0x46; 32])),
+    )]);
+    let before_foreign = state.clone();
+    assert!(matches!(
+        state.tick(&source, &deriver, &foreign).await,
+        Err(DepositWorkerError::CertifiedSweepConflict)
+    ));
+    assert_eq!(state, before_foreign);
+
+    let same_owner = ClassifyingOutputIndex::new([(
+        output.id(),
+        PortableOutputBindingStatus::UnseenClaimed(plan.id),
+    )]);
+    let tick = state.tick(&source, &deriver, &same_owner).await.unwrap();
+    let effect = tick.persistence.unwrap();
+    let events = state.events_after_persist(effect, effect.revision()).unwrap().unwrap();
+    assert_eq!(events.detections.len(), 1);
+    state.acknowledge_events(events.id).unwrap();
+    let restored = DepositWorkerState::decode(&state.encode().unwrap(), &deriver).unwrap();
+    assert!(restored.plan_sweep(7, destination).unwrap().is_none());
+}
+
+#[tokio::test]
+async fn portable_claim_for_a_root_wallet_output_fails_without_mutating_state() {
+    let root = scanned_root_output(11, 32, 101);
+    let mut deposit_block = block(11, 11, 10);
+    deposit_block.root_outputs.push(root.clone());
+    let source = MockChain::new([block(10, 10, 9), deposit_block]);
+    let output_index = ClassifyingOutputIndex::new([(
+        root.id(),
+        PortableOutputBindingStatus::UnseenClaimed(SweepId([0x44; 32])),
+    )]);
+    let config = DepositWorkerConfig { confirmation_depth: 1, ..Default::default() };
+    let (deriver, mut state) = worker(config);
+    let before = state.clone();
+
+    assert!(matches!(
+        state.tick(&source, &deriver, &output_index).await,
+        Err(DepositWorkerError::CorruptState)
     ));
     assert_eq!(state, before);
 }
@@ -689,6 +1050,62 @@ async fn bounded_block_scan_cursor_survives_restart_and_resumes_exactly() {
 }
 
 #[tokio::test]
+async fn complete_prefix_commits_before_a_later_deferred_cursor_across_restart() {
+    let source = CompletePrefixThenDeferredChain::default();
+    let config =
+        DepositWorkerConfig { confirmation_depth: 1, max_blocks_per_tick: 2, ..Default::default() };
+    let (deriver, mut state) = worker(config);
+    let output_index = RecordingOutputIndex::default();
+
+    let prefix = state.tick(&source, &deriver, &output_index).await.unwrap();
+    assert_eq!(prefix.scanner_tip, point(11, 11));
+    assert!(prefix.staged_events);
+    assert!(!state.has_pending_block_scan());
+    assert_eq!(source.scans(), vec![(11, false), (12, false)]);
+    assert_eq!(*output_index.binding_chunk_lengths.lock().unwrap(), vec![1]);
+    let prefix_effect = prefix.persistence.unwrap();
+    assert_eq!(prefix_effect.revision(), state.revision());
+    state = DepositWorkerState::decode(&state.encode().unwrap(), &deriver).unwrap();
+    let events =
+        state.events_after_persist(prefix_effect, prefix_effect.revision()).unwrap().unwrap();
+    assert_eq!(events.detections.len(), 1);
+    assert_eq!(events.detections[0].output, scanned_output(9, 30, 99).id());
+    assert_eq!(state.replay_pending_events().unwrap(), Some(events.clone()));
+    let acknowledgement = state.acknowledge_events(events.id).unwrap();
+    assert_eq!(acknowledgement.revision(), state.revision());
+    state = DepositWorkerState::decode(&state.encode().unwrap(), &deriver).unwrap();
+
+    let deferred = state.tick(&source, &deriver, &output_index).await.unwrap();
+    assert_eq!(deferred.scanner_tip, point(11, 11));
+    assert!(!deferred.staged_events);
+    assert!(state.has_pending_block_scan());
+    assert_eq!(source.scans(), vec![(11, false), (12, false), (12, false)]);
+    assert_eq!(*output_index.binding_chunk_lengths.lock().unwrap(), vec![1, 1]);
+    let deferred_effect = deferred.persistence.unwrap();
+    assert_eq!(deferred_effect.revision(), state.revision());
+    state = DepositWorkerState::decode(&state.encode().unwrap(), &deriver).unwrap();
+
+    let completed = state.tick(&source, &deriver, &output_index).await.unwrap();
+    assert_eq!(completed.scanner_tip, point(12, 12));
+    assert!(completed.staged_events);
+    assert!(!state.has_pending_block_scan());
+    assert_eq!(source.scans(), vec![(11, false), (12, false), (12, false), (12, true)]);
+    assert_eq!(*output_index.binding_chunk_lengths.lock().unwrap(), vec![1, 1, 1]);
+    let completed_effect = completed.persistence.unwrap();
+    assert_eq!(completed_effect.revision(), state.revision());
+    let completed_events =
+        state.events_after_persist(completed_effect, completed_effect.revision()).unwrap().unwrap();
+    let mut detected =
+        completed_events.detections.iter().map(|detection| detection.output).collect::<Vec<_>>();
+    detected.sort_unstable();
+    let mut expected = vec![scanned_output(10, 31, 100).id(), scanned_output(11, 32, 101).id()];
+    expected.sort_unstable();
+    assert_eq!(detected, expected);
+    let restored = DepositWorkerState::decode(&state.encode().unwrap(), &deriver).unwrap();
+    assert_eq!(restored, state);
+}
+
+#[tokio::test]
 async fn recognized_output_pressure_yields_and_completes_the_same_block() {
     let mut first = block(11, 11, 10);
     for output_index in 0_u64..256 {
@@ -735,7 +1152,7 @@ async fn confirmed_detection_is_durable_before_release_and_replays_after_restart
     let (deriver, mut state) = worker(config);
 
     let tick = state.tick(&source, &deriver, &OUTPUT_INDEX).await.unwrap();
-    assert_eq!(tick.scanner_tip, point(11, 11));
+    assert_eq!(tick.scanner_tip, point(13, 13));
     assert!(tick.staged_events);
     assert!(matches!(
         state.tick(&source, &deriver, &OUTPUT_INDEX).await,
@@ -748,6 +1165,7 @@ async fn confirmed_detection_is_durable_before_release_and_replays_after_restart
     assert_eq!(batch.detections[0].output, output.id());
     assert_eq!(batch.detections[0].amount_atomic_units, 10_000_000);
     assert_eq!(batch.detections[0].observed_block, point(11, 11));
+    assert_eq!(batch.detections[0].confirmation_horizon, point(13, 13));
 
     let encoded = state.encode().unwrap();
     let mut restored = DepositWorkerState::decode(&encoded, &deriver).unwrap();
@@ -755,6 +1173,79 @@ async fn confirmed_detection_is_durable_before_release_and_replays_after_restart
     let clear = restored.acknowledge_events(batch.id).unwrap();
     assert_eq!(clear.revision(), effect.revision() + 1);
     assert!(restored.replay_pending_events().unwrap().is_none());
+}
+
+#[tokio::test]
+async fn immature_detection_survives_restart_and_emits_once_at_its_exact_horizon() {
+    let mut deposit_block = block(11, 11, 10);
+    let output = scanned_output(9, 32, 106);
+    deposit_block.outputs.push(output.clone());
+    let source = MockChain::new([block(10, 10, 9), deposit_block, block(12, 12, 11)]);
+    let config = DepositWorkerConfig { confirmation_depth: 3, ..Default::default() };
+    let (deriver, mut state) = worker(config);
+
+    let immature = state.tick(&source, &deriver, &OUTPUT_INDEX).await.unwrap();
+    assert_eq!(immature.scanner_tip, point(12, 12));
+    assert!(!immature.staged_events);
+    assert!(immature.persistence.is_some());
+    assert!(state.replay_pending_events().unwrap().is_none());
+
+    let mut restored = DepositWorkerState::decode(&state.encode().unwrap(), &deriver).unwrap();
+    source.push(block(13, 13, 12));
+    let mature = restored.tick(&source, &deriver, &OUTPUT_INDEX).await.unwrap();
+    let effect = mature.persistence.unwrap();
+    let events = restored.events_after_persist(effect, effect.revision()).unwrap().unwrap();
+    assert_eq!(events.detections.len(), 1);
+    assert_eq!(events.detections[0].output, output.id());
+    assert_eq!(events.detections[0].confirmation_horizon, point(13, 13));
+    restored.acknowledge_events(events.id).unwrap();
+
+    let idle = restored.tick(&source, &deriver, &OUTPUT_INDEX).await.unwrap();
+    assert!(idle.persistence.is_none());
+    assert!(!idle.staged_events);
+}
+
+#[tokio::test]
+async fn horizon_only_reorg_requeues_and_reissues_the_surviving_output() {
+    let mut deposit_block = block(11, 11, 10);
+    let output = scanned_output(9, 33, 107);
+    deposit_block.outputs.push(output.clone());
+    let source =
+        MockChain::new([block(10, 10, 9), deposit_block, block(12, 12, 11), block(13, 13, 12)]);
+    let config = DepositWorkerConfig { confirmation_depth: 3, ..Default::default() };
+    let (deriver, mut state) = worker(config);
+
+    let initial = state.tick(&source, &deriver, &OUTPUT_INDEX).await.unwrap();
+    let effect = initial.persistence.unwrap();
+    let events = state.events_after_persist(effect, effect.revision()).unwrap().unwrap();
+    assert_eq!(events.detections[0].confirmation_horizon, point(13, 13));
+    state.acknowledge_events(events.id).unwrap();
+
+    source.replace(block(13, 23, 12));
+    let rollback_tick = state.tick(&source, &deriver, &OUTPUT_INDEX).await.unwrap();
+    assert_eq!(rollback_tick.scanner_tip, point(12, 12));
+    let effect = rollback_tick.persistence.unwrap();
+    let rollback_batch = state.events_after_persist(effect, effect.revision()).unwrap().unwrap();
+    let rollback = rollback_batch.rollback.as_ref().unwrap();
+    assert!(rollback.removed_outputs.is_empty());
+    assert!(rollback.orphaned_deposits.is_empty());
+    assert_eq!(
+        rollback.invalidated_observation_horizons,
+        vec![threshold_monero::deposit_worker::InvalidatedDepositObservationHorizon {
+            output: output.id(),
+            horizon: point(13, 13),
+        }]
+    );
+    state.acknowledge_events(rollback_batch.id).unwrap();
+
+    let replacement = state.tick(&source, &deriver, &OUTPUT_INDEX).await.unwrap();
+    let effect = replacement.persistence.unwrap();
+    let replacement_events =
+        state.events_after_persist(effect, effect.revision()).unwrap().unwrap();
+    assert_eq!(replacement_events.detections.len(), 1);
+    assert_eq!(replacement_events.detections[0].output, output.id());
+    assert_eq!(replacement_events.detections[0].observed_block, point(11, 11));
+    assert_eq!(replacement_events.detections[0].confirmation_horizon, point(13, 23));
 }
 
 #[tokio::test]
@@ -778,9 +1269,9 @@ async fn late_joiner_scans_registered_deposit_from_before_joining() {
     state.initialize_portable_index_head([1; 32]).unwrap();
 
     let tick = state.tick(&source, &deriver, &OUTPUT_INDEX).await.unwrap();
-    // Height 10 has three confirmations at daemon height 12, so the historical deposit at height
-    // 3 is included even though it predates this party's local state.
-    assert_eq!(tick.scanner_tip, point(10, 11));
+    // The full parent-linked tip is retained, while the historical deposit at height 3 is released
+    // only because its deterministic depth-three horizon is already authenticated.
+    assert_eq!(tick.scanner_tip, point(12, 13));
     let effect = tick.persistence.unwrap();
     let events = state.events_after_persist(effect, effect.revision()).unwrap().unwrap();
     assert_eq!(events.detections.len(), 1);
@@ -1348,6 +1839,44 @@ async fn signed_sweep_is_persisted_replayed_and_confirmed_only_by_root_output_ev
     let preview = restored
         .preview_sweep_family_key_images(plan.id, key_images_in_prepared_order.clone())
         .unwrap();
+    assert_eq!(
+        restored
+            .preview_sweep_family_key_images(plan.id, key_images_in_prepared_order.clone())
+            .unwrap(),
+        preview,
+    );
+    // Alternate inputs across the bounded deterministic cache, including FIFO eviction.
+    for scalar in 12_345..12_410 {
+        let mut other_images = key_images_in_prepared_order.clone();
+        other_images[0] = root_key(scalar);
+        let alternate =
+            restored.preview_sweep_family_key_images(plan.id, other_images.clone()).unwrap();
+        assert_ne!(alternate.unsigned_transaction_digest(), preview.unsigned_transaction_digest());
+        assert_eq!(
+            restored
+                .preview_sweep_family_key_images(plan.id, key_images_in_prepared_order.clone())
+                .unwrap(),
+            preview,
+        );
+        assert_eq!(
+            restored.preview_sweep_family_key_images(plan.id, other_images).unwrap(),
+            alternate
+        );
+    }
+    for _ in 0..2 {
+        assert!(
+            restored
+                .preview_sweep_family_key_images(plan.id, vec![key_images_in_prepared_order[0]])
+                .is_err()
+        );
+        assert!(restored.preview_sweep_family_key_images(plan.id, vec![[0xff; 32]; 2]).is_err());
+    }
+    assert_eq!(
+        restored
+            .preview_sweep_family_key_images(plan.id, key_images_in_prepared_order.clone())
+            .unwrap(),
+        preview,
+    );
     assert_eq!(restored.encode().unwrap(), before_preview);
     let pin = restored.pin_sweep_family_key_image_binding(preview.clone()).unwrap();
     assert_eq!(pin.binding, preview);
@@ -1391,18 +1920,36 @@ async fn signed_sweep_is_persisted_replayed_and_confirmed_only_by_root_output_ev
         .unwrap();
     restored.validate_sweep_family_candidate(plan.id, &alternate_signed).unwrap();
 
+    if std::env::var_os("TM_BENCH_SWEEP_VALIDATION").is_some() {
+        let started = std::time::Instant::now();
+        for _ in 0..32 {
+            restored.validate_sweep_family_candidate(plan.id, &alternate_signed).unwrap();
+        }
+        eprintln!("32 complete sweep candidate validations: {:?}", started.elapsed());
+    }
+
     let assert_invalid = |candidate: monero_oxide::transaction::Transaction| {
         let signed = threshold_monero::deposit_wallet::SignedSweepTransaction::from_transaction(
             &candidate,
             Some(candidate.hash()),
         )
         .unwrap();
-        assert!(matches!(
-            restored.validate_sweep_family_candidate(plan.id, &signed),
-            Err(DepositWorkerError::InvalidSweepFamilyCandidate)
-                | Err(DepositWorkerError::Wallet(DepositWalletError::SignedSweepIntentMismatch))
-        ));
+        for _ in 0..2 {
+            assert!(matches!(
+                restored.validate_sweep_family_candidate(plan.id, &signed),
+                Err(DepositWorkerError::InvalidSweepFamilyCandidate)
+                    | Err(DepositWorkerError::Wallet(
+                        DepositWalletError::SignedSweepIntentMismatch
+                    ))
+            ));
+        }
     };
+    let mut wrong_output = alternate_transaction.clone();
+    let monero_oxide::transaction::Transaction::V2 { prefix, .. } = &mut wrong_output else {
+        unreachable!()
+    };
+    prefix.outputs[0].key = monero_wallet::ed25519::CompressedPoint::G;
+    assert_invalid(wrong_output);
     let mut wrong_image = alternate_transaction.clone();
     let monero_oxide::transaction::Transaction::V2 { prefix, .. } = &mut wrong_image else {
         unreachable!()
@@ -1432,7 +1979,21 @@ async fn signed_sweep_is_persisted_replayed_and_confirmed_only_by_root_output_ev
         unreachable!()
     };
     clsags[0].c1 = monero_wallet::ed25519::Scalar::ZERO;
-    assert_invalid(wrong_clsag);
+    assert_invalid(wrong_clsag.clone());
+    // Fill and evict the deterministic shape cache: matching outputs never authorize a CLSAG.
+    for scalar in 1_u64..=65 {
+        let monero_oxide::transaction::Transaction::V2 { proofs: Some(proofs), .. } =
+            &mut wrong_clsag
+        else {
+            unreachable!()
+        };
+        let monero_oxide::ringct::RctPrunable::Clsag { clsags, .. } = &mut proofs.prunable else {
+            unreachable!()
+        };
+        clsags[0].c1 = monero_wallet::ed25519::Scalar::from(scalar.into());
+        assert_invalid(wrong_clsag.clone());
+    }
+    restored.validate_sweep_family_candidate(plan.id, &alternate_signed).unwrap();
 
     let mut wrong_pseudo_out = alternate_transaction.clone();
     let monero_oxide::transaction::Transaction::V2 { proofs: Some(proofs), .. } =
@@ -1463,8 +2024,22 @@ async fn signed_sweep_is_persisted_replayed_and_confirmed_only_by_root_output_ev
     assert_eq!(signed.transaction_id(), transaction_id);
     assert_eq!(signed.as_bytes(), transaction.serialize());
     let signed_snapshot = restored.encode().unwrap();
+    let mut tampered_snapshot = signed_snapshot.clone();
+    let signed_offset = tampered_snapshot
+        .windows(signed.as_bytes().len())
+        .position(|bytes| bytes == signed.as_bytes())
+        .unwrap();
+    tampered_snapshot[signed_offset + signed.as_bytes().len() - 1] ^= 1;
+    assert!(
+        DepositWorkerState::decode(&tampered_snapshot, &deriver).is_err(),
+        "a warm validation cache must reject changed signed bytes under the same revision",
+    );
     let mut restored = DepositWorkerState::decode(&signed_snapshot, &deriver).unwrap();
     assert_eq!(restored.replay_signed_sweeps().unwrap().len(), 1);
+    // ROAST evidence finality is independent of local publication state. A delayed distinct
+    // signer endorsement must remain fully verifiable after local adoption made the immutable
+    // family `Signed`.
+    restored.validate_sweep_family_candidate(plan.id, &alternate_signed).unwrap();
 
     let mut alternate_blocks = vec![block(10, 10, 9)];
     let mut alternate_parent = 10_u8;

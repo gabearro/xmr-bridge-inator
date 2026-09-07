@@ -1230,12 +1230,35 @@ impl SweepSigningIntent {
         {
             return Err(DepositWalletError::SignedSweepIntentMismatch);
         }
-        let eventuality = Eventuality::from(self.signable_transaction()?);
-        let (pruned, _) = transaction.pruned_with_prunable();
-        if !eventuality.matches(&pruned) {
-            return Err(DepositWalletError::SignedSweepIntentMismatch);
+        std::thread_local! {
+            // ponytail: 64 digests per thread; revisit only if retained families exceed this bound.
+            static RECENT: std::cell::RefCell<std::collections::VecDeque<[u8; 32]>> =
+                const { std::cell::RefCell::new(std::collections::VecDeque::new()) };
         }
-        Ok(())
+        // Memoize only deterministic output reconstruction, never proof/quorum authorization.
+        // Bind both exact byte strings; retain no private signing material in the cache.
+        let mut hasher =
+            blake3::Hasher::new_derive_key("threshold-monero/sweep-eventuality-match-cache/v1");
+        for bytes in [self.signable_transaction.as_slice(), signed.as_bytes()] {
+            hasher.update(&u64::try_from(bytes.len()).unwrap_or(u64::MAX).to_le_bytes());
+            hasher.update(bytes);
+        }
+        let key = *hasher.finalize().as_bytes();
+        RECENT.with_borrow_mut(|cached| {
+            if cached.contains(&key) {
+                return Ok(());
+            }
+            let eventuality = Eventuality::from(self.signable_transaction()?);
+            let (pruned, _) = transaction.pruned_with_prunable();
+            if !eventuality.matches(&pruned) {
+                return Err(DepositWalletError::SignedSweepIntentMismatch);
+            }
+            if cached.len() == 64 {
+                cached.pop_front();
+            }
+            cached.push_back(key);
+            Ok(())
+        })
     }
 }
 
@@ -2083,6 +2106,16 @@ impl ScanState {
             })
     }
 
+    /// Return the exact canonical point authenticated anywhere in the scanner's retained history.
+    ///
+    /// Unlike [`Self::chain_point`], this includes historical blocks pinned by authenticated
+    /// backfill/output evidence. Conflicting evidence at the same height and points ahead of the
+    /// current scanner tip are rejected.
+    #[must_use]
+    pub(crate) fn authenticated_canonical_chain_point(&self, height: u64) -> Option<ChainPoint> {
+        (height <= self.tip().height).then(|| self.authenticated_chain_point(height)).flatten()
+    }
+
     /// Whether an exact point remains authenticated as part of this scanner's canonical history.
     ///
     /// This includes the moving checkpoint, retained reorganization suffix, and historical points
@@ -2092,8 +2125,7 @@ impl ScanState {
     #[must_use]
     pub(crate) fn authenticates_canonical_chain_point(&self, point: ChainPoint) -> bool {
         ChainPoint::new(point.height, point.hash).is_ok()
-            && point.height <= self.tip().height
-            && self.authenticated_chain_point(point.height) == Some(point)
+            && self.authenticated_canonical_chain_point(point.height) == Some(point)
     }
 
     /// Verify one exact client-allocation recognition anchor against authenticated local history.
@@ -2256,6 +2288,38 @@ impl ScanState {
     #[must_use]
     pub fn sweep_signing_attempt_high_water(&self, id: SweepId) -> Option<u64> {
         self.sweeps.get(&id).map(|record| record.signing_attempt_high_water)
+    }
+
+    /// Require one exact worker attempt to remain eligible for key-image authorization or
+    /// signature-share exposure.
+    ///
+    /// A sweep-family key-image binding is attempt-independent once it is pinned, but the right
+    /// to derive or expose signing material is not. Callers must recheck this predicate while
+    /// holding the snapshot mutation fence immediately before crossing either boundary.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an unknown sweep, any lifecycle other than `SigningReleased`, or an
+    /// attempt/session/intent tuple which is not the current monotonic high-water.
+    pub fn validate_live_sweep_signing_attempt(
+        &self,
+        id: SweepId,
+        attempt: u64,
+        session: SessionId,
+        intent_digest: [u8; 32],
+    ) -> Result<(), DepositWalletError> {
+        let record = self.sweeps.get(&id).ok_or(DepositWalletError::UnknownSweep(id))?;
+        if record.status != SweepStatus::SigningReleased {
+            return Err(DepositWalletError::InvalidSweepTransition);
+        }
+        if record.signing_attempt_high_water != attempt
+            || derive_sweep_signing_session(self.wallet, id, attempt) != Some(session)
+            || record.signing_intent.session() != session.0
+            || record.signing_intent.intent_digest() != intent_digest
+        {
+            return Err(DepositWalletError::UnknownSweepSigningAttempt);
+        }
+        Ok(())
     }
 
     /// Validate a portable certified completion against a same-ID local intent, if present.
@@ -2497,51 +2561,39 @@ impl ScanState {
         self.pinned_root_transactions.iter().copied()
     }
 
-    /// Re-seal one exact retained/pinned block for a backfill or recognition hold.
+    /// Exact historical chain points whose empty/full block bodies are held by a durable worker
+    /// obligation rather than only by retained wallet outputs.
+    pub(crate) fn held_historical_chain_points(&self) -> impl Iterator<Item = ChainPoint> + '_ {
+        self.pinned_historical_blocks
+            .values()
+            .filter(|pinned| pinned.held)
+            .map(|pinned| pinned.block.point)
+    }
+
+    /// Re-seal one exact retained/pinned block header for a backfill or recognition hold.
     ///
     /// This avoids asking the chain source for a block which is already authenticated locally.
-    pub(crate) fn authenticated_historical_block_evidence(
+    /// The output vectors are intentionally empty: a hold protects an already-validated local
+    /// block, while output-bearing historical evidence additionally requires a non-genesis
+    /// portable sequence before it may import wallet state.
+    pub(crate) fn authenticated_historical_block_header_evidence(
         &self,
         point: ChainPoint,
         portable_index_head: [u8; 32],
         portable_through_sequence: u64,
     ) -> Result<AuthenticatedHistoricalBlockEvidence, DepositWalletError> {
-        let (block, timestamp, output_ids, root_output_ids) = self
+        let (block, timestamp) = self
             .blocks
             .get(&point.height)
             .filter(|stored| stored.block.point == point)
-            .map(|stored| {
-                (
-                    stored.block,
-                    stored.timestamp,
-                    stored.outputs.as_slice(),
-                    stored.root_outputs.as_slice(),
-                )
-            })
+            .map(|stored| (stored.block, stored.timestamp))
             .or_else(|| {
                 self.pinned_historical_blocks
                     .get(&point.height)
                     .filter(|stored| stored.block.point == point)
-                    .map(|stored| {
-                        (
-                            stored.block,
-                            stored.timestamp,
-                            stored.outputs.as_slice(),
-                            stored.root_outputs.as_slice(),
-                        )
-                    })
+                    .map(|stored| (stored.block, stored.timestamp))
             })
             .ok_or(DepositWalletError::UnknownChainPoint(point))?;
-        let outputs = output_ids
-            .iter()
-            .map(|id| self.outputs.get(id).cloned().ok_or(DepositWalletError::CorruptScanState))
-            .collect::<Result<Vec<_>, _>>()?;
-        let root_outputs = root_output_ids
-            .iter()
-            .map(|id| {
-                self.root_outputs.get(id).cloned().ok_or(DepositWalletError::CorruptScanState)
-            })
-            .collect::<Result<Vec<_>, _>>()?;
         AuthenticatedHistoricalBlockEvidence::from_authenticated_chain_source(
             self.wallet,
             block,
@@ -2549,8 +2601,8 @@ impl ScanState {
             self.tip(),
             portable_index_head,
             portable_through_sequence,
-            outputs,
-            root_outputs,
+            Vec::new(),
+            Vec::new(),
         )
     }
 
@@ -4793,6 +4845,132 @@ fn is_active_sweep(status: SweepStatus) -> bool {
             | SweepStatus::QuarantinedByReorg { .. }
             | SweepStatus::AbandonedByReorg { .. }
     )
+}
+
+#[cfg(test)]
+mod live_sweep_signing_attempt_tests {
+    use super::*;
+
+    const ATTEMPT: u64 = 7;
+    const INTENT_DIGEST: [u8; 32] = [0x71; 32];
+
+    fn fixture() -> (ScanState, SweepId, SessionId) {
+        let deriver = DepositAddressDeriver::new(
+            NetworkKind::Mainnet,
+            (ED25519_BASEPOINT_POINT * DalekScalar::from(42_u64)).compress().to_bytes(),
+            &Zeroizing::new(DalekScalar::from(17_u64).to_bytes()),
+        )
+        .unwrap();
+        let mut state = ScanState::new(&deriver, ChainPoint::new(10, [0x10; 32]).unwrap()).unwrap();
+        let sweep = SweepId([0x51; 32]);
+        let session = derive_sweep_signing_session(state.wallet_id(), sweep, ATTEMPT).unwrap();
+        state.sweeps.insert(
+            sweep,
+            SweepRecord {
+                id: sweep,
+                signing_intent: SweepSigningIntent {
+                    epoch: 11,
+                    plan_commitment: sweep.0,
+                    session: session.0,
+                    committee_digest: [0x61; 32],
+                    group_key: state.root_spend_key(),
+                    signers: vec![1, 3, 7],
+                    signable_transaction: Vec::new(),
+                    prepared_sweep_intent: Vec::new(),
+                    transaction_commitment: [0x62; 32],
+                    signing_context: [0x63; 32],
+                    fee_atomic_units: 1_000,
+                    intent_digest: INTENT_DIGEST,
+                },
+                signing_attempt_high_water: ATTEMPT,
+                retired_signing_attempts: Vec::new(),
+                family_key_images: None,
+                inputs: Vec::new(),
+                signed_transaction: None,
+                family_candidates: Vec::new(),
+                status: SweepStatus::SigningReleased,
+            },
+        );
+        (state, sweep, session)
+    }
+
+    #[test]
+    fn exposure_requires_the_exact_current_worker_attempt() {
+        let (mut state, sweep, session) = fixture();
+        assert!(
+            state
+                .validate_live_sweep_signing_attempt(sweep, ATTEMPT, session, INTENT_DIGEST)
+                .is_ok()
+        );
+        assert!(matches!(
+            state.validate_live_sweep_signing_attempt(
+                sweep,
+                ATTEMPT + 1,
+                derive_sweep_signing_session(state.wallet_id(), sweep, ATTEMPT + 1).unwrap(),
+                INTENT_DIGEST,
+            ),
+            Err(DepositWalletError::UnknownSweepSigningAttempt)
+        ));
+        assert!(matches!(
+            state.validate_live_sweep_signing_attempt(
+                sweep,
+                ATTEMPT,
+                SessionId([0x72; 32]),
+                INTENT_DIGEST,
+            ),
+            Err(DepositWalletError::UnknownSweepSigningAttempt)
+        ));
+        assert!(matches!(
+            state.validate_live_sweep_signing_attempt(sweep, ATTEMPT, session, [0x73; 32]),
+            Err(DepositWalletError::UnknownSweepSigningAttempt)
+        ));
+
+        let next_attempt = ATTEMPT + 1;
+        let next_session =
+            derive_sweep_signing_session(state.wallet_id(), sweep, next_attempt).unwrap();
+        let next_digest = [0x74; 32];
+        let record = state.sweeps.get_mut(&sweep).unwrap();
+        record.signing_attempt_high_water = next_attempt;
+        record.signing_intent.session = next_session.0;
+        record.signing_intent.intent_digest = next_digest;
+        assert!(matches!(
+            state.validate_live_sweep_signing_attempt(sweep, ATTEMPT, session, INTENT_DIGEST),
+            Err(DepositWalletError::UnknownSweepSigningAttempt)
+        ));
+        assert!(
+            state
+                .validate_live_sweep_signing_attempt(sweep, next_attempt, next_session, next_digest)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn terminal_and_reorg_states_cannot_authorize_exposure() {
+        let (mut state, sweep, session) = fixture();
+        let point = ChainPoint::new(12, [0x12; 32]).unwrap();
+        for status in [
+            SweepStatus::Reserved,
+            SweepStatus::Signed { transaction: [0x81; 32] },
+            SweepStatus::Broadcast { transaction: [0x81; 32] },
+            SweepStatus::Confirmed { transaction: [0x81; 32], block: point },
+            SweepStatus::QuarantinedByReorg { ancestor: point, transaction: None },
+            SweepStatus::AbandonedByReorg { ancestor: point },
+        ] {
+            state.sweeps.get_mut(&sweep).unwrap().status = status;
+            assert!(
+                matches!(
+                    state.validate_live_sweep_signing_attempt(
+                        sweep,
+                        ATTEMPT,
+                        session,
+                        INTENT_DIGEST
+                    ),
+                    Err(DepositWalletError::InvalidSweepTransition)
+                ),
+                "status {status:?} authorized signing exposure"
+            );
+        }
+    }
 }
 
 /// Error returned by Monero deposit wallet material and persistence primitives.

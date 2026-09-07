@@ -77,7 +77,6 @@ x-party-environment: &party-environment
   TM_DEPOSIT_VIEW_KEY_FILE: /run/secrets/deposit_view_key
   TM_STATE_DIR: /var/lib/threshold-monero
   TM_SIGNING_SEED_FILE: /run/secrets/signing_seed
-  TM_BOOTSTRAP_X25519_SECRET_FILE: /run/secrets/bootstrap_x25519_secret
   TM_SCENARIO_FILE: /etc/threshold-monero/regtest-scenario.json
   # Each eligible epoch-zero member durably starts only its own canonical dealer role. QUIC
   # outbox retry makes simultaneous container startup and ordinary process restart idempotent.
@@ -196,6 +195,7 @@ services:
     environment:
       <<: *party-environment
       TM_PARTY_ID: "1"
+      TM_BOOTSTRAP_X25519_SECRET_FILE: /run/secrets/bootstrap_x25519_secret
     volumes:
       - p1-state:/var/lib/threshold-monero
       - ./docker/configs/regtest-scenario.json:/etc/threshold-monero/regtest-scenario.json:ro
@@ -225,6 +225,7 @@ services:
     environment:
       <<: *party-environment
       TM_PARTY_ID: "2"
+      TM_BOOTSTRAP_X25519_SECRET_FILE: /run/secrets/bootstrap_x25519_secret
     volumes:
       - p2-state:/var/lib/threshold-monero
       - ./docker/configs/regtest-scenario.json:/etc/threshold-monero/regtest-scenario.json:ro
@@ -254,6 +255,7 @@ services:
     environment:
       <<: *party-environment
       TM_PARTY_ID: "3"
+      TM_BOOTSTRAP_X25519_SECRET_FILE: /run/secrets/bootstrap_x25519_secret
     volumes:
       - p3-state:/var/lib/threshold-monero
       - ./docker/configs/regtest-scenario.json:/etc/threshold-monero/regtest-scenario.json:ro
@@ -283,6 +285,7 @@ services:
     environment:
       <<: *party-environment
       TM_PARTY_ID: "4"
+      TM_BOOTSTRAP_X25519_SECRET_FILE: /run/secrets/bootstrap_x25519_secret
     volumes:
       - p4-state:/var/lib/threshold-monero
       - ./docker/configs/regtest-scenario.json:/etc/threshold-monero/regtest-scenario.json:ro
@@ -312,6 +315,7 @@ services:
     environment:
       <<: *party-environment
       TM_PARTY_ID: "5"
+      TM_BOOTSTRAP_X25519_SECRET_FILE: /run/secrets/bootstrap_x25519_secret
     volumes:
       - p5-state:/var/lib/threshold-monero
       - ./docker/configs/regtest-scenario.json:/etc/threshold-monero/regtest-scenario.json:ro
@@ -354,8 +358,6 @@ services:
     secrets:
       - source: demo-p6-signing-seed
         target: signing_seed
-      - source: demo-p6-bootstrap-x25519-secret
-        target: bootstrap_x25519_secret
       - source: demo-p6-quic-private-key
         target: quic_private_key
       - source: demo-p6-admin-bearer-token
@@ -383,8 +385,6 @@ services:
     secrets:
       - source: demo-p7-signing-seed
         target: signing_seed
-      - source: demo-p7-bootstrap-x25519-secret
-        target: bootstrap_x25519_secret
       - source: demo-p7-quic-private-key
         target: quic_private_key
       - source: demo-p7-admin-bearer-token
@@ -412,8 +412,6 @@ services:
     secrets:
       - source: demo-p8-signing-seed
         target: signing_seed
-      - source: demo-p8-bootstrap-x25519-secret
-        target: bootstrap_x25519_secret
       - source: demo-p8-quic-private-key
         target: quic_private_key
       - source: demo-p8-admin-bearer-token
@@ -561,8 +559,8 @@ volumes:
   p8-state:
 
 secrets:
-  # Public deterministic signing-seed and bootstrap X25519 fixtures. The two key families are
-  # deliberately independent. Replace all sixteen through a secret manager outside this demo.
+  # Public deterministic signing-seed and genesis-member X25519 fixtures. The two key families
+  # are deliberately independent. Post-genesis-only parties never receive an epoch-zero secret.
   demo-p1-signing-seed:
     file: ./docker/demo-secrets/p1-signing-seed.hex
   demo-p2-signing-seed:
@@ -589,12 +587,6 @@ secrets:
     file: ./docker/demo-secrets/p4-bootstrap-x25519-secret.hex
   demo-p5-bootstrap-x25519-secret:
     file: ./docker/demo-secrets/p5-bootstrap-x25519-secret.hex
-  demo-p6-bootstrap-x25519-secret:
-    file: ./docker/demo-secrets/p6-bootstrap-x25519-secret.hex
-  demo-p7-bootstrap-x25519-secret:
-    file: ./docker/demo-secrets/p7-bootstrap-x25519-secret.hex
-  demo-p8-bootstrap-x25519-secret:
-    file: ./docker/demo-secrets/p8-bootstrap-x25519-secret.hex
   # Public deterministic transport-key fixtures. Compose exposes only the matching key to each
   # party and mounts it read-only. Replace these with a real secret manager outside this demo.
   demo-p1-quic-private-key:

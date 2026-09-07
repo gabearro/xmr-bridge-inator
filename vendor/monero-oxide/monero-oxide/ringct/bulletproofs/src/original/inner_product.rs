@@ -98,8 +98,8 @@ impl IpStatement {
     witness: IpWitness,
   ) -> Result<IpProof, IpError> {
     let generators = &crate::original::GENERATORS;
-    let g_bold_slice = &generators.G[.. witness.a.len()];
-    let h_bold_slice = &generators.H[.. witness.a.len()];
+    let g_bold_slice = &generators.G[..witness.a.len()];
+    let h_bold_slice = &generators.H[..witness.a.len()];
 
     let (mut g_bold, mut h_bold, u, mut a, mut b) = {
       let IpStatement { h_bold_weights, u } = self;
@@ -224,8 +224,8 @@ impl IpStatement {
     proof: IpProof,
   ) -> Result<(), IpError> {
     let generators = &crate::original::GENERATORS;
-    let g_bold_slice = &generators.G[.. ip_rows];
-    let h_bold_slice = &generators.H[.. ip_rows];
+    let g_bold_slice = &generators.G[..ip_rows];
+    let h_bold_slice = &generators.H[..ip_rows];
 
     let IpStatement { h_bold_weights, u } = self;
 
@@ -302,11 +302,11 @@ impl IpStatement {
 
     // The g_bold * a term case from line 16
     #[allow(clippy::needless_range_loop)]
-    for i in 0 .. g_bold_slice.len() {
+    for i in 0..g_bold_slice.len() {
       verifier.0.g_bold[i] -= verifier_weight * product_cache[i] * proof.a;
     }
     // The h_bold * b term case from line 16
-    for i in 0 .. h_bold_slice.len() {
+    for i in 0..h_bold_slice.len() {
       verifier.0.h_bold[i] -=
         verifier_weight * product_cache[product_cache.len() - 1 - i] * proof.b * h_bold_weights[i];
     }

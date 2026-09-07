@@ -102,7 +102,7 @@ impl SimpleRequestTransport {
       let url_clone = Zeroizing::new(url);
       let split_url = url_clone.split('@').collect::<Vec<_>>();
       let mut userpass = split_url[0];
-      url = split_url[1 ..].join("@");
+      url = split_url[1..].join("@");
 
       // If there was additionally a protocol string, restore that to the daemon URL
       if userpass.contains("://") {
@@ -135,7 +135,7 @@ impl SimpleRequestTransport {
       )?;
       Authentication::Authenticated {
         username: Zeroizing::new(split_userpass[0].to_owned()),
-        password: Zeroizing::new(split_userpass[1 ..].join(":")),
+        password: Zeroizing::new(split_userpass[1..].join(":")),
         connection: Arc::new(Mutex::new((challenge, client))),
       }
     } else {
@@ -190,7 +190,7 @@ impl SimpleRequestTransport {
       Ok(res)
     }
 
-    for attempt in 0 .. 2 {
+    for attempt in 0..2 {
       return Ok(match &self.authentication {
         Authentication::Unauthenticated(client) => {
           body_from_response(

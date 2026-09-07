@@ -87,11 +87,11 @@ fn featured() {
   for (network, first) in
     [(Network::Mainnet, 'C'), (Network::Testnet, 'K'), (Network::Stagenet, 'F')]
   {
-    for _ in 0 .. 100 {
+    for _ in 0..100 {
       let spend = Scalar::random(&mut OsRng).into() * g;
       let view = Scalar::random(&mut OsRng).into() * g;
 
-      for features in 0 .. (1 << 3) {
+      for features in 0..(1 << 3) {
         const SUBADDRESS_FEATURE_BIT: u8 = 1;
         const INTEGRATED_FEATURE_BIT: u8 = 1 << 1;
         const GUARANTEED_FEATURE_BIT: u8 = 1 << 2;

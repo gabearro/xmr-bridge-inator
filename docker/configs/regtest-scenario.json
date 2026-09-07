@@ -1,7 +1,8 @@
 {
-  "schema_version": 6,
+  "schema_version": 7,
   "demo_only": true,
   "network": "regtest",
+  "deposit_birth_anchor": null,
   "acceptance_monerod_rpc_url": "http://monerod-miner:18081",
   "parties": [
     {
@@ -81,7 +82,7 @@
       "quic_server_name": "p8.threshold-monero.invalid",
       "quic_certificate_file": "/etc/threshold-monero/quic/p8-cert.der",
       "monerod_rpc_urls": ["http://monerod-p8:18081"],
-      "signing_key": "13d9908a70925992ed546007d27f50da68ba7217ef62ac3cca784529ff10471c",
+      "signing_key": "c19a014d941b3cadad9ce6de7be90d89cff7d3b715ed21b68961e3c7d1d2187c",
       "bootstrap_encryption_key": "650de62f273b2001a6bd05beaec51339ce34cd4ae0b59094fe649ddf2aba2a14"
     }
   ],
@@ -100,8 +101,7 @@
       "threshold": 4,
       "fault_bound": 1,
       "members": [1, 2, 3, 4, 5, 6, 7],
-      "eligible_members": [1, 2, 3, 4, 5, 6, 7, 8],
-      "old_dealers": [1, 2, 3, 4, 5]
+      "eligible_members": [1, 2, 3, 4, 5, 6, 7, 8]
     },
     {
       "epoch": 2,
@@ -109,8 +109,7 @@
       "threshold": 4,
       "fault_bound": 1,
       "members": [1, 2, 3, 4, 5, 6, 7],
-      "eligible_members": [1, 2, 3, 4, 5, 6, 7, 8],
-      "old_dealers": [1, 2, 3, 4, 5, 6, 7]
+      "eligible_members": [1, 2, 3, 4, 5, 6, 7, 8]
     },
     {
       "epoch": 3,
@@ -118,17 +117,15 @@
       "threshold": 4,
       "fault_bound": 1,
       "members": [1, 2, 3, 4, 5, 6, 7],
-      "eligible_members": [1, 2, 3, 4, 5, 6, 7, 8],
-      "old_dealers": [1, 2, 3, 4, 5, 6, 7]
+      "eligible_members": [1, 2, 3, 4, 5, 6, 7, 8]
     },
     {
       "epoch": 4,
       "operation": "reshare",
-      "threshold": 2,
+      "threshold": 3,
       "fault_bound": 1,
-      "members": [2, 4, 6, 7],
-      "eligible_members": [2, 4, 6, 7, 8],
-      "old_dealers": [1, 2, 3, 4, 5, 6, 7]
+      "members": [2, 3, 4, 6, 7],
+      "eligible_members": [2, 3, 4, 6, 7, 8]
     }
   ],
   "funding_blocks": 600,

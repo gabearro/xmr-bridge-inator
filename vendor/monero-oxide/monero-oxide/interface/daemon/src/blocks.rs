@@ -56,9 +56,9 @@ impl<T: HttpTransport> ProvidesUnvalidatedBlockchain for MoneroDaemon<T> {
     mut range: RangeInclusive<usize>,
   ) -> impl Send + Future<Output = Result<Vec<Block>, InterfaceError>> {
     const GENEROUS_TRANSACTIONS_PER_BLOCK_ESTIMATE: usize = 1000;
-    const BLOCK_SIZE_ESTIMATE: usize = BlockHeader::SIZE_UPPER_BOUND.0 +
-      <usize as VarInt>::UPPER_BOUND +
-      (GENEROUS_TRANSACTIONS_PER_BLOCK_ESTIMATE * 32);
+    const BLOCK_SIZE_ESTIMATE: usize = BlockHeader::SIZE_UPPER_BOUND.0
+      + <usize as VarInt>::UPPER_BOUND
+      + (GENEROUS_TRANSACTIONS_PER_BLOCK_ESTIMATE * 32);
     const BLOCK_JSON_SIZE_ESTIMATE: usize =
       JSON_BYTE_OVERHEAD_FACTOR_ESTIMATE * BLOCK_SIZE_ESTIMATE;
     const BLOCKS_PER_RESPONSE_ESTIMATE: usize =
@@ -98,7 +98,7 @@ impl<T: HttpTransport> ProvidesUnvalidatedBlockchain for MoneroDaemon<T> {
           request.push('[');
           request.push_str(&block_request(start));
 
-          for number in (start ..= end).skip(1) {
+          for number in (start..=end).skip(1) {
             let next_request = block_request(number);
             // If this would exceed the request's size target, stop this batch early
             if request.len().saturating_add(next_request.len()) >= REQUEST_SIZE_TARGET {
@@ -148,7 +148,7 @@ impl<T: HttpTransport> ProvidesUnvalidatedBlockchain for MoneroDaemon<T> {
           )))?;
         }
         json_blocks.sort_by_key(|result| result.id);
-        for (number, json) in (start ..= end).zip(&json_blocks) {
+        for (number, json) in (start..=end).zip(&json_blocks) {
           if json.id != Some(number) {
             Err(InterfaceError::InvalidInterface(format!(
               "request with ID {number} received response in complimentary position with ID {:?}",
@@ -167,7 +167,7 @@ impl<T: HttpTransport> ProvidesUnvalidatedBlockchain for MoneroDaemon<T> {
           // We've completed the request as an unrepresentable number is greater than the
           // representable end
           None => return Ok(res),
-        }) ..= *range.end();
+        })..=*range.end();
 
         // Update the amount to request
         {

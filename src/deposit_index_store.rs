@@ -26,7 +26,7 @@ use thiserror::Error;
 
 use crate::{
     committee::PartyId,
-    compact_epoch_registry::CompactEpochRegistry,
+    compact_epoch_registry::{CompactEpochRegistry, RegistryId},
     deposit_index::{
         DepositIndexBuilder, DepositIndexCommitStore, DepositIndexError, DepositIndexHead,
         DepositIndexNamespace, DepositIndexObjectId, DepositIndexReader, DepositIndexRecovery,
@@ -38,18 +38,43 @@ use crate::{
         missing_staged_verification_objects, next_local_safety_query_object,
         next_portable_query_object, next_portable_state_query_object,
     },
-    deposit_index_checkpoint::VerifiedDepositIndexCheckpoint,
+    deposit_index_checkpoint::{PortableDepositIndexHead, VerifiedDepositIndexCheckpoint},
+    deposit_index_retention::{
+        DepositIndexRetentionStore, ExportPinCertification, ExportPinReclaim, ImportProgress,
+        PortableReauthenticationAnchor, PortableReauthenticationProgress,
+        PreparedExportCandidatePin, ReauthenticatedPortableRoot, RetentionError,
+        SourcePinSemanticAuthority, StoredExportPin,
+    },
     deposit_ledger::{
         DepositObservationStatement, LedgerError,
         sign_deposit_observation_attestation_after_readback,
     },
+    deposit_state_export::{
+        VerifiedDepositPostHandoffExportCandidate, VerifiedDepositPostHandoffExportSeal,
+    },
+    deposit_state_import::{
+        VerifiedStateImportCandidateTransitionBinding, VerifiedStateImportedCertificate,
+    },
+    deposit_state_transfer_wire::{
+        DepositStateExportHeadRequest, DepositStateExportHeadResponse,
+        DepositStateExportObjectsRequest, DepositStateExportReleaseRequest,
+        DepositStateTransferWireError,
+    },
+    deposit_sync_stage::DepositSyncImportMarker,
+    deposit_sync_wire::{
+        DepositSyncAdvertisement, DepositSyncHeadRequest, DepositSyncHeadResponse,
+        DepositSyncWireError,
+    },
     deposit_wallet::{DepositSubaddressIndex, DepositWalletId},
     identity::{Identity, SignedEnvelope},
+    key_rotation::VerifiedRegistryHandoffTarget,
     storage::{
         DepositIndexJournalKey, DepositIndexJournalScope, MAX_DEPOSIT_INDEX_JOURNAL_BYTES,
         ProtocolStore, StoreError, WalletArtifactOwner, WalletArtifactStore, WalletId,
     },
 };
+
+pub use crate::deposit_index_retention::{SourcePinAcquire, SourcePinRelease, StoredSourcePin};
 
 const DEPOSIT_INDEX_STORE_CHECKPOINT_VERSION: u16 = 1;
 const DEPOSIT_INDEX_MUTATION_JOURNAL_VERSION: u16 = 1;
@@ -58,18 +83,18 @@ const MAX_INDEX_CACHE_OBJECTS: usize = MAX_DEPOSIT_INDEX_UPDATE_VERIFICATION_REA
 const MAX_INDEX_CACHE_BYTES: usize = 256 * 1024 * 1024;
 const MAX_CHECKPOINT_BYTES: usize = 4096;
 
-/// Non-serializable authority for importing one n-f-certified portable logical head.
+/// Non-serializable authority for adopting one n-f-certified portable logical head.
 ///
 /// The exact local `DepositIndexHead` is reconstructed from the verified certificate rather than
 /// accepted from sync bytes. The caller must still persist every semantically verified object
 /// reachable from this head before installing the returned store checkpoint in the wallet
 /// snapshot.
 #[derive(Clone, Debug)]
-pub struct VerifiedPortableIndexImport {
+pub struct VerifiedPortableIndexAdvance {
     head: DepositIndexHead,
 }
 
-impl VerifiedPortableIndexImport {
+impl VerifiedPortableIndexAdvance {
     /// Reconstruct the sole current-format local head certified by a verified quorum checkpoint.
     pub fn from_certified_checkpoint(
         checkpoint: &VerifiedDepositIndexCheckpoint,
@@ -142,28 +167,33 @@ impl DepositIndexStoreCheckpoint {
         Ok(checkpoint)
     }
 
-    /// Replace only the portable authority of an exact fresh party checkpoint.
+    /// Advance only the portable authority while preserving this party's exact local-safety head.
     ///
-    /// This is a fresh-replica import, not a general head setter. The base must be settled and
-    /// contain the canonical empty portable and party-local safety roots. Genesis needs no import:
-    /// callers must retain the existing fresh checkpoint after comparing its logical portable
-    /// head with the verified genesis advertisement.
-    pub fn import_verified_portable(
+    /// The caller must first authenticate the complete checkpoint-certificate archive and prove
+    /// that `import` extends this checkpoint's current archive position. This adapter enforces the
+    /// remaining local invariants: both heads are settled, the certified head is a strict logical
+    /// successor, and an observation-only successor cannot change the ledger decision.
+    pub fn adopt_verified_portable(
         &self,
-        import: &VerifiedPortableIndexImport,
+        import: &VerifiedPortableIndexAdvance,
     ) -> Result<Self, DepositIndexStoreError> {
         self.validate_shape()?;
-        let anchor =
-            self.portable.portable_anchor().ok_or(DepositIndexStoreError::InvalidPortableImport)?;
-        let expected_portable = DepositIndexHead::empty_portable(self.wallet, anchor.next_index())?;
-        let expected_local = DepositIndexHead::empty_local_safety(self.wallet, self.party)?;
+        let current =
+            crate::deposit_index_checkpoint::PortableDepositIndexHead::from_head(&self.portable)
+                .map_err(|_| DepositIndexStoreError::InvalidPortableImport)?;
+        let imported =
+            crate::deposit_index_checkpoint::PortableDepositIndexHead::from_head(&import.head)
+                .map_err(|_| DepositIndexStoreError::InvalidPortableImport)?;
         if !self.committed_journals.is_empty()
-            || self.portable != expected_portable
-            || self.local_safety != expected_local
             || import.head.namespace() != (DepositIndexNamespace::Portable { wallet: self.wallet })
             || import.head.revision() != 0
             || import.head.root().is_none()
-            || import.head.portable_anchor().is_none_or(|imported| imported.through_sequence() == 0)
+            || imported.through_sequence() == 0
+            || imported.through_sequence() < current.through_sequence()
+            || imported == current
+            || (imported.through_sequence() == current.through_sequence()
+                && (imported.ledger_head() != current.ledger_head()
+                    || imported.next_index() != current.next_index()))
         {
             return Err(DepositIndexStoreError::InvalidPortableImport);
         }
@@ -315,6 +345,78 @@ pub struct PreparedDepositIndexSnapshot {
     journals: BTreeMap<DepositIndexJournalScope, PreparedJournal>,
 }
 
+/// Marker-bound, disk-backed portable-retention import.
+///
+/// The caller creates this only after the wallet snapshot CAS has durably installed its exact
+/// import marker. Object pages remain owner-reserved in the sync spool until [`Self::finish`]
+/// publishes the named root and removes all temporary import records.
+pub struct PreparedPortableRetentionImport {
+    retention: DepositIndexRetentionStore,
+    target_root: DepositIndexObjectId,
+    progress: ImportProgress,
+}
+
+impl std::fmt::Debug for PreparedPortableRetentionImport {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PreparedPortableRetentionImport")
+            .field("target_root", &self.target_root)
+            .field("progress", &self.progress)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PreparedPortableRetentionImport {
+    #[must_use]
+    pub const fn needs_objects(&self) -> bool {
+        matches!(self.progress, ImportProgress::Staging)
+    }
+
+    /// Persist one independently bounded descriptor batch. Exact objects already staged before a
+    /// crash are authenticated and reused.
+    pub async fn stage_objects(
+        &mut self,
+        objects: Vec<(DepositIndexObjectId, Vec<u8>)>,
+    ) -> Result<(), DepositIndexStoreError> {
+        if !self.needs_objects() {
+            return Err(DepositIndexStoreError::TransitionInProgress);
+        }
+        self.retention.stage_import_batch(objects).await?;
+        Ok(())
+    }
+
+    /// Declare that the immutable spool enumeration is complete. Missing children and unreachable
+    /// supplied objects fail during the subsequent bounded traversal.
+    pub async fn seal(&mut self) -> Result<(), DepositIndexStoreError> {
+        if self.needs_objects() {
+            self.retention.seal_import().await?;
+            self.progress = ImportProgress::InProgress;
+        }
+        Ok(())
+    }
+
+    /// Finish bounded traversal, graph registration, atomic named-root publication, temporary
+    /// cleanup, and recursive artifact GC. The sync import marker and ownership reservations must
+    /// remain durable until this returns.
+    pub async fn finish(
+        mut self,
+        artifacts: &WalletArtifactStore,
+    ) -> Result<(), DepositIndexStoreError> {
+        self.seal().await?;
+        loop {
+            self.progress = self.retention.advance_import().await?;
+            if self.progress == ImportProgress::Complete {
+                break;
+            }
+        }
+        self.retention.drain_gc(artifacts).await?;
+        if self.retention.current_root() != Some(self.target_root) {
+            return Err(DepositIndexStoreError::CheckpointConflict);
+        }
+        Ok(())
+    }
+}
+
 impl PreparedDepositIndexSnapshot {
     #[must_use]
     pub const fn checkpoint(&self) -> &DepositIndexStoreCheckpoint {
@@ -350,8 +452,214 @@ pub struct DepositIndexStore {
     cache_bytes: usize,
     active_pins: BTreeSet<DepositIndexObjectId>,
     pending_removals: BTreeSet<DepositIndexObjectId>,
+    retention: DepositIndexRetentionStore,
+    cleanup_scope: Option<DepositIndexJournalScope>,
     prepared_digest: Option<[u8; 32]>,
     artifact_loads: u64,
+}
+
+/// Exact projection extracted from one already-verified predecessor export candidate.
+///
+/// Keeping this projection separate makes the remote-vote gate's equality boundary explicit:
+/// source-specific statement material and witness-independent portable semantics are both required
+/// to match. It is private and can only be populated from a verified candidate in production.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct RemoteExportSealCandidateBinding {
+    wallet: DepositWalletId,
+    source_registry: RegistryId,
+    source_party: PartyId,
+    semantic_transition: [u8; 32],
+    transition_binding: [u8; 32],
+    vote_slot: [u8; 32],
+    statement: [u8; 32],
+    advertisement: [u8; 32],
+    export_binding: [u8; 32],
+    portable_root: DepositIndexObjectId,
+    portable_head: [u8; 32],
+}
+
+impl RemoteExportSealCandidateBinding {
+    fn from_verified_candidate(
+        candidate: &VerifiedDepositPostHandoffExportCandidate,
+    ) -> Result<Self, DepositIndexStoreError> {
+        let statement = candidate.statement();
+        let export = statement.final_export();
+        let transition =
+            VerifiedStateImportCandidateTransitionBinding::from_verified_export_candidate(
+                candidate,
+            )
+            .map_err(|_| DepositIndexStoreError::InvalidRemoteExportVote)?;
+        Ok(Self {
+            wallet: transition.wallet(),
+            source_registry: statement.source(),
+            source_party: statement.source_party(),
+            semantic_transition: statement.semantic_transition_digest(),
+            transition_binding: transition.transition_binding(),
+            vote_slot: statement.vote_slot_digest(),
+            statement: statement.digest(),
+            advertisement: export.advertisement_digest(),
+            export_binding: export
+                .digest()
+                .map_err(|_| DepositIndexStoreError::InvalidRemoteExportVote)?,
+            portable_root: export
+                .resulting_portable_head()
+                .root()
+                .ok_or(DepositIndexStoreError::InvalidRemoteExportVote)?,
+            portable_head: export.resulting_portable_head().digest(),
+        })
+    }
+}
+
+/// Non-serializable authority for one remote predecessor member's first export-seal vote.
+///
+/// It is minted only from a settled wallet checkpoint plus a completed process-local full-DAG
+/// reauthentication. The serving source cannot use this path; its own vote remains gated by the
+/// durable global export pin.
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) struct VerifiedRemoteExportSealVoteGate {
+    wallet: DepositWalletId,
+    local_voter: PartyId,
+    source_registry: RegistryId,
+    source_party: PartyId,
+    semantic_transition: [u8; 32],
+    transition_binding: [u8; 32],
+    vote_slot: [u8; 32],
+    statement: [u8; 32],
+    advertisement: [u8; 32],
+    export_binding: [u8; 32],
+    local_checkpoint: [u8; 32],
+    portable_root: DepositIndexObjectId,
+    portable_head: [u8; 32],
+    authenticated_objects: u64,
+}
+
+impl VerifiedRemoteExportSealVoteGate {
+    fn from_verified_binding(
+        binding: &RemoteExportSealCandidateBinding,
+        local_voter: PartyId,
+        local_checkpoint: [u8; 32],
+        authenticated_objects: u64,
+    ) -> Result<Self, DepositIndexStoreError> {
+        let gate = Self {
+            wallet: binding.wallet,
+            local_voter,
+            source_registry: binding.source_registry,
+            source_party: binding.source_party,
+            semantic_transition: binding.semantic_transition,
+            transition_binding: binding.transition_binding,
+            vote_slot: binding.vote_slot,
+            statement: binding.statement,
+            advertisement: binding.advertisement,
+            export_binding: binding.export_binding,
+            local_checkpoint,
+            portable_root: binding.portable_root,
+            portable_head: binding.portable_head,
+            authenticated_objects,
+        };
+        gate.authorize_binding(binding, local_voter)?;
+        Ok(gate)
+    }
+
+    pub(crate) fn authorize(
+        &self,
+        candidate: &VerifiedDepositPostHandoffExportCandidate,
+        local_voter: PartyId,
+    ) -> Result<(), DepositIndexStoreError> {
+        let binding = RemoteExportSealCandidateBinding::from_verified_candidate(candidate)?;
+        self.authorize_binding(&binding, local_voter)
+    }
+
+    fn authorize_binding(
+        &self,
+        binding: &RemoteExportSealCandidateBinding,
+        local_voter: PartyId,
+    ) -> Result<(), DepositIndexStoreError> {
+        if local_voter != self.local_voter
+            || self.local_voter == self.source_party
+            || binding.wallet != self.wallet
+            || binding.source_registry.wallet() != self.wallet
+            || binding.source_registry != self.source_registry
+            || binding.source_party != self.source_party
+            || binding.semantic_transition != self.semantic_transition
+            || binding.transition_binding != self.transition_binding
+            || binding.vote_slot != self.vote_slot
+            || binding.statement != self.statement
+            || binding.advertisement != self.advertisement
+            || binding.export_binding != self.export_binding
+            || binding.portable_root != self.portable_root
+            || binding.portable_head != self.portable_head
+            || self.local_checkpoint == [0; 32]
+            || self.authenticated_objects == 0
+        {
+            return Err(DepositIndexStoreError::InvalidRemoteExportVote);
+        }
+        Ok(())
+    }
+
+    #[must_use]
+    pub(crate) const fn local_voter(&self) -> PartyId {
+        self.local_voter
+    }
+
+    #[must_use]
+    pub(crate) const fn source_registry(&self) -> RegistryId {
+        self.source_registry
+    }
+
+    #[must_use]
+    pub(crate) const fn source_party(&self) -> PartyId {
+        self.source_party
+    }
+
+    #[must_use]
+    pub(crate) const fn semantic_transition_digest(&self) -> [u8; 32] {
+        self.semantic_transition
+    }
+
+    #[must_use]
+    pub(crate) const fn transition_binding(&self) -> [u8; 32] {
+        self.transition_binding
+    }
+
+    #[must_use]
+    pub(crate) const fn vote_slot_digest(&self) -> [u8; 32] {
+        self.vote_slot
+    }
+
+    #[must_use]
+    pub(crate) const fn statement_digest(&self) -> [u8; 32] {
+        self.statement
+    }
+
+    #[must_use]
+    pub(crate) const fn advertisement_digest(&self) -> [u8; 32] {
+        self.advertisement
+    }
+
+    #[must_use]
+    pub(crate) const fn export_binding_digest(&self) -> [u8; 32] {
+        self.export_binding
+    }
+
+    #[must_use]
+    pub(crate) const fn local_checkpoint_digest(&self) -> [u8; 32] {
+        self.local_checkpoint
+    }
+
+    #[must_use]
+    pub(crate) const fn portable_root(&self) -> DepositIndexObjectId {
+        self.portable_root
+    }
+
+    #[must_use]
+    pub(crate) const fn portable_head_digest(&self) -> [u8; 32] {
+        self.portable_head
+    }
+
+    #[must_use]
+    pub(crate) const fn authenticated_object_count(&self) -> u64 {
+        self.authenticated_objects
+    }
 }
 
 /// Private-constructor proof that one exact checkpoint signing slot is present under the
@@ -437,6 +745,16 @@ impl DepositIndexStore {
         checkpoint: DepositIndexStoreCheckpoint,
     ) -> Result<Self, DepositIndexStoreError> {
         checkpoint.validate_shape()?;
+        let allow_committed_transition =
+            checkpoint.committed_journals.contains_key(&DepositIndexJournalScope::Portable);
+        let retention = DepositIndexRetentionStore::open(
+            &artifacts,
+            checkpoint.wallet,
+            checkpoint.party,
+            checkpoint.portable.root(),
+            allow_committed_transition,
+        )
+        .await?;
         let mut store = Self {
             protocol,
             artifacts,
@@ -449,10 +767,13 @@ impl DepositIndexStore {
             cache_bytes: 0,
             active_pins: BTreeSet::new(),
             pending_removals: BTreeSet::new(),
+            retention,
+            cleanup_scope: None,
             prepared_digest: None,
             artifact_loads: 0,
         };
         store.recover_startup().await?;
+        store.retention.drain_gc(&store.artifacts).await?;
         Ok(store)
     }
 
@@ -489,6 +810,541 @@ impl DepositIndexStore {
         &self.checkpoint.local_safety
     }
 
+    /// Repair the portable lifetime graph after an authenticated compact-sync snapshot CAS.
+    ///
+    /// This is deliberately separate from [`Self::open_with_stores`]: ordinary open rejects a
+    /// nonempty checkpoint whose durable current root differs. The caller must retain its exact
+    /// marker and reconstruct `advance` from the fully verified checkpoint archive before invoking
+    /// this seam. The returned handle accepts the complete reachable target graph (or the new
+    /// suffix ending at objects already present in the retained graph). The marker may be cleared
+    /// only after [`PreparedPortableRetentionImport::finish`] succeeds.
+    pub(crate) async fn begin_marker_authorized_portable_retention_import(
+        artifacts: &WalletArtifactStore,
+        target: &DepositIndexStoreCheckpoint,
+        advance: &VerifiedPortableIndexAdvance,
+        marker: &DepositSyncImportMarker,
+        maximum_plaintext_bytes: u64,
+    ) -> Result<PreparedPortableRetentionImport, DepositIndexStoreError> {
+        target.validate_shape()?;
+        marker
+            .validate_for(target.wallet)
+            .map_err(|_| DepositIndexStoreError::InvalidPortableImport)?;
+        let import_marker_digest =
+            marker.digest().map_err(|_| DepositIndexStoreError::InvalidPortableImport)?;
+        if target.has_recovery_journal()
+            || target.portable != advance.head
+            || target.portable.root().is_none()
+            || maximum_plaintext_bytes == 0
+        {
+            return Err(DepositIndexStoreError::InvalidPortableImport);
+        }
+        let root = target.portable.root().ok_or(DepositIndexStoreError::InvalidPortableImport)?;
+        let maximum_objects =
+            crate::deposit_index_checkpoint::PortableDepositIndexHead::from_head(&target.portable)
+                .map_err(|_| DepositIndexStoreError::InvalidPortableImport)?
+                .maximum_reachable_objects()
+                .map_err(|_| DepositIndexStoreError::InvalidPortableImport)?;
+        let (retention, progress) = DepositIndexRetentionStore::open_for_import(
+            artifacts,
+            target.wallet,
+            target.party,
+            import_marker_digest,
+            root,
+            maximum_objects,
+            maximum_plaintext_bytes,
+        )
+        .await?;
+        Ok(PreparedPortableRetentionImport { retention, target_root: root, progress })
+    }
+
+    /// Durably pin the exact current portable root before returning a sync head response.
+    ///
+    /// A retry for the same requester/context/lease returns the byte-identical stored response,
+    /// even when the current head advanced in the meantime. A different lease cannot replace an
+    /// active slot until the requester releases it.
+    pub async fn acquire_source_pin(
+        &mut self,
+        active: &VerifiedRegistryHandoffTarget,
+        request: DepositSyncHeadRequest,
+        response: &DepositSyncHeadResponse,
+    ) -> Result<SourcePinAcquire, DepositIndexStoreError> {
+        self.require_settled_retention()?;
+        let lease = response.lease();
+        let root = response
+            .advertisement()
+            .portable_index()
+            .root()
+            .ok_or(DepositIndexStoreError::InvalidSourcePinResponse)?;
+        if request.context() != response.advertisement().context()
+            || request.context() != lease.context()
+            || request.source() != self.checkpoint.party
+            || request.source() != lease.source()
+            || request.requester() != lease.requester()
+            || response.advertisement().portable_index()
+                != &crate::deposit_index_checkpoint::PortableDepositIndexHead::from_head(
+                    &self.checkpoint.portable,
+                )
+                .map_err(|_| DepositIndexStoreError::InvalidSourcePinResponse)?
+            || self.retention.current_root() != Some(root)
+        {
+            return Err(DepositIndexStoreError::InvalidSourcePinResponse);
+        }
+        let opaque_response = response.to_bytes(request)?;
+        Ok(self
+            .retention
+            .acquire_source_pin(
+                active,
+                SourcePinSemanticAuthority::ordinary(response.advertisement().digest()),
+                request.requester(),
+                request.context().digest(),
+                lease.digest(),
+                root,
+                opaque_response,
+            )
+            .await?)
+    }
+
+    /// Look up only one exact active source lease. A different context or lease in the requester's
+    /// slot is a conflict, not a cache miss.
+    pub async fn active_source_pin(
+        &self,
+        source: PartyId,
+        requester: PartyId,
+        context_digest: [u8; 32],
+        lease_digest: [u8; 32],
+    ) -> Result<Option<StoredSourcePin>, DepositIndexStoreError> {
+        self.require_settled_retention()?;
+        Ok(self
+            .retention
+            .active_source_pin(source, requester, context_digest, lease_digest)
+            .await?)
+    }
+
+    /// Replay a requester's active slot before constructing a response from the moving current
+    /// head. The stored canonical response is re-decoded against this exact request so corrupted
+    /// or wrongly bound bytes fail closed.
+    pub async fn source_pin_for_head_request(
+        &self,
+        request: DepositSyncHeadRequest,
+    ) -> Result<Option<StoredSourcePin>, DepositIndexStoreError> {
+        self.require_settled_retention()?;
+        if request.source() != self.checkpoint.party {
+            return Err(DepositIndexStoreError::InvalidSourcePinResponse);
+        }
+        let Some(pin) = self
+            .retention
+            .source_pin_for_head(request.source(), request.requester(), request.context().digest())
+            .await?
+        else {
+            return Ok(None);
+        };
+        let response = DepositSyncHeadResponse::from_bytes(request, pin.response())?;
+        if response.lease().digest() != pin.lease_digest()
+            || response.lease().source() != pin.source()
+            || response.lease().requester() != pin.requester()
+            || response.advertisement().portable_index().root() != Some(pin.root())
+        {
+            return Err(DepositIndexStoreError::InvalidSourcePinResponse);
+        }
+        Ok(Some(pin))
+    }
+
+    /// Replay one exact certified-export head response from its durable requester slot.
+    ///
+    /// The stored bytes are decoded against this exact request and every lease/root binding is
+    /// compared with the authenticated retention record. A released slot returns `None`; the
+    /// independently retained global export is not sufficient to replay a requester lease.
+    pub(crate) async fn source_pin_for_export_head_request(
+        &self,
+        request: DepositStateExportHeadRequest,
+    ) -> Result<Option<StoredSourcePin>, DepositIndexStoreError> {
+        self.require_settled_retention()?;
+        if request.source() != self.checkpoint.party
+            || request.context().wallet() != self.checkpoint.wallet
+        {
+            return Err(DepositIndexStoreError::InvalidSourcePinResponse);
+        }
+        let Some(pin) = self
+            .retention
+            .source_pin_for_head(request.source(), request.requester(), request.context().digest())
+            .await?
+        else {
+            return Ok(None);
+        };
+        self.validate_export_head_source_pin(request, &pin, None)?;
+        Ok(Some(pin))
+    }
+
+    /// Require the exact still-active requester lease before serving certified-export objects.
+    ///
+    /// QUIC authentication and lease/capability MAC verification happen before this storage
+    /// boundary. This additional durable lookup prevents a previously valid but released lease
+    /// from reading even while the independent global export root remains retained.
+    pub(crate) async fn active_source_pin_for_export_objects_request(
+        &self,
+        request: &DepositStateExportObjectsRequest,
+    ) -> Result<Option<StoredSourcePin>, DepositIndexStoreError> {
+        self.require_settled_retention()?;
+        request.validate()?;
+        let lease = request.lease();
+        if request.source() != self.checkpoint.party
+            || request.context().wallet() != self.checkpoint.wallet
+        {
+            return Err(DepositIndexStoreError::InvalidSourcePinResponse);
+        }
+        let head_request = DepositStateExportHeadRequest::new(
+            lease.context(),
+            lease.semantic_transition_digest(),
+            lease.source(),
+            lease.requester(),
+            lease.request_nonce(),
+        )?;
+        if head_request.digest() != lease.head_request_digest() {
+            return Err(DepositIndexStoreError::InvalidSourcePinResponse);
+        }
+        let Some(pin) = self
+            .retention
+            .active_source_pin(
+                lease.source(),
+                lease.requester(),
+                lease.context().digest(),
+                lease.digest(),
+            )
+            .await?
+        else {
+            return Ok(None);
+        };
+        self.validate_export_head_source_pin(head_request, &pin, Some(lease))?;
+        Ok(Some(pin))
+    }
+
+    fn validate_export_head_source_pin(
+        &self,
+        request: DepositStateExportHeadRequest,
+        pin: &StoredSourcePin,
+        expected_lease: Option<crate::deposit_state_transfer_wire::DepositStateExportLease>,
+    ) -> Result<(), DepositIndexStoreError> {
+        let response = DepositStateExportHeadResponse::from_bytes(request, pin.response())?;
+        let lease = response.lease();
+        if pin.wallet() != self.checkpoint.wallet
+            || pin.source() != request.source()
+            || pin.requester() != request.requester()
+            || pin.context_digest() != request.context().digest()
+            || pin.lease_digest() != lease.digest()
+            || pin.root()
+                != lease.portable_root().ok_or(DepositIndexStoreError::InvalidSourcePinResponse)?
+            || response.request_digest() != request.digest()
+            || response.source() != request.source()
+            || response.requester() != request.requester()
+            || response.semantic_transition_digest() != request.semantic_transition_digest()
+            || response.advertisement().portable_index().root() != Some(pin.root())
+            || expected_lease.is_some_and(|expected| expected != lease)
+        {
+            return Err(DepositIndexStoreError::InvalidSourcePinResponse);
+        }
+        Ok(())
+    }
+
+    /// Durably release one exact requester slot. Exact retries and an already absent slot return
+    /// `AlreadyReleased`; a different active lease in that slot fails closed. Artifact GC is
+    /// deliberately deferred to [`Self::progress_retention_gc_batch`] so the typed acknowledgement
+    /// follows the exact lease-removal commit without filesystem work.
+    pub async fn release_source_pin(
+        &mut self,
+        source: PartyId,
+        requester: PartyId,
+        context_digest: [u8; 32],
+        lease_digest: [u8; 32],
+    ) -> Result<SourcePinRelease, DepositIndexStoreError> {
+        self.require_settled_retention()?;
+        Ok(self
+            .retention
+            .release_source_pin(source, requester, context_digest, lease_digest)
+            .await?)
+    }
+
+    /// Storage-only late release path. It neither opens a wallet snapshot nor contacts Monero and
+    /// therefore remains available during initialization failure, imported-snapshot recovery, and
+    /// after this source leaves the active committee. Missing retention state fails closed; an
+    /// already absent requester slot is an idempotent success.
+    pub async fn release_source_pin_from_storage(
+        artifacts: &WalletArtifactStore,
+        wallet: DepositWalletId,
+        source: PartyId,
+        requester: PartyId,
+        context_digest: [u8; 32],
+        lease_digest: [u8; 32],
+    ) -> Result<SourcePinRelease, DepositIndexStoreError> {
+        let mut retention =
+            DepositIndexRetentionStore::open_existing_for_release(artifacts, wallet, source)
+                .await?;
+        Ok(retention.release_source_pin(source, requester, context_digest, lease_digest).await?)
+    }
+
+    /// Advance source-side portable-index garbage collection by one bounded batch.
+    ///
+    /// Returns `true` while durable work remains. The node pacemaker should call this once per
+    /// turn until it returns `false`; imports may temporarily keep work pending.
+    pub async fn progress_retention_gc_batch(&mut self) -> Result<bool, DepositIndexStoreError> {
+        self.require_settled_retention()?;
+        Ok(self.retention.progress_gc_batch(&self.artifacts).await?)
+    }
+
+    /// Cold storage-only certified-export release. The same bytes are MAC-authenticated before
+    /// their exact lease/context digests are allowed to select a requester slot.
+    pub(crate) async fn release_export_head_pin_from_storage(
+        artifacts: &WalletArtifactStore,
+        authenticated_source: PartyId,
+        authenticated_requester: PartyId,
+        export_lease_mac_key: &[u8; 32],
+        bytes: &[u8],
+    ) -> Result<SourcePinRelease, DepositIndexStoreError> {
+        let request = DepositStateExportReleaseRequest::from_bytes(
+            authenticated_source,
+            authenticated_requester,
+            export_lease_mac_key,
+            bytes,
+        )?;
+        let lease = request.lease();
+        Self::release_source_pin_from_storage(
+            artifacts,
+            lease.context().wallet(),
+            lease.source(),
+            lease.requester(),
+            lease.context().digest(),
+            lease.digest(),
+        )
+        .await
+    }
+
+    /// Advance authenticated committee authorization without inferring requester release.
+    ///
+    /// Requester leases survive every handoff and are removed only by their exact signed release.
+    pub async fn reclaim_source_pins_after_handoff(
+        &mut self,
+        active: &VerifiedRegistryHandoffTarget,
+    ) -> Result<usize, DepositIndexStoreError> {
+        self.require_settled_retention()?;
+        Ok(self.retention.reclaim_after_handoff(active).await?)
+    }
+
+    /// Bind a remote predecessor's first seal vote to this party's exact settled, fully
+    /// reauthenticated current portable state.
+    pub(crate) fn verify_remote_export_seal_vote_gate(
+        &self,
+        candidate: &VerifiedDepositPostHandoffExportCandidate,
+        reauthenticated: &ReauthenticatedPortableRoot,
+    ) -> Result<VerifiedRemoteExportSealVoteGate, DepositIndexStoreError> {
+        self.require_settled_retention()?;
+        let binding = RemoteExportSealCandidateBinding::from_verified_candidate(candidate)?;
+        let export = candidate.statement().final_export();
+        let logical = PortableDepositIndexHead::from_head(&self.checkpoint.portable)
+            .map_err(|_| DepositIndexStoreError::InvalidRemoteExportVote)?;
+        let root = logical.root().ok_or(DepositIndexStoreError::InvalidRemoteExportVote)?;
+        if self.checkpoint.party == binding.source_party
+            || binding.wallet != self.checkpoint.wallet
+            || binding.source_registry.wallet() != self.checkpoint.wallet
+            || export.resulting_portable_head() != &logical
+            || binding.portable_root != root
+            || binding.portable_head != logical.digest()
+            || self.retention.current_root() != Some(root)
+            || !self.retention.authorizes_completed_reauthentication(
+                reauthenticated,
+                PortableReauthenticationAnchor::Current,
+                &logical,
+            )
+        {
+            return Err(DepositIndexStoreError::InvalidRemoteExportVote);
+        }
+        VerifiedRemoteExportSealVoteGate::from_verified_binding(
+            &binding,
+            self.checkpoint.party,
+            self.checkpoint.digest(),
+            reauthenticated.object_count(),
+        )
+    }
+
+    /// Commit the exact export candidate and its independent global root reference before the
+    /// caller is allowed to produce a local seal signature.
+    pub(crate) async fn prepare_export_candidate_pin(
+        &mut self,
+        candidate: &VerifiedDepositPostHandoffExportCandidate,
+        advertisement: &DepositSyncAdvertisement,
+    ) -> Result<PreparedExportCandidatePin, DepositIndexStoreError> {
+        self.require_settled_retention()?;
+        Ok(self.retention.prepare_export_candidate_pin(candidate, advertisement).await?)
+    }
+
+    /// Attach the exact canonical quorum certificate only to its already committed candidate.
+    pub(crate) async fn certify_export_pin(
+        &mut self,
+        seal: &VerifiedDepositPostHandoffExportSeal,
+    ) -> Result<ExportPinCertification, DepositIndexStoreError> {
+        self.require_settled_retention()?;
+        Ok(self.retention.certify_export_pin(seal).await?)
+    }
+
+    /// Reauthenticate one exact certified source export after restart.
+    pub(crate) async fn active_export_pin(
+        &self,
+        seal: &VerifiedDepositPostHandoffExportSeal,
+    ) -> Result<Option<StoredExportPin>, DepositIndexStoreError> {
+        self.require_settled_retention()?;
+        Ok(self.retention.active_export_pin(seal).await?)
+    }
+
+    /// Read the sole certified local export for one semantic transition.
+    pub(crate) async fn certified_export_pin_for_transition(
+        &self,
+        semantic_transition: [u8; 32],
+    ) -> Result<Option<StoredExportPin>, DepositIndexStoreError> {
+        self.require_settled_retention()?;
+        Ok(self.retention.certified_export_pin_for_transition(semantic_transition).await?)
+    }
+
+    /// Validate and atomically retain a canonical typed ExportHead response before it can escape
+    /// to QUIC. Every wire binding is compared with the exact certified global export readback.
+    pub(crate) async fn acquire_export_head_response_pin(
+        &mut self,
+        active: &VerifiedRegistryHandoffTarget,
+        request: DepositStateExportHeadRequest,
+        response: &DepositStateExportHeadResponse,
+        export: &StoredExportPin,
+    ) -> Result<SourcePinAcquire, DepositIndexStoreError> {
+        self.require_settled_retention()?;
+        let lease = response.lease();
+        let advertisement = response.advertisement().to_bytes()?;
+        let certificate = response
+            .certificate()
+            .to_bytes()
+            .map_err(|_| DepositIndexStoreError::InvalidSourcePinResponse)?;
+        let response_bytes = response.to_bytes(request)?;
+        if request.source() != self.checkpoint.party
+            || request.source() != export.source()
+            || request.requester() != lease.requester()
+            || request.semantic_transition_digest() != export.semantic_transition_digest()
+            || response.semantic_transition_digest() != export.semantic_transition_digest()
+            || lease.source() != export.source()
+            || lease.semantic_transition_digest() != export.semantic_transition_digest()
+            || lease.transition_binding() != export.transition_binding()
+            || lease.seal_statement_digest() != export.seal_statement_digest()
+            || Some(lease.seal_certificate_digest()) != export.seal_certificate_digest()
+            || lease.advertisement_digest() != export.advertisement_digest()
+            || lease.portable_root() != Some(export.root())
+            || lease.portable_head_digest() != response.advertisement().portable_index().digest()
+            || advertisement.as_slice() != export.advertisement_bytes()
+            || export.seal_certificate_bytes() != Some(certificate.as_slice())
+        {
+            return Err(DepositIndexStoreError::InvalidSourcePinResponse);
+        }
+        Ok(self
+            .retention
+            .acquire_certified_export_head_pin(
+                active,
+                request.requester(),
+                request.context().digest(),
+                lease.digest(),
+                export,
+                response_bytes,
+            )
+            .await?)
+    }
+
+    /// Reclaim all exact source variants for the transition only after the target's verified
+    /// StateImported certificate, then cooperatively drain newly unreachable objects.
+    pub(crate) async fn reclaim_export_roots(
+        &mut self,
+        certificate: &VerifiedStateImportedCertificate,
+    ) -> Result<ExportPinReclaim, DepositIndexStoreError> {
+        self.require_settled_retention()?;
+        let result = self.retention.reclaim_export_roots(certificate).await?;
+        self.retention.drain_gc(&self.artifacts).await?;
+        Ok(result)
+    }
+
+    /// Prove that an exact export reclaim was already committed without mutating retention state.
+    ///
+    /// Historical source-only certificate retries use this path after the active wallet epoch has
+    /// advanced. It deliberately performs no garbage-collection drain and cannot create a missing
+    /// tombstone.
+    pub(crate) async fn require_export_reclaim_tombstone(
+        &self,
+        certificate: &VerifiedStateImportedCertificate,
+    ) -> Result<(), DepositIndexStoreError> {
+        self.require_settled_retention()?;
+        Ok(self.retention.require_export_reclaim_tombstone(certificate).await?)
+    }
+
+    /// Begin or resume a bounded full reauthentication of the settled current portable DAG.
+    ///
+    /// The logical head is derived from the wallet-snapshot checkpoint rather than accepted from
+    /// the network. Completion returns a process-local token which cannot survive a restart.
+    pub(crate) async fn begin_current_portable_reauthentication(
+        &mut self,
+    ) -> Result<PortableReauthenticationProgress, DepositIndexStoreError> {
+        self.require_settled_retention()?;
+        let head = PortableDepositIndexHead::from_head(&self.checkpoint.portable)
+            .map_err(|_| DepositIndexStoreError::InvalidCheckpoint)?;
+        Ok(self
+            .retention
+            .begin_portable_reauthentication(PortableReauthenticationAnchor::Current, &head)
+            .await?)
+    }
+
+    /// Begin or resume a bounded full reauthentication of an exact certified export DAG.
+    ///
+    /// The retention store re-decodes the canonical advertisement already held by the global
+    /// export pin, so a caller cannot pair the pin with a substituted logical head.
+    pub(crate) async fn begin_export_portable_reauthentication(
+        &mut self,
+        export: &StoredExportPin,
+    ) -> Result<PortableReauthenticationProgress, DepositIndexStoreError> {
+        self.require_settled_retention()?;
+        Ok(self.retention.begin_export_portable_reauthentication(export).await?)
+    }
+
+    /// Perform one bounded traversal/read/verification turn for the active permanent-DAG audit.
+    pub(crate) async fn advance_portable_reauthentication(
+        &mut self,
+    ) -> Result<PortableReauthenticationProgress, DepositIndexStoreError> {
+        self.require_settled_retention()?;
+        Ok(self.retention.advance_portable_reauthentication(&self.artifacts).await?)
+    }
+
+    /// Consume a completed process-local audit token and start bounded durable scratch cleanup.
+    pub(crate) async fn release_portable_reauthentication(
+        &mut self,
+        completed: &ReauthenticatedPortableRoot,
+    ) -> Result<PortableReauthenticationProgress, DepositIndexStoreError> {
+        self.require_settled_retention()?;
+        Ok(self.retention.release_portable_reauthentication(completed).await?)
+    }
+
+    /// Release an owned completed audit and drain its bounded scratch cleanup before writing.
+    pub(crate) async fn finish_portable_reauthentication(
+        &mut self,
+        completed: &ReauthenticatedPortableRoot,
+    ) -> Result<(), DepositIndexStoreError> {
+        let budget = completed
+            .object_count()
+            .checked_mul(4)
+            .and_then(|turns| turns.checked_add(8))
+            .ok_or(RetentionError::CountOverflow)?;
+        let mut progress = self.release_portable_reauthentication(completed).await?;
+        for _ in 0..budget {
+            match progress {
+                PortableReauthenticationProgress::Idle => return Ok(()),
+                PortableReauthenticationProgress::InProgress => {
+                    progress = self.advance_portable_reauthentication().await?;
+                }
+                PortableReauthenticationProgress::Complete(_) => {
+                    return Err(RetentionError::InvalidDurableState.into());
+                }
+            }
+        }
+        Err(RetentionError::InvalidDurableState.into())
+    }
+
     #[must_use]
     pub const fn artifact_load_count(&self) -> u64 {
         self.artifact_loads
@@ -497,6 +1353,7 @@ impl DepositIndexStore {
     /// Discard query working data while retaining at most the two authenticated roots.
     pub fn reset_bounded_cache(&mut self) -> Result<(), DepositIndexStoreError> {
         if self.prepared_digest.is_some() {
+            tracing::debug!("deposit index cache reset waits for a prepared snapshot");
             return Err(DepositIndexStoreError::TransitionInProgress);
         }
         let roots = self.heads.values().filter_map(DepositIndexHead::root).collect::<BTreeSet<_>>();
@@ -557,6 +1414,18 @@ impl DepositIndexStore {
             return Err(DepositIndexStoreError::ReadBoundExceeded);
         }
         Ok(())
+    }
+
+    /// Load one exact object requested by a deterministic synchronous transition replay.
+    ///
+    /// The identifier is discovered only while walking the already-authenticated current head or
+    /// an update deterministically derived from it. Content addressing and wallet binding are
+    /// rechecked by `load_exact_artifact`; peer-supplied object bytes never enter this path.
+    pub(crate) async fn preload_referenced_object(
+        &mut self,
+        id: DepositIndexObjectId,
+    ) -> Result<(), DepositIndexStoreError> {
+        self.load_exact_artifact(id).await
     }
 
     /// Authenticated direct portable lookup with no allocation enumeration.
@@ -706,7 +1575,20 @@ impl DepositIndexStore {
         if self.prepared_digest.is_some()
             || updates.is_empty()
             || updates.len() > MAX_INDEX_NAMESPACES
+            || (self.retention.has_reauthentication()
+                && updates.iter().any(|update| {
+                    matches!(
+                        update.expected_head().namespace(),
+                        DepositIndexNamespace::Portable { .. }
+                    )
+                }))
         {
+            tracing::debug!(
+                prepared = self.prepared_digest.is_some(),
+                updates = updates.len(),
+                reauthentication = self.retention.has_reauthentication(),
+                "deposit index snapshot preparation waits for an existing transition"
+            );
             return Err(DepositIndexStoreError::TransitionInProgress);
         }
         let base_checkpoint_digest = self.checkpoint.digest();
@@ -805,21 +1687,29 @@ impl DepositIndexStore {
             return Err(DepositIndexStoreError::CheckpointConflict);
         }
         authenticated_checkpoint.validate_successor(&self.checkpoint.clone().settled())?;
+        for (scope, journal) in &prepared.journals {
+            if *scope == DepositIndexJournalScope::Portable {
+                self.apply_portable_retention(journal.staged.update()).await?;
+            }
+        }
         self.install_heads(authenticated_checkpoint);
         self.active_pins = prepared
             .journals
             .values()
             .flat_map(|journal| journal.staged.update().staged_objects().map(|(id, _)| id))
             .collect();
-        for journal in prepared.journals.values() {
+        for (scope, journal) in &prepared.journals {
             self.preload_staged(&journal.staged, true).await?;
-            if journal.staged.recover(self)? != DepositIndexRecovery::Committed {
+            if self.recover_staged(*scope, &journal.staged)? != DepositIndexRecovery::Committed {
                 return Err(DepositIndexStoreError::CheckpointConflict);
             }
         }
         self.flush_pending_removals().await?;
         for journal in prepared.journals.values() {
             self.release_materialized(journal.staged.update(), journal.owner).await?;
+        }
+        self.retention.drain_gc(&self.artifacts).await?;
+        for journal in prepared.journals.values() {
             self.protocol.destroy_deposit_index_journal(journal.key, &journal.bytes).await?;
         }
         self.checkpoint = authenticated_checkpoint.clone().settled();
@@ -892,13 +1782,22 @@ impl DepositIndexStore {
                     JournalPosition::Committed,
                 )?;
                 self.materialize_update(staged.update(), journal.owner()).await?;
+                if scope == DepositIndexJournalScope::Portable {
+                    if self.retention.current_root() != staged.update().next_head().root() {
+                        self.retention
+                            .finish_reauthentication_for_committed_recovery(&self.artifacts)
+                            .await?;
+                    }
+                    self.apply_portable_retention(staged.update()).await?;
+                }
                 self.active_pins = staged.update().staged_objects().map(|(id, _)| id).collect();
                 self.preload_staged(staged, true).await?;
-                if staged.recover(self)? != DepositIndexRecovery::Committed {
+                if self.recover_staged(scope, staged)? != DepositIndexRecovery::Committed {
                     return Err(DepositIndexStoreError::CheckpointConflict);
                 }
                 self.flush_pending_removals().await?;
                 self.release_materialized(staged.update(), journal.owner()).await?;
+                self.retention.drain_gc(&self.artifacts).await?;
                 self.protocol.destroy_deposit_index_journal(key, &bytes).await?;
                 self.active_pins.clear();
             }
@@ -911,6 +1810,9 @@ impl DepositIndexStore {
             self.abort_stale_pending_journal(scope).await?;
         }
         self.validate_current_roots().await?;
+        if self.retention.current_root() != self.checkpoint.portable.root() {
+            return Err(DepositIndexStoreError::CheckpointConflict);
+        }
         self.reset_bounded_cache()?;
         Ok(())
     }
@@ -1033,6 +1935,56 @@ impl DepositIndexStore {
         Ok(())
     }
 
+    async fn apply_portable_retention(
+        &mut self,
+        update: &DepositIndexUpdate,
+    ) -> Result<(), DepositIndexStoreError> {
+        if !matches!(update.expected_head().namespace(), DepositIndexNamespace::Portable { .. })
+            || !matches!(update.next_head().namespace(), DepositIndexNamespace::Portable { .. })
+        {
+            return Err(DepositIndexStoreError::InvalidCheckpoint);
+        }
+        let objects =
+            update.staged_objects().map(|(id, bytes)| (id, bytes.to_vec())).collect::<Vec<_>>();
+        self.retention
+            .apply_root_swap(update.expected_head().root(), update.next_head().root(), objects)
+            .await?;
+        Ok(())
+    }
+
+    fn recover_staged(
+        &mut self,
+        scope: DepositIndexJournalScope,
+        staged: &StagedDepositIndexUpdate,
+    ) -> Result<DepositIndexRecovery, DepositIndexStoreError> {
+        if self.cleanup_scope.replace(scope).is_some() {
+            return Err(DepositIndexStoreError::TransitionInProgress);
+        }
+        let recovered = staged.recover(self);
+        self.cleanup_scope = None;
+        Ok(recovered?)
+    }
+
+    fn require_settled_retention(&self) -> Result<(), DepositIndexStoreError> {
+        if self.prepared_digest.is_some()
+            || self.checkpoint.has_recovery_journal()
+            || self.cleanup_scope.is_some()
+            || self.retention.has_import()
+            || self.retention.current_root() != self.checkpoint.portable.root()
+        {
+            tracing::debug!(
+                prepared = self.prepared_digest.is_some(),
+                checkpoint_journal = self.checkpoint.has_recovery_journal(),
+                cleanup_scope = self.cleanup_scope.is_some(),
+                import = self.retention.has_import(),
+                root_matches = self.retention.current_root() == self.checkpoint.portable.root(),
+                "deposit index retention is not settled"
+            );
+            return Err(DepositIndexStoreError::TransitionInProgress);
+        }
+        Ok(())
+    }
+
     async fn flush_pending_removals(&mut self) -> Result<(), DepositIndexStoreError> {
         let removals = std::mem::take(&mut self.pending_removals);
         for id in removals {
@@ -1137,12 +2089,19 @@ impl DepositIndexCommitStore for DepositIndexStore {
     }
 
     fn remove_index_object(&mut self, id: DepositIndexObjectId) -> Result<(), DepositIndexError> {
+        if self.cleanup_scope == Some(DepositIndexJournalScope::Portable) {
+            // Portable object lifetime is owned exclusively by the authenticated refcount graph.
+            // `StagedDepositIndexUpdate::cleanup` still exercises its exact object set, but direct
+            // artifact unlinking here would bypass historical source roots.
+            return Ok(());
+        }
         self.pending_removals.insert(id);
         Ok(())
     }
 
     fn index_object_is_pinned(&self, id: DepositIndexObjectId) -> Result<bool, DepositIndexError> {
-        Ok(self.active_pins.contains(&id)
+        Ok(self.cleanup_scope == Some(DepositIndexJournalScope::Portable)
+            || self.active_pins.contains(&id)
             || self.heads.values().any(|head| head.root() == Some(id)))
     }
 }
@@ -1273,9 +2232,15 @@ pub enum DepositIndexStoreError {
     Ledger(#[from] LedgerError),
     #[error("encrypted storage rejected durable state: {0}")]
     Storage(#[from] StoreError),
+    #[error("portable deposit-index retention rejected durable state: {0}")]
+    Retention(#[from] crate::deposit_index_retention::RetentionError),
+    #[error("deposit-sync wire rejected a source pin response: {0}")]
+    SyncWire(#[from] DepositSyncWireError),
+    #[error("deposit state-transfer wire rejected a source pin response: {0}")]
+    StateTransferWire(#[from] DepositStateTransferWireError),
     #[error("deposit index checkpoint is malformed")]
     InvalidCheckpoint,
-    #[error("verified portable index import is invalid for this fresh party checkpoint")]
+    #[error("verified portable index advance is invalid for this settled party checkpoint")]
     InvalidPortableImport,
     #[error("deposit index checkpoint CAS or journal binding conflicts")]
     CheckpointConflict,
@@ -1287,6 +2252,10 @@ pub enum DepositIndexStoreError {
     ReadBoundExceeded,
     #[error("deposit index object readback did not authenticate")]
     ObjectAuthentication,
+    #[error("source pin response does not name this exact settled portable head")]
+    InvalidSourcePinResponse,
+    #[error("remote export-seal vote is not bound to this exact reauthenticated settled head")]
+    InvalidRemoteExportVote,
     #[error("checkpoint signing slot is not present under the committed wallet-snapshot head")]
     UncommittedSigningSlot,
     #[error(
@@ -1308,7 +2277,7 @@ mod tests {
         committee::{Committee, Member},
         compact_registry_archive::prepare_compact_registry_genesis,
         config::NetworkKind,
-        deposit_index::LocalSafetyQuery,
+        deposit_index::{DEPOSIT_INDEX_ARTIFACT_KIND, LocalSafetyQuery},
         deposit_ledger::{
             CertifiedLedgerEntry, LedgerRequestId, LedgerStatement, RequestBinding,
             genesis_head as ledger_genesis_head,
@@ -1318,6 +2287,7 @@ mod tests {
         },
         identity::Identity,
         key_rotation::VerifiedRegistryHandoffTarget,
+        storage::WalletArtifactRef,
     };
 
     const PARTY: PartyId = PartyId(7);
@@ -1329,6 +2299,21 @@ mod tests {
 
     fn initial_checkpoint() -> DepositIndexStoreCheckpoint {
         DepositIndexStoreCheckpoint::empty(wallet(), PARTY, index(1)).unwrap()
+    }
+
+    async fn complete_current_reauthentication(
+        store: &mut DepositIndexStore,
+    ) -> crate::deposit_index_retention::ReauthenticatedPortableRoot {
+        for _ in 0..1_024 {
+            match store.advance_portable_reauthentication().await.unwrap() {
+                PortableReauthenticationProgress::Idle => {
+                    panic!("portable reauthentication became idle before completion")
+                }
+                PortableReauthenticationProgress::InProgress => {}
+                PortableReauthenticationProgress::Complete(completed) => return completed,
+            }
+        }
+        panic!("bounded portable reauthentication did not complete");
     }
 
     fn index(minor: u32) -> DepositSubaddressIndex {
@@ -1348,7 +2333,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn verified_portable_import_preserves_fresh_local_safety_and_survives_restart() {
+    async fn verified_portable_advance_preserves_local_safety_and_survives_restart() {
         let directory = TempDir::new().unwrap();
         let root = (ED25519_BASEPOINT_POINT * Scalar::from(42_u64)).compress().to_bytes();
         let deriver = DepositAddressDeriver::new(
@@ -1361,6 +2346,19 @@ mod tests {
         let fresh = DepositIndexStoreCheckpoint::empty(wallet, PARTY, index(1)).unwrap();
         let mut source =
             DepositIndexStore::open(directory.path(), PARTY, &SEED, fresh.clone()).await.unwrap();
+        let signed_ledger = [0x45; 32];
+        let signed_checkpoint = checkpoint_slot(0x46);
+        let mut local_builder =
+            DepositIndexBuilder::new(&source, fresh.local_safety_head().clone()).unwrap();
+        assert!(local_builder.mark_first_used(index(0x44), 1_700_000_000).unwrap());
+        assert!(local_builder.record_signed_ledger_slot(1, signed_ledger).unwrap());
+        assert!(local_builder.record_signed_index_checkpoint_slot(signed_checkpoint).unwrap());
+        let local_update = local_builder.finish().unwrap().unwrap();
+        let prepared = source.prepare_snapshot(vec![local_update]).await.unwrap();
+        let target = prepared.checkpoint().clone();
+        source.commit_prepared(&prepared, &target).await.unwrap();
+        let local_checkpoint = source.checkpoint().clone();
+
         let (update, request) = portable_allocation_update(&source, &deriver);
         let prepared = source.prepare_snapshot(vec![update]).await.unwrap();
         let target = prepared.checkpoint().clone();
@@ -1370,15 +2368,15 @@ mod tests {
         )
         .unwrap();
         let import =
-            VerifiedPortableIndexImport::from_authenticated_head_for_test(source.portable_head())
+            VerifiedPortableIndexAdvance::from_authenticated_head_for_test(source.portable_head())
                 .unwrap();
         assert!(matches!(
-            source.checkpoint().import_verified_portable(&import),
+            source.checkpoint().adopt_verified_portable(&import),
             Err(DepositIndexStoreError::InvalidPortableImport)
         ));
         drop(source);
 
-        let imported = fresh.import_verified_portable(&import).unwrap();
+        let imported = fresh.adopt_verified_portable(&import).unwrap();
         assert!(!imported.has_recovery_journal());
         assert_eq!(imported.portable_head().revision(), 0);
         assert_eq!(
@@ -1426,19 +2424,272 @@ mod tests {
         drop(restarted);
 
         assert!(matches!(
-            initial_checkpoint().import_verified_portable(&import),
+            initial_checkpoint().adopt_verified_portable(&import),
             Err(DepositIndexStoreError::InvalidPortableImport)
         ));
-        let mut local_store =
-            DepositIndexStore::open(directory.path(), PARTY, &SEED, fresh.clone()).await.unwrap();
-        let local_update =
-            first_used_update(&local_store, fresh.local_safety_head().clone(), [0x44]);
-        let prepared = local_store.prepare_snapshot(vec![local_update]).await.unwrap();
-        let target = prepared.checkpoint().clone();
-        local_store.commit_prepared(&prepared, &target).await.unwrap();
+        let advanced = local_checkpoint.adopt_verified_portable(&import).unwrap();
+        assert_eq!(advanced.local_safety_head(), local_checkpoint.local_safety_head());
+        assert_eq!(
+            crate::deposit_index_checkpoint::PortableDepositIndexHead::from_head(
+                advanced.portable_head()
+            )
+            .unwrap(),
+            source_logical
+        );
+
+        let mut restarted =
+            DepositIndexStore::open(directory.path(), PARTY, &SEED, advanced).await.unwrap();
+        restarted.preload_local_safety_query(LocalSafetyQuery::SignedLedgerSlot(1)).await.unwrap();
+        restarted
+            .preload_local_safety_query(LocalSafetyQuery::SignedIndexCheckpointSlot(1))
+            .await
+            .unwrap();
+        let mut exact =
+            DepositIndexBuilder::new(&restarted, restarted.local_safety_head().clone()).unwrap();
+        assert!(!exact.record_signed_ledger_slot(1, signed_ledger).unwrap());
+        assert!(!exact.record_signed_index_checkpoint_slot(signed_checkpoint).unwrap());
+        assert!(exact.finish().unwrap().is_none());
+
+        let mut conflicting =
+            DepositIndexBuilder::new(&restarted, restarted.local_safety_head().clone()).unwrap();
         assert!(matches!(
-            local_store.checkpoint().import_verified_portable(&import),
-            Err(DepositIndexStoreError::InvalidPortableImport)
+            conflicting.record_signed_ledger_slot(1, [0x47; 32]),
+            Err(DepositIndexError::LedgerSlotAlreadySigned)
+        ));
+        assert!(matches!(
+            conflicting.record_signed_index_checkpoint_slot(checkpoint_slot(0x48)),
+            Err(DepositIndexError::IndexCheckpointSlotAlreadySigned)
+        ));
+    }
+
+    #[tokio::test]
+    async fn permanent_portable_reauthentication_resumes_and_remints_only_after_full_restart_scan()
+    {
+        let directory = TempDir::new().unwrap();
+        let root = (ED25519_BASEPOINT_POINT * Scalar::from(42_u64)).compress().to_bytes();
+        let deriver = DepositAddressDeriver::new(
+            NetworkKind::Regtest,
+            root,
+            &Zeroizing::new(Scalar::from(17_u64).to_bytes()),
+        )
+        .unwrap();
+        let fresh =
+            DepositIndexStoreCheckpoint::empty(deriver.wallet_id(), PARTY, index(1)).unwrap();
+        let mut store =
+            DepositIndexStore::open(directory.path(), PARTY, &SEED, fresh).await.unwrap();
+        let (update, _) = portable_allocation_update(&store, &deriver);
+        let prepared = store.prepare_snapshot(vec![update]).await.unwrap();
+        let authenticated = prepared.checkpoint().clone();
+        store.commit_prepared(&prepared, &authenticated).await.unwrap();
+        let settled = store.checkpoint().clone();
+        let logical = PortableDepositIndexHead::from_head(store.portable_head()).unwrap();
+
+        // Model interrupted committed-journal cleanup: the root is already installed, but the
+        // authenticated wallet checkpoint and its exact journal still require startup replay.
+        let journal = &prepared.journals[&DepositIndexJournalScope::Portable];
+        store
+            .protocol
+            .save_deposit_index_journal(journal.key, &journal.bytes, &mut OsRng)
+            .await
+            .unwrap();
+        assert_eq!(
+            store.begin_current_portable_reauthentication().await.unwrap(),
+            PortableReauthenticationProgress::InProgress
+        );
+        assert!(matches!(
+            store.retention.apply_root_swap(store.portable_head().root(), None, Vec::new()).await,
+            Err(crate::deposit_index_retention::RetentionError::ReauthenticationInProgress)
+        ));
+        drop(store);
+
+        let mut resumed =
+            DepositIndexStore::open(directory.path(), PARTY, &SEED, authenticated).await.unwrap();
+        assert_eq!(resumed.checkpoint(), &settled);
+        assert_eq!(
+            resumed.begin_current_portable_reauthentication().await.unwrap(),
+            PortableReauthenticationProgress::InProgress
+        );
+        let first = complete_current_reauthentication(&mut resumed).await;
+        assert!(first.object_count() > 0);
+        assert!(first.authorizes(
+            deriver.wallet_id(),
+            PARTY,
+            PortableReauthenticationAnchor::Current,
+            &logical,
+        ));
+        assert_eq!(
+            resumed.begin_current_portable_reauthentication().await.unwrap(),
+            PortableReauthenticationProgress::Complete(first.clone())
+        );
+        drop(resumed);
+
+        let mut restarted =
+            DepositIndexStore::open(directory.path(), PARTY, &SEED, settled).await.unwrap();
+        assert_eq!(
+            restarted.begin_current_portable_reauthentication().await.unwrap(),
+            PortableReauthenticationProgress::InProgress
+        );
+        let reminted = complete_current_reauthentication(&mut restarted).await;
+        assert_eq!(reminted.root(), first.root());
+        assert_eq!(reminted.head_digest(), first.head_digest());
+        assert_eq!(reminted.object_count(), first.object_count());
+        assert!(reminted.authorizes(
+            deriver.wallet_id(),
+            PARTY,
+            PortableReauthenticationAnchor::Current,
+            &logical,
+        ));
+        assert_eq!(
+            restarted.release_portable_reauthentication(&reminted).await.unwrap(),
+            PortableReauthenticationProgress::InProgress
+        );
+        for _ in 0..1_024 {
+            match restarted.advance_portable_reauthentication().await.unwrap() {
+                PortableReauthenticationProgress::Idle => break,
+                PortableReauthenticationProgress::InProgress => {}
+                PortableReauthenticationProgress::Complete(_) => {
+                    panic!("released reauthentication unexpectedly reminted a token")
+                }
+            }
+        }
+        assert_eq!(
+            restarted.advance_portable_reauthentication().await.unwrap(),
+            PortableReauthenticationProgress::Idle
+        );
+        assert_eq!(
+            restarted.release_portable_reauthentication(&reminted).await.unwrap(),
+            PortableReauthenticationProgress::Idle,
+            "another completed reader may replay cleanup after the shared audit is gone"
+        );
+        assert_eq!(
+            restarted.begin_current_portable_reauthentication().await.unwrap(),
+            PortableReauthenticationProgress::InProgress
+        );
+        for (id, _) in journal.staged.update().staged_objects() {
+            restarted.preload_referenced_object(id).await.unwrap();
+        }
+        let (next, request) = portable_allocation_update(&restarted, &deriver);
+        assert!(matches!(
+            restarted.prepare_snapshot(vec![next.clone()]).await,
+            Err(DepositIndexStoreError::TransitionInProgress)
+        ));
+        let completed = complete_current_reauthentication(&mut restarted).await;
+        restarted.finish_portable_reauthentication(&completed).await.unwrap();
+        restarted.finish_portable_reauthentication(&completed).await.unwrap();
+        assert_eq!(
+            restarted.advance_portable_reauthentication().await.unwrap(),
+            PortableReauthenticationProgress::Idle
+        );
+        let prepared = restarted.prepare_snapshot(vec![next]).await.unwrap();
+        let target = prepared.checkpoint().clone();
+        // Reproduce the legacy ordering: a committed portable successor coexists with an audit
+        // of its predecessor. Bypass only the store's preparation fence to inject that crash state.
+        restarted
+            .retention
+            .begin_portable_reauthentication(PortableReauthenticationAnchor::Current, &logical)
+            .await
+            .unwrap();
+        drop(restarted);
+        let mut recovered =
+            DepositIndexStore::open(directory.path(), PARTY, &SEED, target).await.unwrap();
+        assert_eq!(
+            recovered.advance_portable_reauthentication().await.unwrap(),
+            PortableReauthenticationProgress::Idle
+        );
+        assert!(
+            recovered
+                .lookup_portable(&PortableAllocationQuery::Request(request))
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn remote_export_vote_gate_is_exact_and_cannot_authorize_the_serving_source() {
+        fn portable_root(wallet: DepositWalletId, tag: u8) -> DepositIndexObjectId {
+            let reference = WalletArtifactRef::for_contents(
+                WalletId(wallet.0),
+                DEPOSIT_INDEX_ARTIFACT_KIND,
+                &[tag],
+            )
+            .unwrap();
+            DepositIndexObjectId::from_storage_reference(reference).unwrap()
+        }
+
+        let wallet = wallet();
+        let source_party = PartyId(1);
+        let remote_voter = PartyId(2);
+        let binding = RemoteExportSealCandidateBinding {
+            wallet,
+            source_registry: RegistryId::new(wallet, 3, [0x11; 32], [0x12; 32]).unwrap(),
+            source_party,
+            semantic_transition: [0x13; 32],
+            transition_binding: [0x14; 32],
+            vote_slot: [0x15; 32],
+            statement: [0x16; 32],
+            advertisement: [0x17; 32],
+            export_binding: [0x18; 32],
+            portable_root: portable_root(wallet, 0x19),
+            portable_head: [0x1a; 32],
+        };
+        let gate = VerifiedRemoteExportSealVoteGate::from_verified_binding(
+            &binding,
+            remote_voter,
+            [0x1b; 32],
+            3,
+        )
+        .unwrap();
+        assert!(gate.authorize_binding(&binding, remote_voter).is_ok());
+
+        let mut different_statement = binding;
+        different_statement.statement = [0x21; 32];
+        assert!(matches!(
+            gate.authorize_binding(&different_statement, remote_voter),
+            Err(DepositIndexStoreError::InvalidRemoteExportVote)
+        ));
+
+        let mut different_source = binding;
+        different_source.source_party = PartyId(3);
+        assert!(matches!(
+            gate.authorize_binding(&different_source, remote_voter),
+            Err(DepositIndexStoreError::InvalidRemoteExportVote)
+        ));
+
+        let mut different_source_registry = binding;
+        different_source_registry.source_registry =
+            RegistryId::new(wallet, 3, [0x22; 32], [0x12; 32]).unwrap();
+        assert!(matches!(
+            gate.authorize_binding(&different_source_registry, remote_voter),
+            Err(DepositIndexStoreError::InvalidRemoteExportVote)
+        ));
+
+        let mut different_portable_root = binding;
+        different_portable_root.portable_root = portable_root(wallet, 0x23);
+        assert!(matches!(
+            gate.authorize_binding(&different_portable_root, remote_voter),
+            Err(DepositIndexStoreError::InvalidRemoteExportVote)
+        ));
+
+        let mut different_portable_head = binding;
+        different_portable_head.portable_head = [0x24; 32];
+        assert!(matches!(
+            gate.authorize_binding(&different_portable_head, remote_voter),
+            Err(DepositIndexStoreError::InvalidRemoteExportVote)
+        ));
+
+        assert!(matches!(
+            gate.authorize_binding(&binding, source_party),
+            Err(DepositIndexStoreError::InvalidRemoteExportVote)
+        ));
+        assert!(matches!(
+            VerifiedRemoteExportSealVoteGate::from_verified_binding(
+                &binding,
+                source_party,
+                [0x1b; 32],
+                3,
+            ),
+            Err(DepositIndexStoreError::InvalidRemoteExportVote)
         ));
     }
 
@@ -1488,6 +2739,7 @@ mod tests {
         };
         let head = store.portable_head().clone();
         let first_index = head.portable_anchor().unwrap().next_index();
+        let sequence = head.portable_anchor().unwrap().through_sequence() + 1;
         let target = VerifiedRegistryHandoffTarget::for_test(
             committee.clone(),
             1,
@@ -1498,14 +2750,17 @@ mod tests {
             deriver.root_spend_key(),
         )
         .unwrap();
+        let genesis =
+            DepositIndexStoreCheckpoint::empty(deriver.wallet_id(), PARTY, index(1)).unwrap();
         let pending =
-            prepare_compact_registry_genesis(&target, first_index, head.digest()).unwrap();
+            prepare_compact_registry_genesis(&target, index(1), genesis.portable_head().digest())
+                .unwrap();
         let registry = pending.proposed_head().registry();
-        let request = LedgerRequestId([0x34; 32]);
+        let request = LedgerRequestId([0x33 + u8::try_from(sequence).unwrap(); 32]);
         let statement = LedgerStatement::allocation(
             registry,
-            1,
-            ledger_genesis_head(deriver.wallet_id()),
+            sequence,
+            head.portable_anchor().unwrap().ledger_head(),
             request,
             RequestBinding([0x35; 32]),
             deriver.derive(first_index),
@@ -1605,6 +2860,67 @@ mod tests {
 
     fn checkpoint_slot(marker: u8) -> SignedIndexCheckpointSlot {
         checkpoint_slot_at(marker, 1_700_000_000)
+    }
+
+    #[tokio::test]
+    async fn cold_checkpoint_signing_preloads_the_certified_locator_counterpart() {
+        for party in [PartyId(2), PartyId(3), PartyId(4)] {
+            let directory = TempDir::new().unwrap();
+            let seed = [u8::try_from(party.0).unwrap(); 32];
+            let initial = DepositIndexStoreCheckpoint::empty(wallet(), party, index(1)).unwrap();
+            let mut store =
+                DepositIndexStore::open(directory.path(), party, &seed, initial).await.unwrap();
+            let mut builder =
+                DepositIndexBuilder::new(&store, store.local_safety_head().clone()).unwrap();
+            for value in 1..=64 {
+                assert!(builder.mark_first_used(index(value), 1_700_000_000).unwrap());
+            }
+            let update = builder.finish().unwrap().unwrap();
+            let prepared = store.prepare_snapshot(vec![update]).await.unwrap();
+            let authenticated = prepared.checkpoint().clone();
+            store.commit_prepared(&prepared, &authenticated).await.unwrap();
+            let settled = store.checkpoint().clone();
+            drop(store);
+
+            let mut store =
+                DepositIndexStore::open(directory.path(), party, &seed, settled).await.unwrap();
+            let slot = SignedIndexCheckpointSlot::new(
+                6,
+                [0x61; 32],
+                [0x62; 32],
+                [0x63; 32],
+                [0x64; 32],
+                1_700_000_000,
+            )
+            .unwrap();
+
+            store.reset_bounded_cache().unwrap();
+            store
+                .preload_local_safety_query(LocalSafetyQuery::SignedIndexCheckpointSlot(6))
+                .await
+                .unwrap();
+            let cold_error = {
+                let mut builder =
+                    DepositIndexBuilder::new(&store, store.local_safety_head().clone()).unwrap();
+                builder.record_signed_index_checkpoint_slot(slot).unwrap_err()
+            };
+            assert!(
+                matches!(cold_error, DepositIndexError::MissingObject(_)),
+                "party {party} unexpectedly had the certified-locator sibling in its cold cache"
+            );
+
+            store.reset_bounded_cache().unwrap();
+            for query in [
+                LocalSafetyQuery::SignedIndexCheckpointSlot(6),
+                LocalSafetyQuery::CertifiedCheckpointLocator(6),
+            ] {
+                store.preload_local_safety_query(query).await.unwrap();
+            }
+            let mut builder =
+                DepositIndexBuilder::new(&store, store.local_safety_head().clone()).unwrap();
+            assert!(builder.record_signed_index_checkpoint_slot(slot).unwrap());
+            assert!(builder.finish().unwrap().is_some());
+        }
     }
 
     #[tokio::test]

@@ -26,8 +26,8 @@ pub fn merkle_root(mut leaves: impl AsMut<[[u8; 32]]>) -> Option<[u8; 32]> {
 
   let mut pair_buf = [0; 64];
   let mut pair = |left: &[u8; 32], right: &[u8; 32]| {
-    pair_buf[.. 32].copy_from_slice(left);
-    pair_buf[32 ..].copy_from_slice(right);
+    pair_buf[..32].copy_from_slice(left);
+    pair_buf[32..].copy_from_slice(right);
     keccak256(pair_buf)
   };
 
@@ -60,7 +60,7 @@ pub fn merkle_root(mut leaves: impl AsMut<[[u8; 32]]>) -> Option<[u8; 32]> {
         let overage = leaves.len() - low_pow_2;
         // This choice of `start` means `leaves[start ..].len() == (2 * overage)`
         let start = low_pow_2 - overage;
-        for i in 0 .. overage {
+        for i in 0..overage {
           // Take the next pair of leaves
           let left = leaves[start + (2 * i)];
           let right = leaves[start + (2 * i) + 1];
@@ -68,7 +68,7 @@ pub fn merkle_root(mut leaves: impl AsMut<[[u8; 32]]>) -> Option<[u8; 32]> {
           leaves[start + i] = pair(&left, &right);
         }
         // Truncate now that we've performed the initial pairing off
-        leaves = &mut leaves[.. low_pow_2];
+        leaves = &mut leaves[..low_pow_2];
       }
 
       Some(leaves[0])

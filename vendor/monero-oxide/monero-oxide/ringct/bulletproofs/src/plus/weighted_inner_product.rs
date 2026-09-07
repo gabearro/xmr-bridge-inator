@@ -46,7 +46,7 @@ impl WipWitness {
     let missing = padded_pow_of_2(a.len()) - a.len();
     a.0.reserve(missing);
     b.0.reserve(missing);
-    for _ in 0 .. missing {
+    for _ in 0..missing {
       a.0.push(Scalar::ZERO);
       b.0.push(Scalar::ZERO);
     }
@@ -73,7 +73,7 @@ impl WipStatement {
     // y ** n
     let mut y_vec = ScalarVector::new(generators.len());
     y_vec[0] = y;
-    for i in 1 .. y_vec.len() {
+    for i in 1..y_vec.len() {
       y_vec[i] = y_vec[i - 1] * y;
     }
 
@@ -151,7 +151,7 @@ impl WipStatement {
     let (g, h) = (BpPlusGenerators::g(), BpPlusGenerators::h());
     let mut g_bold = vec![];
     let mut h_bold = vec![];
-    for i in 0 .. generators.len() {
+    for i in 0..generators.len() {
       g_bold.push(generators.generator(GeneratorsList::GBold, i));
       h_bold.push(generators.generator(GeneratorsList::HBold, i));
     }
@@ -392,7 +392,7 @@ impl WipStatement {
     }
 
     let re = r_answer * e;
-    for i in 0 .. generators.len() {
+    for i in 0..generators.len() {
       let mut scalar = product_cache[i] * re;
       if i > 0 {
         scalar *= inv_y[i - 1];
@@ -401,7 +401,7 @@ impl WipStatement {
     }
 
     let se = s_answer * e;
-    for i in 0 .. generators.len() {
+    for i in 0..generators.len() {
       verifier.0.h_bold[i] += verifier_weight * (se * product_cache[product_cache.len() - 1 - i]);
     }
 

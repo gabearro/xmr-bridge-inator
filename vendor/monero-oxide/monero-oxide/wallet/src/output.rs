@@ -37,8 +37,8 @@ impl core::fmt::Debug for AbsoluteId {
 impl AbsoluteId {
   /// A constant-time `eq`, albeit one not exposed via `ConstantTimeEq`.
   fn ct_eq(&self, other: &Self) -> Choice {
-    self.transaction.ct_eq(&other.transaction) &
-      self.index_in_transaction.ct_eq(&other.index_in_transaction)
+    self.transaction.ct_eq(&other.transaction)
+      & self.index_in_transaction.ct_eq(&other.index_in_transaction)
   }
 
   /// Write the AbsoluteId.
@@ -117,9 +117,9 @@ impl core::fmt::Debug for OutputData {
 impl OutputData {
   /// A constant-time `eq`, albeit one not exposed via `ConstantTimeEq`.
   pub(crate) fn ct_eq(&self, other: &Self) -> Choice {
-    self.key.ct_eq(&other.key) &
-      self.key_offset.ct_eq(&other.key_offset) &
-      self.commitment.ct_eq(&other.commitment)
+    self.key.ct_eq(&other.key)
+      & self.key_offset.ct_eq(&other.key_offset)
+      & self.commitment.ct_eq(&other.commitment)
   }
 
   /// The key this output may be spent by.
@@ -198,10 +198,10 @@ impl core::fmt::Debug for Metadata {
 
 impl Metadata {
   fn eq(&self, other: &Self) -> bool {
-    (self.additional_timelock == other.additional_timelock) &&
-      (self.subaddress == other.subaddress) &&
-      (self.payment_id == other.payment_id) &&
-      (self.arbitrary_data == other.arbitrary_data)
+    (self.additional_timelock == other.additional_timelock)
+      && (self.subaddress == other.subaddress)
+      && (self.payment_id == other.payment_id)
+      && (self.arbitrary_data == other.arbitrary_data)
   }
 
   /// Write the Metadata.
@@ -274,7 +274,7 @@ impl Metadata {
 
         let mut data = vec![];
         let mut total_len = 0usize;
-        for _ in 0 .. chunks {
+        for _ in 0..chunks {
           let len = read_byte(r)?;
           let chunk = read_raw_vec(read_byte, usize::from(len), r)?;
           total_len = total_len.saturating_add(chunk.len());
@@ -314,9 +314,9 @@ impl PartialEq for WalletOutput {
   /// This equality evaluates the entire object, not just the ID.
   fn eq(&self, other: &Self) -> bool {
     bool::from(
-      self.absolute_id.ct_eq(&other.absolute_id) &
-        self.relative_id.ct_eq(&other.relative_id) &
-        self.data.ct_eq(&other.data),
+      self.absolute_id.ct_eq(&other.absolute_id)
+        & self.relative_id.ct_eq(&other.relative_id)
+        & self.data.ct_eq(&other.data),
     ) & self.metadata.eq(&other.metadata)
   }
 }

@@ -65,7 +65,7 @@ const PUB_KEY_BYTES: [u8; 33] = [
 ];
 
 fn pub_key() -> CompressedPoint {
-  CompressedPoint::from(<[u8; 32]>::try_from(&PUB_KEY_BYTES[1 .. PUB_KEY_BYTES.len()]).unwrap())
+  CompressedPoint::from(<[u8; 32]>::try_from(&PUB_KEY_BYTES[1..PUB_KEY_BYTES.len()]).unwrap())
 }
 
 fn test_write_buf(extra: &Extra, buf: &[u8]) {
@@ -224,7 +224,7 @@ fn fetching_long_data_does_not_panic() {
   arb_data[0] = ARBITRARY_DATA_MARKER;
 
   // Push sets of arbitrary data
-  for _ in 0 .. 5 {
+  for _ in 0..5 {
     extra.push_nonce(arb_data.clone());
   }
   // Confirm we're within policy

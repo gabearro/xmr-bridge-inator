@@ -8,12 +8,12 @@ matching signer; the acceptance client receives all bearer tokens so it can driv
 harness. The values provide no security and must never be reused on testnet, stagenet, mainnet, or
 any production deployment.
 
-For a real deployment, replace these file-backed Compose secrets with independently generated
-signing, bootstrap X25519, and transport keys delivered through the platform's secret manager.
-Issue short-lived certificates from an authenticated deployment PKI, support revocation and
-rotation, and protect private keys with an HSM or equivalent isolated keystore. A party must never
-be able to read another party's signing seed, bootstrap X25519 secret, QUIC private key, bearer
-capability, or persisted share volume.
+Production secret provisioning is an external deployment-owner responsibility and is not
+implemented or tested by this repository. A deployment must replace these file-backed fixtures
+with independently generated signing, bootstrap X25519, and transport keys, provide authenticated
+certificate enrollment/revocation/rotation, and choose suitable secret-manager or HSM custody. A
+party must never be able to read another party's signing seed, bootstrap X25519 secret, QUIC
+private key, bearer capability, or persisted share volume.
 
 `../generate-demo-quic-pki.sh --check` verifies that the checked-in fixtures match the deterministic
 recipe. The fixture files are deliberately world-readable because file-backed Docker Compose

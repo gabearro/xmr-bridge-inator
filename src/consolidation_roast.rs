@@ -1470,7 +1470,22 @@ impl ConsolidationRoast {
             })
     }
 
-    /// Clone every full hot attempt proof in absolute-view order for immutable cold staging.
+    fn hot_attempt_archive_material(
+        &self,
+        view: u64,
+        record: &RoastViewRecord,
+    ) -> Result<RoastAttemptArchiveMaterial, ConsolidationRoastError> {
+        Ok(RoastAttemptArchiveMaterial {
+            slot: record.slot.clone(),
+            context: record.context.clone(),
+            intent: record.intent.clone(),
+            intent_certificate: record.intent_certificate.clone(),
+            wire_binding: self.wire_binding(view)?,
+            key_image_certificate: record.key_image_certificate.clone(),
+        })
+    }
+
+    /// Clone every full hot attempt proof in absolute-view order for terminal cold staging.
     ///
     /// Replay tombstones are intentionally excluded: their complete key-image certificates may
     /// already have been retired, so they must have been archived before entering that window.
@@ -1480,17 +1495,28 @@ impl ConsolidationRoast {
         self.validate()?;
         self.views
             .iter()
-            .map(|(view, record)| {
-                Ok(RoastAttemptArchiveMaterial {
-                    slot: record.slot.clone(),
-                    context: record.context.clone(),
-                    intent: record.intent.clone(),
-                    intent_certificate: record.intent_certificate.clone(),
-                    wire_binding: self.wire_binding(*view)?,
-                    key_image_certificate: record.key_image_certificate.clone(),
-                })
-            })
+            .map(|(view, record)| self.hot_attempt_archive_material(*view, record))
             .collect()
+    }
+
+    /// Return the sole hot attempt which certifying the next view will demote into the immutable
+    /// replay-tombstone window.
+    ///
+    /// Superseded hot views remain live and may still acquire a key-image certificate or an
+    /// endorsed candidate. Freezing any of them earlier would make a later valid contribution
+    /// conflict with the immutable `(family, view)` archive entry. At the bounded hot-window
+    /// boundary, `append_certified_view` demotes exactly the oldest view and rejects every new
+    /// contribution to that tombstone, so that is the first safe time to archive it.
+    pub fn attempts_requiring_archive_before_successor(
+        &self,
+    ) -> Result<Vec<RoastAttemptArchiveMaterial>, ConsolidationRoastError> {
+        self.validate()?;
+        if self.views.len() < MAX_HOT_ROAST_VIEWS {
+            return Ok(Vec::new());
+        }
+        let (&view, record) =
+            self.views.first_key_value().ok_or(ConsolidationRoastError::InvalidState)?;
+        Ok(vec![self.hot_attempt_archive_material(view, record)?])
     }
 
     /// Append the next BA-certified view.  No claim is made about prior views being unable to
@@ -3599,6 +3625,54 @@ mod tests {
                 .append_certified_view(context, intent, certificate, 1_000 + view * 100)
                 .unwrap(),
             view
+        );
+    }
+
+    #[test]
+    fn successor_archives_only_the_view_crossing_into_the_replay_window() {
+        let mut fixture = fixture(PartyId(1));
+        assert!(fixture.reducer.attempts_requiring_archive_before_successor().unwrap().is_empty());
+
+        while fixture.reducer.views.len() < MAX_HOT_ROAST_VIEWS {
+            append_next(&mut fixture);
+            if fixture.reducer.views.len() < MAX_HOT_ROAST_VIEWS {
+                assert!(
+                    fixture
+                        .reducer
+                        .attempts_requiring_archive_before_successor()
+                        .unwrap()
+                        .is_empty()
+                );
+            }
+        }
+
+        let hot = fixture.reducer.hot_attempt_archive_materials().unwrap();
+        let evicted = fixture.reducer.attempts_requiring_archive_before_successor().unwrap();
+        assert_eq!(hot.len(), MAX_HOT_ROAST_VIEWS);
+        assert_eq!(evicted, vec![hot[0].clone()]);
+        assert_eq!(evicted[0].slot.roast_view(), 0);
+        assert_ne!(evicted[0].slot.roast_view(), hot.last().unwrap().slot.roast_view());
+
+        append_next(&mut fixture);
+        let tombstone = fixture.reducer.replay_tombstones.get(&0).unwrap();
+        assert_eq!(tombstone.slot, evicted[0].slot);
+        assert_eq!(tombstone.context, evicted[0].context);
+        assert_eq!(tombstone.intent, evicted[0].intent);
+        assert_eq!(tombstone.intent_certificate, evicted[0].intent_certificate);
+        assert_eq!(
+            tombstone.key_image_certificate,
+            evicted[0]
+                .key_image_certificate
+                .as_ref()
+                .map(PortableKeyImageBindingCertificate::digest)
+        );
+
+        let next_eviction = fixture.reducer.attempts_requiring_archive_before_successor().unwrap();
+        assert_eq!(next_eviction.len(), 1);
+        assert_eq!(next_eviction[0].slot.roast_view(), 1);
+        assert_eq!(
+            fixture.reducer.views.last_key_value().unwrap().0,
+            &u64::try_from(MAX_HOT_ROAST_VIEWS).unwrap()
         );
     }
 

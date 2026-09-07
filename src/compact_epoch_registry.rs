@@ -15,6 +15,7 @@ use thiserror::Error;
 
 use crate::{
     committee::{Committee, CommitteeError, SessionId},
+    deposit_state_export::{DepositHandoffStateBinding, DepositStateExportError},
     deposit_wallet::{DepositSubaddressIndex, DepositWalletId},
     identity::{Identity, IdentityError, SignedEnvelope},
     key_rotation::VerifiedRegistryHandoffTarget,
@@ -24,9 +25,10 @@ pub const COMPACT_EPOCH_REGISTRY_VERSION: u16 = 2;
 pub const COMPACT_REGISTRY_ID_VERSION: u16 = 2;
 pub const COMPACT_REGISTRY_LINK_VERSION: u16 = 2;
 pub const COMPACT_ACTIVE_ISSUER_VERSION: u16 = 2;
-pub const COMPACT_HANDOFF_STATEMENT_VERSION: u16 = 2;
-pub const COMPACT_HANDOFF_CERTIFICATE_VERSION: u16 = 2;
+pub const COMPACT_HANDOFF_STATEMENT_VERSION: u16 = 3;
+pub const COMPACT_HANDOFF_CERTIFICATE_VERSION: u16 = 3;
 pub const VERIFIED_ISSUER_WINDOW_VERSION: u16 = 2;
+const MAX_COMPACT_HANDOFF_CERTIFICATE_BYTES: usize = 64 * 1024;
 
 /// A `u64` key always consumes exactly this many authenticated branch decisions.
 pub const COMPACT_REGISTRY_INDEX_DEPTH: u8 = 64;
@@ -37,8 +39,11 @@ pub const FINAL_COMPACT_REGISTRY_EPOCH: u64 = u64::MAX;
 
 const REGISTRY_ID_DOMAIN: &str = "threshold-monero/compact-registry-id/v2";
 const LINK_DOMAIN: &str = "threshold-monero/compact-registry-link/v2";
-const HANDOFF_STATEMENT_DOMAIN: &str = "threshold-monero/compact-registry-handoff-statement/v2";
-const HANDOFF_SESSION_DOMAIN: &[u8] = b"threshold-monero/compact-registry-handoff-session/v2";
+const HANDOFF_STATEMENT_DOMAIN: &str = "threshold-monero/compact-registry-handoff-statement/v3";
+const HANDOFF_SESSION_DOMAIN: &[u8] = b"threshold-monero/compact-registry-handoff-session/v3";
+const HANDOFF_CERTIFICATE_DOMAIN: &str = "threshold-monero/compact-registry-handoff-certificate/v3";
+const HANDOFF_EXPORT_CAPABILITY_DOMAIN: &str =
+    "threshold-monero/compact-registry-handoff-export-capability/v1";
 const GENESIS_PARENT_DOMAIN: &str = "threshold-monero/compact-registry-genesis-parent/v2";
 const GENESIS_LEDGER_HEAD_DOMAIN: &str = "threshold-monero/compact-registry-ledger-genesis/v2";
 const INDEX_EMPTY_LEAF_DOMAIN: &str = "threshold-monero/compact-registry-index-empty-leaf/v2";
@@ -150,7 +155,7 @@ pub struct RegistryLink {
 }
 
 impl RegistryLink {
-    /// Construct a new-format genesis link.  No legacy registry or legacy genesis digest is
+    /// Construct a canonical genesis link. No alternate registry or genesis digest is
     /// accepted. The non-serializable target capability can only be created after the epoch-zero
     /// DKG activation certificate and configured Monero wallet binding have both been verified.
     pub fn genesis(
@@ -664,9 +669,10 @@ impl CompactEpochRegistry {
 ///
 /// The source identity includes both the semantic chain root and the authenticated index root.
 /// Consequently a certificate cannot be transplanted onto another fork, another witness-derived
-/// archive layout, or an earlier/later source head. `source_portable_index` binds the complete
-/// logical [`crate::deposit_index::DepositIndexHead`] immediately before the terminal statement;
-/// the snapshot CAS must install the derived post-statement portable head with the successor.
+/// logical state, or an earlier/later source head. `source_state` binds the complete
+/// witness-independent logical [`crate::deposit_index::DepositIndexHead`] immediately before the
+/// terminal statement. Exact source-specific archive and certificate references are deliberately
+/// excluded and enter a separate post-handoff export seal.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct RegistryHandoffStatement {
     version: u16,
@@ -680,6 +686,8 @@ pub struct RegistryHandoffStatement {
     terminal_sequence: u64,
     previous_ledger_head: [u8; 32],
     source_portable_index: [u8; 32],
+    source_state: DepositHandoffStateBinding,
+    export_capability_context: [u8; 32],
     target_epoch: u64,
     target_key_id: [u8; 32],
     target_group_key: [u8; 32],
@@ -690,12 +698,57 @@ pub struct RegistryHandoffStatement {
     next_index: DepositSubaddressIndex,
 }
 
+fn handoff_export_capability_context(
+    source: &CompactEpochRegistry,
+    state: &DepositHandoffStateBinding,
+    target: &VerifiedRegistryHandoffTarget,
+) -> Result<[u8; 32], CompactRegistryError> {
+    handoff_export_capability_context_from_parts(
+        source.id(),
+        source.active().certified_activation_root(),
+        state,
+        target.committee().epoch,
+        target.committee().digest(),
+        target.activation(),
+        target.certified_activation_root(),
+    )
+}
+
+fn handoff_export_capability_context_from_parts(
+    source: RegistryId,
+    source_certified_activation_root: [u8; 32],
+    state: &DepositHandoffStateBinding,
+    target_epoch: u64,
+    target_committee: [u8; 32],
+    target_activation: [u8; 32],
+    target_certified_activation_root: [u8; 32],
+) -> Result<[u8; 32], CompactRegistryError> {
+    source.validate()?;
+    state.validate()?;
+    if source_certified_activation_root == [0; 32]
+        || target_committee == [0; 32]
+        || target_activation == [0; 32]
+        || target_certified_activation_root == [0; 32]
+    {
+        return Err(CompactRegistryError::InvalidHandoffStatement);
+    }
+    let mut hasher = blake3::Hasher::new_derive_key(HANDOFF_EXPORT_CAPABILITY_DOMAIN);
+    hasher.update(&source.digest());
+    hasher.update(&source_certified_activation_root);
+    hasher.update(&state.digest()?);
+    hasher.update(&target_epoch.to_le_bytes());
+    hasher.update(&target_committee);
+    hasher.update(&target_activation);
+    hasher.update(&target_certified_activation_root);
+    Ok(*hasher.finalize().as_bytes())
+}
+
 impl RegistryHandoffStatement {
     pub fn new(
         source: &CompactEpochRegistry,
         terminal_sequence: u64,
         previous_ledger_head: [u8; 32],
-        source_portable_index: [u8; 32],
+        source_state: DepositHandoffStateBinding,
         target: &VerifiedRegistryHandoffTarget,
         next_index: DepositSubaddressIndex,
     ) -> Result<Self, CompactRegistryError> {
@@ -708,6 +761,13 @@ impl RegistryHandoffStatement {
         {
             return Err(CompactRegistryError::WrongHandoffTarget);
         }
+        source_state.validate()?;
+        if source_state.portable_head().wallet_id() != source.wallet() {
+            return Err(CompactRegistryError::InvalidHandoffStatement);
+        }
+        let source_portable_index = source_state.portable_head().digest();
+        let export_capability_context =
+            handoff_export_capability_context(source, &source_state, target)?;
         let statement = Self {
             version: COMPACT_HANDOFF_STATEMENT_VERSION,
             wallet: source.wallet(),
@@ -720,6 +780,8 @@ impl RegistryHandoffStatement {
             terminal_sequence,
             previous_ledger_head,
             source_portable_index,
+            source_state,
+            export_capability_context,
             target_epoch: target_committee.epoch,
             target_key_id: target.key_id(),
             target_group_key: target.group_key(),
@@ -739,6 +801,7 @@ impl RegistryHandoffStatement {
     ) -> Result<(), CompactRegistryError> {
         source.validate()?;
         self.source.validate()?;
+        self.source_state.validate()?;
         // Every handoff creates a successor whose first ledger sequence is terminal + 1.  Keeping
         // this check in the signed-statement validator prevents a quorum from certifying an
         // otherwise well-formed transition which no successor can install.
@@ -759,6 +822,14 @@ impl RegistryHandoffStatement {
             || self.terminal_sequence < source.active.start_sequence
             || self.previous_ledger_head == [0_u8; 32]
             || self.source_portable_index == [0_u8; 32]
+            || self.source_state.portable_head().wallet_id() != self.wallet
+            || self.source_state.portable_head().digest() != self.source_portable_index
+            || self.source_state.terminal_checkpoint_decision().is_none()
+            || self.source_state.portable_head().through_sequence().checked_add(1)
+                != Some(self.terminal_sequence)
+            || self.source_state.portable_head().ledger_head() != self.previous_ledger_head
+            || self.source_state.portable_head().next_index() != self.next_index
+            || self.export_capability_context == [0_u8; 32]
             || self.target_epoch
                 != source.active_epoch().checked_add(1).ok_or(CompactRegistryError::Overflow)?
             || self.target_committee == [0_u8; 32]
@@ -767,6 +838,18 @@ impl RegistryHandoffStatement {
             || self.target_activation == [0_u8; 32]
             || self.target_certified_activation_root == [0_u8; 32]
         {
+            return Err(CompactRegistryError::InvalidHandoffStatement);
+        }
+        let expected_export_context = handoff_export_capability_context_from_parts(
+            self.source,
+            self.source_certified_activation_root,
+            &self.source_state,
+            self.target_epoch,
+            self.target_committee,
+            self.target_activation,
+            self.target_certified_activation_root,
+        )?;
+        if self.export_capability_context != expected_export_context {
             return Err(CompactRegistryError::InvalidHandoffStatement);
         }
         Ok(())
@@ -787,6 +870,13 @@ impl RegistryHandoffStatement {
         hasher.update(&self.terminal_sequence.to_le_bytes());
         hasher.update(&self.previous_ledger_head);
         hasher.update(&self.source_portable_index);
+        hasher.update(
+            &self
+                .source_state
+                .digest()
+                .expect("validated handoff state binding has a canonical digest"),
+        );
+        hasher.update(&self.export_capability_context);
         hasher.update(&self.target_epoch.to_le_bytes());
         hasher.update(&self.target_key_id);
         hasher.update(&self.target_group_key);
@@ -857,6 +947,20 @@ impl RegistryHandoffStatement {
     #[must_use]
     pub const fn source_portable_index(&self) -> [u8; 32] {
         self.source_portable_index
+    }
+
+    #[must_use]
+    pub const fn source_state(&self) -> &DepositHandoffStateBinding {
+        &self.source_state
+    }
+
+    /// Witness-independent transition context authorizing source-specific read-only export seals.
+    ///
+    /// This commits the source registry ID and activation root, the full semantic portable state,
+    /// and the target epoch, committee, activation, and certified activation-history root.
+    #[must_use]
+    pub const fn export_capability_context(&self) -> [u8; 32] {
+        self.export_capability_context
     }
 
     #[must_use]
@@ -961,6 +1065,43 @@ impl RegistryHandoffCertificate {
             previous = Some(witness.from);
         }
         Ok(())
+    }
+
+    /// Canonical bounded bytes of this exact witness-set-specific certificate.
+    pub fn to_bytes(&self) -> Result<Vec<u8>, CompactRegistryError> {
+        if self.version != COMPACT_HANDOFF_CERTIFICATE_VERSION {
+            return Err(CompactRegistryError::InvalidHandoffCertificate);
+        }
+        let bytes = postcard::to_allocvec(self).map_err(|_| CompactRegistryError::Serialization)?;
+        if bytes.is_empty() || bytes.len() > MAX_COMPACT_HANDOFF_CERTIFICATE_BYTES {
+            return Err(CompactRegistryError::HandoffCertificateTooLarge);
+        }
+        Ok(bytes)
+    }
+
+    /// Decode one exact certificate artifact without accepting trailing or alternate encodings.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, CompactRegistryError> {
+        if bytes.is_empty() || bytes.len() > MAX_COMPACT_HANDOFF_CERTIFICATE_BYTES {
+            return Err(CompactRegistryError::HandoffCertificateTooLarge);
+        }
+        let (certificate, trailing) = postcard::take_from_bytes::<Self>(bytes)
+            .map_err(|_| CompactRegistryError::Serialization)?;
+        if !trailing.is_empty() {
+            return Err(CompactRegistryError::TrailingBytes);
+        }
+        if certificate.to_bytes()? != bytes {
+            return Err(CompactRegistryError::NonCanonicalEncoding);
+        }
+        Ok(certificate)
+    }
+
+    /// Domain-separated commitment to the exact canonical witness-bearing artifact.
+    pub fn digest(&self) -> Result<[u8; 32], CompactRegistryError> {
+        let bytes = self.to_bytes()?;
+        let mut hasher = blake3::Hasher::new_derive_key(HANDOFF_CERTIFICATE_DOMAIN);
+        hasher.update(&(bytes.len() as u64).to_le_bytes());
+        hasher.update(&bytes);
+        Ok(*hasher.finalize().as_bytes())
     }
 
     #[must_use]
@@ -1119,19 +1260,39 @@ pub fn compact_registry_empty_index_root(wallet: DepositWalletId) -> [u8; 32] {
 #[must_use]
 pub(crate) fn compact_registry_empty_index_hash_at(wallet: DepositWalletId, depth: u8) -> [u8; 32] {
     assert!(depth <= COMPACT_REGISTRY_INDEX_DEPTH, "compact index depth is bounded");
+    std::thread_local! {
+        // One public wallet's constants per thread; untrusted wallet IDs cannot grow this cache.
+        static EMPTY_HASHES: std::cell::RefCell<Option<(DepositWalletId, [[u8; 32]; 65])>> =
+            const { std::cell::RefCell::new(None) };
+    }
+    EMPTY_HASHES.with_borrow_mut(|cached| {
+        let (cached_wallet, hashes) =
+            cached.get_or_insert_with(|| (wallet, empty_index_hashes(wallet)));
+        if *cached_wallet != wallet {
+            *cached_wallet = wallet;
+            *hashes = empty_index_hashes(wallet);
+        }
+        hashes[usize::from(depth)]
+    })
+}
+
+fn empty_index_hashes(wallet: DepositWalletId) -> [[u8; 32]; 65] {
+    let mut hashes = [[0; 32]; 65];
     let mut hasher = blake3::Hasher::new_derive_key(INDEX_EMPTY_LEAF_DOMAIN);
     hasher.update(&COMPACT_REGISTRY_INDEX_DEPTH.to_le_bytes());
     hasher.update(&wallet.0);
     let mut hash = *hasher.finalize().as_bytes();
-    for branch_depth in (depth..COMPACT_REGISTRY_INDEX_DEPTH).rev() {
+    hashes[usize::from(COMPACT_REGISTRY_INDEX_DEPTH)] = hash;
+    for branch_depth in (0..COMPACT_REGISTRY_INDEX_DEPTH).rev() {
         let mut branch = blake3::Hasher::new_derive_key(INDEX_EMPTY_BRANCH_DOMAIN);
         branch.update(&branch_depth.to_le_bytes());
         branch.update(&wallet.0);
         branch.update(&hash);
         branch.update(&hash);
         hash = *branch.finalize().as_bytes();
+        hashes[usize::from(branch_depth)] = hash;
     }
-    hash
+    hashes
 }
 
 #[must_use]
@@ -1180,6 +1341,8 @@ pub enum CompactRegistryError {
     Committee(#[from] CommitteeError),
     #[error("identity error: {0}")]
     Identity(#[from] IdentityError),
+    #[error("deposit state export error: {0}")]
+    StateExport(#[from] DepositStateExportError),
     #[error("registry id is malformed")]
     InvalidRegistryId,
     #[error("registry link is malformed")]
@@ -1198,6 +1361,14 @@ pub enum CompactRegistryError {
     InvalidHandoffStatement,
     #[error("handoff certificate is malformed")]
     InvalidHandoffCertificate,
+    #[error("handoff certificate serialization failed")]
+    Serialization,
+    #[error("handoff certificate exceeds its allocation bound")]
+    HandoffCertificateTooLarge,
+    #[error("handoff certificate encoding has trailing bytes")]
+    TrailingBytes,
+    #[error("handoff certificate encoding is not canonical")]
+    NonCanonicalEncoding,
     #[error("handoff target does not match the supplied target activation")]
     WrongHandoffTarget,
     #[error("compact registry is not bound to the supplied certified activation authority")]
@@ -1216,10 +1387,37 @@ pub enum CompactRegistryError {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn cached_empty_hashes_match_the_wire_hashes_across_wallet_changes() {
+        use super::*;
+        for wallet in [DepositWalletId([1; 32]), DepositWalletId([2; 32]), DepositWalletId([1; 32])]
+        {
+            for depth in 0..=COMPACT_REGISTRY_INDEX_DEPTH {
+                let mut leaf = blake3::Hasher::new_derive_key(INDEX_EMPTY_LEAF_DOMAIN);
+                leaf.update(&COMPACT_REGISTRY_INDEX_DEPTH.to_le_bytes());
+                leaf.update(&wallet.0);
+                let mut expected = *leaf.finalize().as_bytes();
+                for branch_depth in (depth..COMPACT_REGISTRY_INDEX_DEPTH).rev() {
+                    let mut branch = blake3::Hasher::new_derive_key(INDEX_EMPTY_BRANCH_DOMAIN);
+                    branch.update(&branch_depth.to_le_bytes());
+                    branch.update(&wallet.0);
+                    branch.update(&expected);
+                    branch.update(&expected);
+                    expected = *branch.finalize().as_bytes();
+                }
+                assert_eq!(compact_registry_empty_index_hash_at(wallet, depth), expected);
+                assert_eq!(compact_registry_empty_index_hash_at(wallet, depth), expected);
+            }
+        }
+    }
+
     use super::*;
     use crate::{
         committee::{Member, PartyId},
+        deposit_index::{DEPOSIT_INDEX_ARTIFACT_KIND, DepositIndexHead, DepositIndexObjectId},
+        deposit_index_checkpoint::PortableDepositIndexHead,
         identity::Identity,
+        storage::{WalletArtifactRef, WalletId},
     };
 
     fn test_x25519_secret(party: PartyId, epoch: u64) -> [u8; 32] {
@@ -1304,13 +1502,35 @@ mod tests {
         source: &CompactEpochRegistry,
         target: &VerifiedRegistryHandoffTarget,
     ) -> RegistryHandoffStatement {
-        RegistryHandoffStatement::new(
-            source,
-            10,
+        let next_index = DepositSubaddressIndex::new(0, 9).unwrap();
+        let source_state = handoff_source_state(source.wallet(), next_index);
+        RegistryHandoffStatement::new(source, 10, [11_u8; 32], source_state, target, next_index)
+            .unwrap()
+    }
+
+    fn handoff_source_state(
+        wallet: DepositWalletId,
+        next_index: DepositSubaddressIndex,
+    ) -> DepositHandoffStateBinding {
+        let reference = WalletArtifactRef::for_contents(
+            WalletId(wallet.0),
+            DEPOSIT_INDEX_ARTIFACT_KIND,
+            b"compact-registry-handoff-test-root",
+        )
+        .unwrap();
+        let portable = DepositIndexHead::from_portable_components(
+            wallet,
+            1,
+            1,
+            Some(DepositIndexObjectId::from_storage_reference(reference).unwrap()),
+            9,
             [11_u8; 32],
-            [13_u8; 32],
-            target,
-            DepositSubaddressIndex::new(0, 9).unwrap(),
+            next_index,
+        )
+        .unwrap();
+        DepositHandoffStateBinding::new(
+            Some([13_u8; 32]),
+            PortableDepositIndexHead::from_head(&portable).unwrap(),
         )
         .unwrap()
     }
@@ -1391,6 +1611,16 @@ mod tests {
         assert!(certificate.verify(&other_wallet).is_err());
         assert!(certificate.verify(&index_fork).is_err());
         assert!(certificate.verify(&fork).is_err());
+        assert!(RegistryLink::successor(&source, &target, &certificate).is_ok());
+        for invalid_source in [&other_wallet, &index_fork, &fork] {
+            assert!(RegistryLink::successor(invalid_source, &target, &certificate).is_err());
+        }
+        let mut invalid_signature = certificate.clone();
+        invalid_signature.witnesses[0].signature[0] ^= 1;
+        assert!(RegistryLink::successor(&source, &target, &invalid_signature).is_err());
+        let mut missing_witness = certificate;
+        missing_witness.witnesses.pop();
+        assert!(RegistryLink::successor(&source, &target, &missing_witness).is_err());
     }
 
     #[test]
@@ -1399,15 +1629,17 @@ mod tests {
         let source_committee = committee(0, &source_identities);
         let (_, source) = genesis(DepositWalletId([1_u8; 32]), source_committee);
         let target = target(DepositWalletId([1_u8; 32]), committee(1, &identities(1)), [12_u8; 32]);
+        let next_index = DepositSubaddressIndex::new(0, 9).unwrap();
+        let source_state = handoff_source_state(source.wallet(), next_index);
 
         assert!(matches!(
             RegistryHandoffStatement::new(
                 &source,
                 u64::MAX,
                 [11_u8; 32],
-                [13_u8; 32],
+                source_state,
                 &target,
-                DepositSubaddressIndex::new(0, 9).unwrap(),
+                next_index,
             ),
             Err(CompactRegistryError::Overflow)
         ));

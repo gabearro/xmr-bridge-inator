@@ -53,7 +53,7 @@ pub trait ProvidesUnvalidatedBlockchain: Sync + ProvidesBlockchainMeta {
     number: usize,
   ) -> impl Send + Future<Output = Result<Block, InterfaceError>> {
     async move {
-      let mut blocks = self.contiguous_blocks(number ..= number).await?;
+      let mut blocks = self.contiguous_blocks(number..=number).await?;
       if blocks.len() != 1 {
         Err(InterfaceError::InternalError(format!(
           "`{}` returned {} blocks, expected {}",

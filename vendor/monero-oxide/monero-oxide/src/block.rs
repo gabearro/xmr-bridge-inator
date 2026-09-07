@@ -41,11 +41,11 @@ pub struct BlockHeader {
 impl BlockHeader {
   /// The upper bound for a block header's size.
   pub const SIZE_UPPER_BOUND: UpperBound<usize> = UpperBound(
-    <u8 as VarInt>::UPPER_BOUND +
-      <u8 as VarInt>::UPPER_BOUND +
-      <u64 as VarInt>::UPPER_BOUND +
-      32 +
-      4,
+    <u8 as VarInt>::UPPER_BOUND
+      + <u8 as VarInt>::UPPER_BOUND
+      + <u64 as VarInt>::UPPER_BOUND
+      + 32
+      + 4,
   );
 
   /// Write the BlockHeader.
@@ -231,7 +231,7 @@ impl Block {
     if transactions >= Self::MAX_TRANSACTIONS {
       Err(io::Error::other("amount of transaction exceeds limit"))?;
     }
-    let transactions = (0 .. transactions).map(|_| read_bytes(r)).collect::<Result<_, _>>()?;
+    let transactions = (0..transactions).map(|_| read_bytes(r)).collect::<Result<_, _>>()?;
 
     Block::new(header, miner_transaction, transactions)
       .ok_or_else(|| io::Error::other("block failed sanity checks"))

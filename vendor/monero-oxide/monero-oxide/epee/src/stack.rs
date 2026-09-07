@@ -52,7 +52,7 @@ impl PackedTypes {
       10 => TypeOrEntry::Type(Type::String),
       11 => TypeOrEntry::Type(Type::Bool),
       12 => TypeOrEntry::Type(Type::Object),
-      13 ..= 15 => panic!("`PackedTypes` was written to with a non-existent `TypeOrEntry`"),
+      13..=15 => panic!("`PackedTypes` was written to with a non-existent `TypeOrEntry`"),
       _ => unreachable!("masked by 0b1111"),
     }
   }

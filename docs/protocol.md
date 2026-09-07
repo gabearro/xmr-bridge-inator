@@ -1,8 +1,8 @@
 # Protocol architecture
 
 This document describes the current clean-state protocol. Threshold Monero is experimental,
-unaudited research software. The current source has not demonstrated acceptance on public Monero
-testnet or mainnet, and mainnet party mode is disabled.
+unaudited research software. Private Regtest is the sole release-acceptance target. Public
+testnet/mainnet deployment and evidence are outside scope, and mainnet party mode is disabled.
 
 ## One persistent party
 
@@ -23,12 +23,12 @@ process is stopped. A completed one-shot acceptance client does not stop the par
 
 ## Configuration and identities
 
-The scenario fixes the Monero network, stable party signing identities, one public bootstrap
-X25519 key per party, committee policy, Byzantine fault bounds, refresh interval, deposit birth
-checkpoint, fee ceiling, and QUIC trust roots. The signing seed and bootstrap X25519 secret are
-independent inputs: the stable seed derives only Ed25519, never a receiver key. Each message is
-checked against locally reconstructed configuration. Peer-supplied context is never accepted as a
-replacement for local trusted context.
+The scenario fixes the Monero network, stable party signing identities, one public genesis
+bootstrap X25519 key per party, configured committee shapes and eligible successor rosters,
+Byzantine fault bounds, refresh interval, deposit birth checkpoint, fee ceiling, and QUIC trust
+roots. The signing seed and bootstrap X25519 secret are independent inputs: the stable seed derives
+only Ed25519, never a receiver key. Each message is checked against locally reconstructed
+configuration. Peer-supplied context is never accepted as a replacement for local trusted context.
 
 QUIC authenticates both endpoints. Inner Ed25519 envelopes provide portable origin attribution for
 consensus votes and consolidation contributions that may be relayed by another party. Canonical
@@ -81,10 +81,13 @@ epoch-zero key generation because the constant is constrained to the existing di
 The new verification-share polynomial must differ from the predecessor while the group public key
 and key identifier remain unchanged. Messages, commitments, shares, certificates, and signing
 sessions are bound to their exact epoch and transition. Evaluations from two refresh epochs are
-points on different polynomials; combining an earlier share with later shares is not a valid
-interpolation set and does not recover the common constant. Proactive security additionally assumes
-fewer than the threshold shares are exposed in every epoch and that retired secret material cannot
-be recovered after erasure.
+points on different polynomials, and the protocol never accepts a mixed-epoch set for signing or
+interpolation. Under independently randomized refresh polynomials, a collection containing fewer
+than the threshold number of evaluations from each epoch does not determine the common constant;
+interpolating mixed points as though they shared one polynomial matches it only with negligible
+collision probability. Any threshold subset from one epoch reconstructs it by design. Proactive
+security additionally assumes fewer than the threshold shares are exposed in every epoch and that
+retired secret material cannot be recovered after erasure.
 
 ### Persistent fixed-interval refresh
 
@@ -93,32 +96,50 @@ deadline is stored with the active epoch and survives restart. When it becomes d
 dealers autonomously begin the immediate successor transition; no client needs to keep scheduling
 refreshes.
 
+Because every successful refresh permanently commits a fresh receiver-key generation, ordinary
+deployments enforce a minimum interval of one hour. Shorter intervals are accepted only when both
+`demo_only` and private Regtest are selected, which keeps accelerated lifecycle tests available
+without permitting an accidental unbounded production storage rate.
+
 Every configured successor first runs receiver-key rotation, including committee growth, shrink,
-and same-membership refresh. The trusted scenario supplies only the target shape and each party's
-bootstrap baseline; it does not precompute future receiver secrets. Overlap members use the exact
-certified source key as their omission baseline, while a joining member uses its separately
-provisioned bootstrap key. A configured party may join once and later leave, but cannot rejoin
-under that retired bootstrap identity; re-admission is represented by newly provisioned party
-identity material.
+and fixed-size/fixed-threshold refresh-or-reshare. The trusted scenario supplies the target
+threshold and `desired_n` through `members`, plus a canonical `eligible_members` authentication
+roster containing at least `desired_n + f_target` stable identities. Governance asserts that at
+most `f_target` identities in the whole eligible roster are Byzantine; applying the bound only
+after selection would not make arbitrary eligible substitution safe. If the certificate selects
+the same identities, the successor uses the true zero-constant refresh branch described above;
+eligible substitution uses resharing. The scenario does not precompute any successor receiver
+secret. Bootstrap X25519 material is authoritative only for epoch zero.
 
-When a ceremony begins, every responsive target member independently generates its successor
+When a ceremony begins, every responsive eligible identity independently generates its successor
 X25519 secret, persists it, reads back the authenticated record, and only then signs an
-advertisement. Joining members send their advertisements to the source committee even though they
-cannot vote in that source epoch. The source committee certifies a deterministic selection
-containing target `n-f` advertisements using a source `n-f` Byzantine certificate. At most target
-`f` omitted members use the target policy's exact baseline for that transition. A target-only
-member can ingest the certificate and join the subsequent AVSS.
+advertisement. Eligible identities outside the source committee send their advertisements to the
+source committee even though they cannot vote in that source epoch. The source committee uses a
+source `n-f` Byzantine certificate to choose a set containing exactly `desired_n` advertisements.
+Ordinarily a value must retain the maximum possible source overlap `P`. Only after the persisted
+policy window expires may source parties sign a view-independent fallback statement; an exact
+canonical `n_source-f_source` bundle permits the verifier-computed lower overlap `R`, while values
+below `R`, early/partial bundles, and gratuitous bundles at `P` are invalid. The fallback deadline
+and signed-vote outbox survive restart. Peer ingress stores votes but cannot make the local party
+sign one.
 
-The certified public selection is the sole input to successor AVSS. An advertised party must load
-the exact persisted fresh secret; an omitted overlap party may relabel its source secret only after
-certification; and an omitted joining party may activate its matching bootstrap secret only after
-certification. Superseded private receiver keys are erased after certified cutover. Consequently,
-a seed or static scenario file cannot reconstruct historical or future epoch receiver secrets.
+The successor committee is constructed solely from those fresh advertised keys; an omitted
+candidate is erased and receives no successor share. The policy cumulatively binds all configured
+bootstrap and previously certified receiver keys, so none can be advertised again. A target-only
+selected member can ingest and verify the certificate, including any fallback bundle, and join the
+subsequent AVSS without source voting authority.
 
-After the configured chain ends, parties construct the next same-membership, same-threshold target
-policy dynamically and run the same rotation protocol. The new AVSS sharing is still fresh even
-for an omitted receiver key, but mobile-adversary deployments should rotate and erase every
-receiver key as soon as the party is responsive.
+The certified public selection is the sole input to successor AVSS. Every selected party must load
+the exact persisted fresh secret. Superseded private receiver keys are erased after certified
+cutover, so a stable seed or static scenario file cannot reconstruct historical or future epoch
+receiver secrets. A party that left or was omitted may be re-admitted under the same stable
+identity in a later epoch only if it is eligible, generates and advertises another fresh key, and
+is included in that epoch's exact certified selection.
+
+After the configured chain ends, parties construct a same-threshold policy dynamically. All stable
+scenario identities form its eligible roster, while `desired_n` remains the active committee size.
+The same fresh-advertisement selection permits a responsive eligible identity to replace an omitted
+member without carrying any receiver key between epochs.
 
 After the successor activates, its own interval is armed. Thus a live network continues producing
 fresh epochs until explicitly stopped or until it fails closed on missing quorum, corrupt state,
@@ -128,12 +149,27 @@ capacity limits, or exhausted counters.
 
 AVSS completion alone does not select the sharing. Parties propose certified dealer entries to a
 bounded, rotating-view Byzantine reducer. Signed votes, timers, locks, decisions, and outbound
-effects are persisted. After eventual synchrony, a silent proposer can be bypassed by a later view.
+effects are persisted. Once the complete honest-leader proposal, admission, vote, delivery,
+reducer, and durable-storage pipeline finishes before the deadline capped at
+`64 * protocol_timeout_seconds`, a silent proposer can be bypassed by a later view.
 
 The selected share is staged first. It becomes active only after `n-f` matching activation
 acknowledgements bind the transition, transcript, public epoch, and activation digest. Cutover
-leases prevent signing and share retirement from crossing an unresolved epoch boundary. The old
-share is retired only after successor-bound obligations and deposit handoff are durably closed.
+leases prevent signing and share retirement from crossing an unresolved epoch boundary. Ordinarily
+the old share remains until successor-bound signing obligations and the old deposit registry are
+durably closed. Under the deposit-genesis publication fence, authenticated absence of any local
+deposit snapshot may instead authorize immediate retirement; this prevents a never-initialized
+deposit service from pinning obsolete threshold and X25519 material indefinitely.
+
+That absence decision does not assume a delayed canonical deposit genesis can never appear. If one
+does appear after retirement, the stable Ed25519 seed may derive a non-serializable
+`RecoveryAndFenceOnly` capability bound to the exact certified transition, source committee, target
+committee, activation, registry root, and fault bound. Its durable reducer policy permits only exact
+quorum-backed pre-pin ledger recovery, independently certified ledger or observation checkpoints,
+and the host-validated `HandoffFence`. It cannot originate a client request, raw observation,
+consolidation, state export, or final `Handoff`. Installing the exact portable Fence revokes this
+recovery authority; a separate committee-bound `HandoffOnly` capability may then attest only the
+final Handoff. Neither stable capability reconstructs an erased threshold share or X25519 secret.
 
 ## Deposit ledger
 
@@ -155,6 +191,11 @@ witnesses discarded, so attestations from different epochs cannot be combined. A
 import a ledger tip whose latest archive operation is an observation; pending observations are
 consumed only when the imported portable record is the same semantic output fact, and otherwise
 survive only when their exact allocation was imported.
+
+That portable deposit-state import does not yet transfer authenticated ROAST archive history and
+abandoned-family watch state. The current stable scope therefore requires at least one retained
+old-committee member for ROAST late settlement across handoff. Fully disjoint successor support is
+tracked in [TODO.md](../TODO.md).
 
 Every party scans from the configured wallet birth checkpoint with the common private view scalar.
 Scanner state handles confirmation depth, maturity, reorg rollback, exact output identity, and a
@@ -220,12 +261,15 @@ custody, and verified erasure of retired shares and encryption keys.
 ## Known boundaries
 
 - The code and protocol have not been independently audited.
-- Public-testnet and mainnet transaction acceptance is not established by the current source.
+- Public-testnet and mainnet operation is outside this implementation's acceptance scope; the
+  current source makes no public-network acceptance claim.
 - Parties share one private view key. Each party has a distinct daemon route, but the combined
   signer/observer fault budget remains an important Byzantine-trust boundary.
 - QUIC demo certificates, signing seeds, bootstrap X25519 secrets, bearer tokens, and view
   material are public fixtures.
-- Partial synchrony is assumed for liveness; safety must not depend on timeouts.
+- Liveness assumes the complete post-stabilization honest-leader proposal, admission, vote,
+  delivery, reducer, and durable-storage pipeline finishes before the deadline capped at
+  `64 * protocol_timeout_seconds`; safety must not depend on timeouts.
 - Resource bounds can deliberately halt progress rather than permit unbounded state growth.
 - Proactive security requires non-recoverable retirement, which software on a rollbackable host
   cannot prove by itself.

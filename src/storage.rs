@@ -25,11 +25,6 @@ use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 use crate::{
     committee::{PartyId, SessionId},
-    consolidation_consensus::{
-        AttemptSafetyKey, ConsolidationAttemptSafety, ConsolidationConsensusError,
-        ConsolidationIntent, ConsolidationIntentCertificate,
-    },
-    deposit_consensus::ConsensusContext,
     deposit_wallet::{DepositWalletId, SweepId, derive_sweep_signing_session},
     identity::{EpochEncryptionSecret, Identity, IdentityError, PersistedKeyAdvertisementIdentity},
     key_rotation::{
@@ -40,45 +35,86 @@ use crate::{
 };
 
 const SHARE_RECORD_VERSION: u16 = 2;
-const PROTOCOL_STORE_VERSION: u16 = 1;
+const PROTOCOL_STORE_VERSION: u16 = 2;
 const WALLET_SNAPSHOT_STORE_VERSION: u16 = 1;
 const WALLET_ARTIFACT_STORE_VERSION: u16 = 2;
 const WALLET_ARTIFACT_RESERVATION_VERSION: u16 = 1;
-const PROTOCOL_DIRECTORY: &str = "protocol-v1";
+const PROTOCOL_DIRECTORY: &str = "protocol-v2";
 const WALLET_SNAPSHOT_DIRECTORY: &str = "wallet-snapshots-v1";
 const WALLET_ARTIFACT_DIRECTORY: &str = "wallet-artifacts-v2";
 const PARTY_STATE_LEASE_FILE_PREFIX: &str = ".party-state-";
 const PARTY_STATE_LEASE_FILE_SUFFIX: &str = ".lock";
+const SESSION_NAMESPACE_LOCK_FILE: &str = ".session-namespace.lock";
 const SESSION_STATE_DIRECTORY: &str = "sessions";
 const TOMBSTONE_DIRECTORY: &str = "tombstones";
 const ACTIVATION_DIRECTORY: &str = "activations";
 const ACTIVATION_INDEX_DIRECTORY: &str = "activation-indexes";
 const KEY_ROTATION_ROUND_DIRECTORY: &str = "key-rotation-rounds";
 const KEY_ROTATION_CERTIFICATE_DIRECTORY: &str = "key-rotation-certificates";
-const CONSOLIDATION_ATTEMPT_SAFETY_DIRECTORY: &str = "consolidation-attempt-safety";
 const SWEEP_SIGNING_HIGH_WATER_DIRECTORY: &str = "sweep-signing-high-water";
 const DEPOSIT_INDEX_JOURNAL_DIRECTORY: &str = "deposit-index-journals";
+const DEPOSIT_SYNC_SPOOL_HEAD_DIRECTORY: &str = "deposit-sync-spool-heads-v1";
+const DEPOSIT_STATE_TRANSFER_INTENTS_FILE: &str = "deposit-state-transfer-intents-v1";
 const EPOCH_IDENTITY_DIRECTORY: &str = "epoch-identities";
 const REFRESH_SCHEDULE_FILE: &str = "proactive-refresh-schedule";
 const RETIRED_DIRECTORY: &str = "retired";
 const ACTIVATION_INDEX_VERSION: u16 = 1;
-const KEY_ROTATION_SNAPSHOT_VERSION: u16 = 1;
-const CONSOLIDATION_ATTEMPT_SAFETY_SNAPSHOT_VERSION: u16 = 1;
-const EPOCH_IDENTITY_RECORD_VERSION: u16 = 1;
+const KEY_ROTATION_SNAPSHOT_VERSION: u16 = 2;
+const EPOCH_IDENTITY_RECORD_VERSION: u16 = 2;
 const SWEEP_SIGNING_HIGH_WATER_VERSION: u16 = 1;
-const EPOCH_IDENTITY_CERTIFICATION_VERSION: u16 = 2;
+const EPOCH_IDENTITY_CERTIFICATION_VERSION: u16 = 3;
+const DEPOSIT_SYNC_SPOOL_HEAD_SNAPSHOT_VERSION: u16 = 1;
+const DEPOSIT_STATE_TRANSFER_INTENTS_SNAPSHOT_VERSION: u16 = 1;
 const AEAD_TAG_BYTES: usize = 16;
 const MAX_RECORD_OVERHEAD_BYTES: usize = 1024;
 const MAX_SHARE_FILE_BYTES: usize = 16 * 1024 * 1024;
 const KEY_ROTATION_SNAPSHOT_HEADER_BYTES: usize = 1 + 2 + 8 + 32 + 32 + 8;
 const MAX_KEY_ROTATION_SNAPSHOT_BYTES: usize =
     MAX_KEY_ROTATION_ROUND_STATE_BYTES + KEY_ROTATION_SNAPSHOT_HEADER_BYTES;
-const CONSOLIDATION_ATTEMPT_SAFETY_SNAPSHOT_HEADER_BYTES: usize = 1 + 2 + 8 + 32 + 32 + 8;
-const MAX_EPOCH_IDENTITY_RECORD_BYTES: usize = 256;
+const DEPOSIT_SYNC_SPOOL_HEAD_SNAPSHOT_HEADER_BYTES: usize = 2 + 8 + 32 + 32 + 8;
+const MAX_DEPOSIT_SYNC_SPOOL_HEAD_SNAPSHOT_BYTES: usize =
+    MAX_DEPOSIT_SYNC_SPOOL_HEAD_BYTES + DEPOSIT_SYNC_SPOOL_HEAD_SNAPSHOT_HEADER_BYTES;
+const DEPOSIT_STATE_TRANSFER_INTENTS_SNAPSHOT_HEADER_BYTES: usize = 2 + 8 + 32 + 32 + 8;
+const MAX_DEPOSIT_STATE_TRANSFER_INTENTS_SNAPSHOT_BYTES: usize =
+    MAX_DEPOSIT_STATE_TRANSFER_INTENTS_BYTES + DEPOSIT_STATE_TRANSFER_INTENTS_SNAPSHOT_HEADER_BYTES;
+const MAX_EPOCH_IDENTITY_RECORD_BYTES: usize = 320;
 const MAX_SWEEP_SIGNING_HIGH_WATER_BYTES: usize = 256;
 
 /// Hard bound on one decrypted durable state-machine snapshot.
 pub const MAX_SESSION_STATE_BYTES: usize = 8 * 1024 * 1024;
+/// Maximum number of uncertified AVSS reducers admitted by the live protocol.
+///
+/// `server` must use this same exported value for live admission.
+pub const MAX_LIVE_AVSS_RUNS: usize = 64;
+/// Number of authenticated epoch-history entries retained in the hot suffix.
+///
+/// `server` must use this same exported value when it constructs the epoch-history reducer.
+pub const EPOCH_HISTORY_HOT_ENTRIES: u16 = 64;
+/// The current epoch and its in-flight successor can both sit beyond the compact hot suffix.
+pub const EPOCH_HISTORY_CURRENT_SUFFIX_RECORDS: usize = 2;
+/// Maximum number of certificate-finalized AVSS reducers which may still be draining.
+pub const MAX_CURRENT_EPOCH_RECORDS: usize =
+    match (EPOCH_HISTORY_HOT_ENTRIES as usize).checked_add(EPOCH_HISTORY_CURRENT_SUFFIX_RECORDS) {
+        Some(maximum) => maximum,
+        None => panic!("current epoch record bound overflowed"),
+    };
+/// Fixed opaque records used by the consolidation, consolidation-bootstrap, protocol-fault,
+/// driver-latch, and deposit-checkpoint acceptance gates.
+pub const MAX_FIXED_SESSION_STATE_RECORDS: usize = 5;
+/// Maximum legitimate number of active encrypted records in the session-state directory.
+///
+/// The three terms are disjoint: uncertified live AVSS reducers, certificate-finalized reducers
+/// retained by the bounded hot-history suffix while their outboxes drain, and fixed acceptance
+/// records. Checked construction makes additions to any protocol class fail at compile time on
+/// overflow instead of silently weakening the traversal bound.
+pub const MAX_SESSION_STATE_RECORDS: usize =
+    match MAX_LIVE_AVSS_RUNS.checked_add(MAX_CURRENT_EPOCH_RECORDS) {
+        Some(maximum) => match maximum.checked_add(MAX_FIXED_SESSION_STATE_RECORDS) {
+            Some(maximum) => maximum,
+            None => panic!("session state record bound overflowed"),
+        },
+        None => panic!("session state record bound overflowed"),
+    };
 /// Hard bound on the purpose attached to a permanent session tombstone.
 pub const MAX_SESSION_TOMBSTONE_PURPOSE_BYTES: usize = 1024;
 /// Hard bound on one durable epoch-activation certificate.
@@ -87,11 +123,6 @@ pub const MAX_ACTIVATION_CERTIFICATE_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_ACTIVATION_INDEX_BYTES: usize = 128;
 /// Hard bound on the authenticated proactive-refresh pacemaker record.
 pub const MAX_REFRESH_SCHEDULE_BYTES: usize = 1024;
-/// Hard bound on one canonical consolidation-attempt safety state.
-pub const MAX_CONSOLIDATION_ATTEMPT_SAFETY_STATE_BYTES: usize = 256 * 1024;
-const MAX_CONSOLIDATION_ATTEMPT_SAFETY_SNAPSHOT_BYTES: usize =
-    MAX_CONSOLIDATION_ATTEMPT_SAFETY_STATE_BYTES
-        + CONSOLIDATION_ATTEMPT_SAFETY_SNAPSHOT_HEADER_BYTES;
 /// Hard bound on one decrypted wallet/deposit state snapshot.
 ///
 /// This intentionally matches the deposit reducer's maximum canonical postcard encoding.
@@ -105,6 +136,19 @@ const MAX_WALLET_ARTIFACT_RESERVATION_BYTES: usize = 4 * 1024;
 const MAX_TEMPORARY_REPLACEMENTS_PER_DESTINATION: usize = 64;
 /// Hard bound on one exact staged deposit-index transition journal.
 pub const MAX_DEPOSIT_INDEX_JOURNAL_BYTES: usize = 16 * 1024 * 1024;
+/// Hard bound on one canonical durable deposit-sync spool head.
+///
+/// Object plaintext and immutable page metadata live outside this compact CAS record, so this is
+/// a per-head bound rather than a lifetime candidate-size limit.
+/// The authenticated spool head may carry a worst-case 2 MiB traversal/verifier cursor plus
+/// fixed-size committee claims, release intents, and one bounded page journal.
+pub const MAX_DEPOSIT_SYNC_SPOOL_HEAD_BYTES: usize = 3 * 1024 * 1024;
+/// Hard bound on the opaque durable QUIC state-transfer intent snapshot.
+///
+/// The runtime admits at most one exact intent per configured remote recipient. Its own decoder
+/// applies that semantic count bound; this storage boundary independently caps ciphertext,
+/// decrypted allocation, and authenticated readback.
+pub const MAX_DEPOSIT_STATE_TRANSFER_INTENTS_BYTES: usize = 128 * 1024;
 
 /// Stable application-defined identifier for one threshold wallet.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
@@ -138,6 +182,59 @@ impl DepositIndexJournalKey {
         }
         Ok(())
     }
+}
+
+/// Fixed, restart-derivable key for one candidate namespace's non-authoritative spool head.
+///
+/// The network binding prevents a candidate downloaded under one QUIC trust domain from being
+/// opened under another. The caller supplies an exact advertisement-bound namespace, within which
+/// there is one derivable record path per `(network_id, wallet_id)` pair. Recovery never derives a
+/// filename from peer-controlled bytes.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+pub struct DepositSyncSpoolHeadKey {
+    pub network_id: [u8; 32],
+    pub wallet_id: DepositWalletId,
+}
+
+impl DepositSyncSpoolHeadKey {
+    pub fn validate(self) -> Result<(), StoreError> {
+        if self.network_id == [0_u8; 32] || self.wallet_id.0 == [0_u8; 32] {
+            return Err(StoreError::InvalidDepositSyncSpoolHeadKey);
+        }
+        Ok(())
+    }
+}
+
+/// Authenticated position in one compact spool head's revision/hash chain.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DepositSyncSpoolHeadMetadata {
+    pub key: DepositSyncSpoolHeadKey,
+    pub revision: u64,
+    pub previous_snapshot_hash: [u8; 32],
+    pub snapshot_hash: [u8; 32],
+}
+
+/// One authenticated opaque deposit-sync spool head and its durable CAS position.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DepositSyncSpoolHeadBlob {
+    pub metadata: DepositSyncSpoolHeadMetadata,
+    pub state: ProtocolBlob,
+}
+
+/// Authenticated position in the fixed network-bound state-transfer intent hash chain.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DepositStateTransferIntentsMetadata {
+    pub network_id: [u8; 32],
+    pub revision: u64,
+    pub previous_snapshot_hash: [u8; 32],
+    pub snapshot_hash: [u8; 32],
+}
+
+/// One authenticated opaque state-transfer intent snapshot and its durable CAS position.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DepositStateTransferIntentsBlob {
+    pub metadata: DepositStateTransferIntentsMetadata,
+    pub state: ProtocolBlob,
 }
 
 /// Authenticated position in a wallet snapshot's revision/hash chain.
@@ -561,15 +658,16 @@ struct ProtocolMutationState {
     /// rollback fence used by wallet snapshots; complete-volume rollback after restart still
     /// requires an external monotonic anchor.
     key_rotation_heads: BTreeMap<KeyRotationRoundKey, KeyRotationRoundMetadata>,
-    /// Highest authenticated consolidation safety head observed by this process. As with the
-    /// other local rollback fences, a complete volume rollback across process restart requires an
-    /// external monotonic anchor.
-    consolidation_attempt_safety_heads:
-        BTreeMap<AttemptSafetyKey, ConsolidationAttemptSafetyMetadata>,
     /// Highest authenticated per-sweep nonce attempt observed by this process. This detects file
     /// deletion, rollback and same-attempt forks while running; complete-volume rollback after a
     /// restart still requires the deployment's external monotonic anchor.
     sweep_signing_high_waters: BTreeMap<(DepositWalletId, SweepId), SweepSigningHighWater>,
+    /// Highest authenticated deposit-sync spool head observed by this process. A successful exact
+    /// destruction removes this entry so the same candidate namespace can start a fresh chain.
+    deposit_sync_spool_heads: BTreeMap<DepositSyncSpoolHeadKey, DepositSyncSpoolHeadMetadata>,
+    /// Highest authenticated fixed state-transfer-intent head observed for each transport trust
+    /// domain. Intent snapshots are never deleted, including when their opaque state is empty.
+    deposit_state_transfer_intents: BTreeMap<[u8; 32], DepositStateTransferIntentsMetadata>,
     retired_epoch_identities: BTreeMap<u64, EpochIdentityRetirement>,
 }
 
@@ -630,6 +728,18 @@ impl Drop for WalletArtifactNamespaceLock {
     }
 }
 
+/// Cross-instance serialization for check-then-mutate operations in the session namespace.
+///
+/// `ProtocolStore`'s Tokio mutex protects one handle. This permanent advisory lock also protects
+/// independently constructed handles and processes which correctly use the storage API.
+struct SessionNamespaceLock(std::fs::File);
+
+impl Drop for SessionNamespaceLock {
+    fn drop(&mut self) {
+        let _ = self.0.unlock();
+    }
+}
+
 impl std::fmt::Debug for WalletArtifactStore {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
@@ -655,6 +765,17 @@ impl std::fmt::Debug for WalletSnapshotStore {
 pub struct SessionStateKey {
     pub session: SessionId,
     pub context_digest: [u8; 32],
+}
+
+/// One authenticated active session-state snapshot.
+///
+/// Restoration returns these bytes directly so callers never enumerate, authenticate, discard,
+/// and then reopen the same secret-bearing record.
+#[derive(Debug, Eq, PartialEq)]
+pub struct StoredSessionState {
+    pub session: SessionId,
+    pub context_digest: [u8; 32],
+    pub state: ProtocolBlob,
 }
 
 /// Stable lookup key for an epoch activation certificate.
@@ -697,50 +818,6 @@ pub struct StoredKeyRotationRound {
 enum OpenKeyRotationRound {
     Active(StoredKeyRotationRound),
     Retired([u8; 32]),
-}
-
-/// Authenticated position in one consolidation attempt's durable safety-state chain.
-///
-/// `closed` is part of the authenticated head. Once true, the exact terminal state remains as a
-/// permanent keyed marker and no later revision can be installed.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct ConsolidationAttemptSafetyMetadata {
-    pub key: AttemptSafetyKey,
-    pub revision: u64,
-    pub previous_snapshot_hash: [u8; 32],
-    pub snapshot_hash: [u8; 32],
-    pub closed: bool,
-}
-
-/// One decrypted, semantically validated consolidation-attempt safety record.
-///
-/// The canonical bytes are the exact bytes read back after authenticated decryption. They can be
-/// passed directly to a pending exposure/fence capability's readback gate.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct StoredConsolidationAttemptSafety {
-    pub metadata: ConsolidationAttemptSafetyMetadata,
-    pub state: ConsolidationAttemptSafety,
-    canonical_state: ProtocolBlob,
-}
-
-impl StoredConsolidationAttemptSafety {
-    /// Exact canonical state bytes recovered from durable authenticated storage.
-    #[must_use]
-    pub fn canonical_state(&self) -> &[u8] {
-        self.canonical_state.as_bytes()
-    }
-
-    /// Whether this exact terminal state has been converted to its permanent closure marker.
-    #[must_use]
-    pub const fn is_closed(&self) -> bool {
-        self.metadata.closed
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-struct ConsolidationAttemptSafetyFilenameKey {
-    session: SessionId,
-    attempt_digest: [u8; 32],
 }
 
 /// Permanent, authenticated evidence that one dynamic X25519 epoch secret was retired after an
@@ -980,10 +1057,6 @@ enum ProtocolRecordContext {
         epoch: u64,
         public_key: [u8; 32],
     },
-    ConsolidationAttemptSafety {
-        session: SessionId,
-        attempt_digest: [u8; 32],
-    },
     SweepSigningHighWater {
         wallet: DepositWalletId,
         sweep: SweepId,
@@ -993,6 +1066,13 @@ enum ProtocolRecordContext {
         scope: DepositIndexJournalScope,
         expected_revision: u64,
         expected_head_digest: [u8; 32],
+    },
+    DepositSyncSpoolHead {
+        network_id: [u8; 32],
+        wallet_id: DepositWalletId,
+    },
+    DepositStateTransferIntents {
+        network_id: [u8; 32],
     },
 }
 
@@ -1007,9 +1087,10 @@ impl ProtocolRecordContext {
             Self::KeyRotationRound { .. } => "key rotation round snapshot",
             Self::KeyRotationCertificate { .. } => "key rotation certificate",
             Self::EpochIdentity { .. } => "epoch identity record",
-            Self::ConsolidationAttemptSafety { .. } => "consolidation attempt safety snapshot",
             Self::SweepSigningHighWater { .. } => "sweep signing high-water",
             Self::DepositIndexJournal { .. } => "deposit index journal",
+            Self::DepositSyncSpoolHead { .. } => "deposit sync spool head snapshot",
+            Self::DepositStateTransferIntents { .. } => "deposit state-transfer intent snapshot",
         }
     }
 }
@@ -1072,6 +1153,9 @@ struct ActiveEpochIdentitySecret {
     epoch: u64,
     public_key: [u8; 32],
     secret: [u8; 32],
+    /// `None` is valid only for the externally provisioned epoch-zero identity. Every dynamic
+    /// candidate is bound to the exact current rotation context before it can be advertised.
+    candidate_context: Option<[u8; 32]>,
     certification: Option<EpochIdentityCertification>,
 }
 
@@ -1120,6 +1204,14 @@ pub(crate) struct ShareRetirement {
 }
 
 impl ShareRetirement {
+    pub(crate) const fn epoch(self) -> u64 {
+        self.epoch
+    }
+
+    pub(crate) const fn committee_digest(self) -> [u8; 32] {
+        self.committee_digest
+    }
+
     /// Construct storage authorization only at the server boundary which has already verified and
     /// durably persisted the successor activation certificate.
     pub(crate) fn for_certified_successor(
@@ -1252,8 +1344,6 @@ pub enum StoreError {
     InvalidShare(#[from] KeyError),
     #[error("persisted key-rotation state is invalid: {0}")]
     InvalidKeyRotation(#[from] KeyRotationError),
-    #[error("persisted consolidation-attempt safety state is invalid: {0}")]
-    InvalidConsolidationAttemptSafety(#[from] ConsolidationConsensusError),
     #[error("persisted dynamic identity is invalid: {0}")]
     InvalidIdentity(#[from] IdentityError),
     #[error("storage entry is not a regular file: {0}")]
@@ -1326,42 +1416,10 @@ pub enum StoreError {
         "key-rotation round {0:?} was permanently retired after its certificate became durable"
     )]
     KeyRotationRoundRetired(KeyRotationRoundKey),
-    #[error("consolidation attempt {key:?} must begin at revision zero, not {actual}")]
-    ConsolidationAttemptSafetyRevisionMustStartAtZero { key: AttemptSafetyKey, actual: u64 },
-    #[error(
-        "consolidation attempt {key:?} revision is not the next durable revision: expected {expected}, got {actual}"
-    )]
-    ConsolidationAttemptSafetyRevisionNotNext { key: AttemptSafetyKey, expected: u64, actual: u64 },
-    #[error(
-        "consolidation attempt {key:?} revision {revision} conflicts with durable safety state"
-    )]
-    ConsolidationAttemptSafetyRevisionConflict { key: AttemptSafetyKey, revision: u64 },
-    #[error("consolidation attempt {0:?} revision counter is exhausted")]
-    ConsolidationAttemptSafetyRevisionExhausted(AttemptSafetyKey),
-    #[error(
-        "consolidation attempt {key:?} rolled back in-process from revision {highest_seen} to {found}"
-    )]
-    ConsolidationAttemptSafetyRollbackDetected {
-        key: AttemptSafetyKey,
-        highest_seen: u64,
-        found: u64,
-    },
-    #[error(
-        "consolidation attempt {key:?} disappeared after revision {highest_seen} was authenticated"
-    )]
-    ConsolidationAttemptSafetySnapshotDisappeared { key: AttemptSafetyKey, highest_seen: u64 },
-    #[error("consolidation attempt {key:?} has a same-revision fork at revision {revision}")]
-    ConsolidationAttemptSafetyForkDetected { key: AttemptSafetyKey, revision: u64 },
-    #[error("consolidation attempt {key:?} hash chain is discontinuous at revision {revision}")]
-    ConsolidationAttemptSafetyHashChainMismatch { key: AttemptSafetyKey, revision: u64 },
-    #[error("consolidation attempt safety record belongs to another exact attempt")]
-    ConsolidationAttemptSafetyKeyMismatch,
-    #[error("consolidation attempt {0:?} is permanently closed")]
-    ConsolidationAttemptSafetyClosed(AttemptSafetyKey),
-    #[error("consolidation attempt {0:?} is not in a terminal safety phase")]
-    ConsolidationAttemptSafetyNotTerminal(AttemptSafetyKey),
     #[error("dynamic epoch identity {epoch} conflicts with the durable public key")]
     EpochIdentityConflict { epoch: u64 },
+    #[error("dynamic epoch identity {epoch} belongs to another or missing current rotation policy")]
+    EpochIdentityPolicyConflict { epoch: u64 },
     #[error("dynamic epoch identity {epoch} is certified by another key-rotation decision")]
     EpochIdentityCertificationConflict { epoch: u64 },
     #[error(
@@ -1414,6 +1472,74 @@ pub enum StoreError {
     InvalidDepositIndexJournalKey,
     #[error("deposit index journal conflicts with an existing exact-head transition")]
     DepositIndexJournalConflict(DepositIndexJournalKey),
+    #[error("deposit sync spool head key is invalid")]
+    InvalidDepositSyncSpoolHeadKey,
+    #[error("deposit sync spool head {0:?} revision counter is exhausted")]
+    DepositSyncSpoolHeadRevisionExhausted(DepositSyncSpoolHeadKey),
+    #[error(
+        "deposit sync spool head {key:?} durable head does not match expected revision {expected_revision}; found {actual_revision}"
+    )]
+    DepositSyncSpoolHeadMismatch {
+        key: DepositSyncSpoolHeadKey,
+        expected_revision: u64,
+        actual_revision: u64,
+    },
+    #[error("deposit sync spool head {key:?} revision {revision} conflicts with durable bytes")]
+    DepositSyncSpoolHeadRevisionConflict { key: DepositSyncSpoolHeadKey, revision: u64 },
+    #[error(
+        "deposit sync spool head {key:?} rolled back in-process from revision {highest_seen} to {found}"
+    )]
+    DepositSyncSpoolHeadRollbackDetected {
+        key: DepositSyncSpoolHeadKey,
+        highest_seen: u64,
+        found: u64,
+    },
+    #[error(
+        "deposit sync spool head {key:?} disappeared after revision {highest_seen} was authenticated"
+    )]
+    DepositSyncSpoolHeadDisappeared { key: DepositSyncSpoolHeadKey, highest_seen: u64 },
+    #[error("deposit sync spool head {key:?} has a same-revision fork at revision {revision}")]
+    DepositSyncSpoolHeadForkDetected { key: DepositSyncSpoolHeadKey, revision: u64 },
+    #[error("deposit sync spool head {key:?} hash chain is discontinuous at revision {revision}")]
+    DepositSyncSpoolHeadHashChainMismatch { key: DepositSyncSpoolHeadKey, revision: u64 },
+    #[error("deposit state-transfer intent network identifier is invalid")]
+    InvalidDepositStateTransferIntentsNetwork,
+    #[error(
+        "deposit state-transfer intent snapshot for network {network_id:?} exhausted its revision counter"
+    )]
+    DepositStateTransferIntentsRevisionExhausted { network_id: [u8; 32] },
+    #[error(
+        "deposit state-transfer intent snapshot for network {network_id:?} does not match expected revision {expected_revision}; found {actual_revision}"
+    )]
+    DepositStateTransferIntentsMismatch {
+        network_id: [u8; 32],
+        expected_revision: u64,
+        actual_revision: u64,
+    },
+    #[error(
+        "deposit state-transfer intent snapshot for network {network_id:?} revision {revision} conflicts with durable bytes"
+    )]
+    DepositStateTransferIntentsRevisionConflict { network_id: [u8; 32], revision: u64 },
+    #[error(
+        "deposit state-transfer intent snapshot for network {network_id:?} rolled back in-process from revision {highest_seen} to {found}"
+    )]
+    DepositStateTransferIntentsRollbackDetected {
+        network_id: [u8; 32],
+        highest_seen: u64,
+        found: u64,
+    },
+    #[error(
+        "deposit state-transfer intent snapshot for network {network_id:?} disappeared after revision {highest_seen} was authenticated"
+    )]
+    DepositStateTransferIntentsDisappeared { network_id: [u8; 32], highest_seen: u64 },
+    #[error(
+        "deposit state-transfer intent snapshot for network {network_id:?} has a same-revision fork at revision {revision}"
+    )]
+    DepositStateTransferIntentsForkDetected { network_id: [u8; 32], revision: u64 },
+    #[error(
+        "deposit state-transfer intent snapshot for network {network_id:?} has a discontinuous hash chain at revision {revision}"
+    )]
+    DepositStateTransferIntentsHashChainMismatch { network_id: [u8; 32], revision: u64 },
 }
 
 impl ShareStore {
@@ -1820,14 +1946,18 @@ impl ProtocolStore {
     }
 
     #[must_use]
-    pub fn consolidation_attempt_safety_path(&self, key: AttemptSafetyKey) -> PathBuf {
-        self.consolidation_attempt_safety_directory()
-            .join(consolidation_attempt_safety_filename(key))
+    pub fn deposit_index_journal_path(&self, key: DepositIndexJournalKey) -> PathBuf {
+        self.deposit_index_journal_directory().join(deposit_index_journal_filename(key))
     }
 
     #[must_use]
-    pub fn deposit_index_journal_path(&self, key: DepositIndexJournalKey) -> PathBuf {
-        self.deposit_index_journal_directory().join(deposit_index_journal_filename(key))
+    pub fn deposit_sync_spool_head_path(&self, key: DepositSyncSpoolHeadKey) -> PathBuf {
+        self.deposit_sync_spool_head_directory().join(deposit_sync_spool_head_filename(key))
+    }
+
+    #[must_use]
+    pub fn deposit_state_transfer_intents_path(&self) -> PathBuf {
+        self.directory.join(DEPOSIT_STATE_TRANSFER_INTENTS_FILE)
     }
 
     #[must_use]
@@ -1956,6 +2086,405 @@ impl ProtocolStore {
         }
         destroy_file_and_sync_parent(&path).await?;
         Ok(true)
+    }
+
+    /// Persist the immediate successor of one authenticated deposit-sync spool head.
+    ///
+    /// Passing `None` creates revision zero. Passing `Some(metadata)` is an exact CAS against the
+    /// current durable head and writes its immediate hash-chained successor. An uncertain exact
+    /// retry is idempotent when the durable successor contains the same state bytes.
+    pub async fn save_deposit_sync_spool_head<R: RngCore + CryptoRng>(
+        &self,
+        key: DepositSyncSpoolHeadKey,
+        expected: Option<DepositSyncSpoolHeadMetadata>,
+        state: &[u8],
+        rng: &mut R,
+    ) -> Result<DepositSyncSpoolHeadMetadata, StoreError> {
+        key.validate()?;
+        if let Some(expected) = expected
+            && expected.key != key
+        {
+            return Err(StoreError::WrongContext);
+        }
+        if state.len() > MAX_DEPOSIT_SYNC_SPOOL_HEAD_BYTES {
+            return Err(StoreError::BlobTooLarge {
+                kind: "deposit sync spool head state",
+                actual: state.len(),
+                maximum: MAX_DEPOSIT_SYNC_SPOOL_HEAD_BYTES,
+            });
+        }
+
+        let mut mutation = self.mutation.lock().await;
+        ensure_private_directory(&self.directory).await?;
+        ensure_private_directory(&self.deposit_sync_spool_head_directory()).await?;
+        let destination = self.deposit_sync_spool_head_path(key);
+        let current = if entry_exists_regular(&destination).await? {
+            let current = self.open_deposit_sync_spool_head(key).await?;
+            Self::observe_deposit_sync_spool_head_snapshot(
+                &mut mutation.deposit_sync_spool_heads,
+                current.metadata,
+            )?;
+            Some(current)
+        } else {
+            if let Some(highest) = mutation.deposit_sync_spool_heads.get(&key) {
+                return Err(StoreError::DepositSyncSpoolHeadDisappeared {
+                    key,
+                    highest_seen: highest.revision,
+                });
+            }
+            None
+        };
+
+        let (revision, previous_snapshot_hash) = match (current, expected) {
+            (None, None) => (0, [0_u8; 32]),
+            (None, Some(expected)) => {
+                return Err(StoreError::DepositSyncSpoolHeadDisappeared {
+                    key,
+                    highest_seen: expected.revision,
+                });
+            }
+            (Some(current), None) => {
+                if current.metadata.revision == 0 && current.state.as_bytes() == state {
+                    return Ok(current.metadata);
+                }
+                return Err(StoreError::DepositSyncSpoolHeadRevisionConflict {
+                    key,
+                    revision: current.metadata.revision,
+                });
+            }
+            (Some(current), Some(expected)) if current.metadata == expected => {
+                let revision = expected
+                    .revision
+                    .checked_add(1)
+                    .ok_or(StoreError::DepositSyncSpoolHeadRevisionExhausted(key))?;
+                (revision, expected.snapshot_hash)
+            }
+            (Some(current), Some(expected))
+                if expected.revision.checked_add(1) == Some(current.metadata.revision)
+                    && current.metadata.previous_snapshot_hash == expected.snapshot_hash =>
+            {
+                if current.state.as_bytes() == state {
+                    return Ok(current.metadata);
+                }
+                return Err(StoreError::DepositSyncSpoolHeadRevisionConflict {
+                    key,
+                    revision: current.metadata.revision,
+                });
+            }
+            (Some(current), Some(expected)) if current.metadata.revision == expected.revision => {
+                return Err(StoreError::DepositSyncSpoolHeadForkDetected {
+                    key,
+                    revision: current.metadata.revision,
+                });
+            }
+            (Some(current), Some(expected)) => {
+                return Err(StoreError::DepositSyncSpoolHeadMismatch {
+                    key,
+                    expected_revision: expected.revision,
+                    actual_revision: current.metadata.revision,
+                });
+            }
+        };
+
+        let plaintext = Zeroizing::new(encode_deposit_sync_spool_head_snapshot(
+            self.party,
+            key,
+            revision,
+            previous_snapshot_hash,
+            state,
+        )?);
+        let (metadata, _) =
+            decode_deposit_sync_spool_head_snapshot(self.party, key, plaintext.as_slice())?;
+        let context = deposit_sync_spool_head_context(key);
+        let sealed = self.seal_protocol_record(
+            context.clone(),
+            plaintext.as_slice(),
+            MAX_DEPOSIT_SYNC_SPOOL_HEAD_SNAPSHOT_BYTES,
+            rng,
+        )?;
+        atomic_replace(&destination, &sealed.encoded, sealed.nonce).await?;
+
+        let durable = self.open_deposit_sync_spool_head(key).await?;
+        if durable.metadata != metadata || durable.state.as_bytes() != state {
+            return Err(StoreError::DepositSyncSpoolHeadForkDetected { key, revision });
+        }
+        Self::observe_deposit_sync_spool_head_snapshot(
+            &mut mutation.deposit_sync_spool_heads,
+            durable.metadata,
+        )?;
+        Ok(durable.metadata)
+    }
+
+    /// Load one exact wallet/network spool head without enumerating protocol storage.
+    pub async fn load_deposit_sync_spool_head(
+        &self,
+        key: DepositSyncSpoolHeadKey,
+    ) -> Result<Option<DepositSyncSpoolHeadBlob>, StoreError> {
+        key.validate()?;
+        let mut mutation = self.mutation.lock().await;
+        if !directory_exists(&self.directory).await?
+            || !directory_exists(&self.deposit_sync_spool_head_directory()).await?
+        {
+            if let Some(highest) = mutation.deposit_sync_spool_heads.get(&key) {
+                return Err(StoreError::DepositSyncSpoolHeadDisappeared {
+                    key,
+                    highest_seen: highest.revision,
+                });
+            }
+            return Ok(None);
+        }
+        let path = self.deposit_sync_spool_head_path(key);
+        if !entry_exists_regular(&path).await? {
+            if let Some(highest) = mutation.deposit_sync_spool_heads.get(&key) {
+                return Err(StoreError::DepositSyncSpoolHeadDisappeared {
+                    key,
+                    highest_seen: highest.revision,
+                });
+            }
+            return Ok(None);
+        }
+        let durable = self.open_deposit_sync_spool_head(key).await?;
+        Self::observe_deposit_sync_spool_head_snapshot(
+            &mut mutation.deposit_sync_spool_heads,
+            durable.metadata,
+        )?;
+        Ok(Some(durable))
+    }
+
+    /// Remove one exact spool head after authenticating its CAS position and plaintext.
+    ///
+    /// An absent head is an idempotent success. Exact destruction resets the in-process fence so a
+    /// future exact candidate namespace can start a new revision-zero chain.
+    pub async fn destroy_deposit_sync_spool_head(
+        &self,
+        key: DepositSyncSpoolHeadKey,
+        expected: DepositSyncSpoolHeadMetadata,
+        expected_state: &[u8],
+    ) -> Result<bool, StoreError> {
+        key.validate()?;
+        if expected.key != key {
+            return Err(StoreError::WrongContext);
+        }
+        let mut mutation = self.mutation.lock().await;
+        if !directory_exists(&self.directory).await?
+            || !directory_exists(&self.deposit_sync_spool_head_directory()).await?
+        {
+            if let Some(highest) = mutation.deposit_sync_spool_heads.get(&key) {
+                return Err(StoreError::DepositSyncSpoolHeadDisappeared {
+                    key,
+                    highest_seen: highest.revision,
+                });
+            }
+            return Ok(false);
+        }
+        let path = self.deposit_sync_spool_head_path(key);
+        if !entry_exists_regular(&path).await? {
+            if let Some(highest) = mutation.deposit_sync_spool_heads.get(&key) {
+                return Err(StoreError::DepositSyncSpoolHeadDisappeared {
+                    key,
+                    highest_seen: highest.revision,
+                });
+            }
+            return Ok(false);
+        }
+        let durable = self.open_deposit_sync_spool_head(key).await?;
+        Self::observe_deposit_sync_spool_head_snapshot(
+            &mut mutation.deposit_sync_spool_heads,
+            durable.metadata,
+        )?;
+        if durable.metadata != expected {
+            if durable.metadata.revision == expected.revision {
+                return Err(StoreError::DepositSyncSpoolHeadForkDetected {
+                    key,
+                    revision: durable.metadata.revision,
+                });
+            }
+            return Err(StoreError::DepositSyncSpoolHeadMismatch {
+                key,
+                expected_revision: expected.revision,
+                actual_revision: durable.metadata.revision,
+            });
+        }
+        if durable.state.as_bytes() != expected_state {
+            return Err(StoreError::DepositSyncSpoolHeadRevisionConflict {
+                key,
+                revision: durable.metadata.revision,
+            });
+        }
+        destroy_file_and_sync_parent(&path).await?;
+        mutation.deposit_sync_spool_heads.remove(&key);
+        Ok(true)
+    }
+
+    /// Persist the immediate successor of the fixed network-bound state-transfer intent snapshot.
+    ///
+    /// Passing `None` creates revision zero. Passing `Some(metadata)` is an exact CAS against the
+    /// current authenticated head. Retrying an uncertain create or successor write is idempotent
+    /// only when the durable state bytes are identical. An empty state is a valid snapshot and
+    /// must be written instead of deleting the record, preserving its monotonic generation and
+    /// rollback fence.
+    pub async fn save_deposit_state_transfer_intents<R: RngCore + CryptoRng>(
+        &self,
+        network_id: [u8; 32],
+        expected: Option<DepositStateTransferIntentsMetadata>,
+        state: &[u8],
+        rng: &mut R,
+    ) -> Result<DepositStateTransferIntentsMetadata, StoreError> {
+        validate_deposit_state_transfer_intents_network(network_id)?;
+        if let Some(expected) = expected
+            && expected.network_id != network_id
+        {
+            return Err(StoreError::WrongContext);
+        }
+        if state.len() > MAX_DEPOSIT_STATE_TRANSFER_INTENTS_BYTES {
+            return Err(StoreError::BlobTooLarge {
+                kind: "deposit state-transfer intent state",
+                actual: state.len(),
+                maximum: MAX_DEPOSIT_STATE_TRANSFER_INTENTS_BYTES,
+            });
+        }
+
+        let mut mutation = self.mutation.lock().await;
+        ensure_private_directory(&self.directory).await?;
+        let destination = self.deposit_state_transfer_intents_path();
+        let current = if entry_exists_regular(&destination).await? {
+            let current = self.open_deposit_state_transfer_intents(network_id).await?;
+            Self::observe_deposit_state_transfer_intents_snapshot(
+                &mut mutation.deposit_state_transfer_intents,
+                current.metadata,
+            )?;
+            Some(current)
+        } else {
+            if let Some(highest) = mutation.deposit_state_transfer_intents.get(&network_id) {
+                return Err(StoreError::DepositStateTransferIntentsDisappeared {
+                    network_id,
+                    highest_seen: highest.revision,
+                });
+            }
+            None
+        };
+
+        let (revision, previous_snapshot_hash) = match (current, expected) {
+            (None, None) => (0, [0_u8; 32]),
+            (None, Some(expected)) => {
+                return Err(StoreError::DepositStateTransferIntentsDisappeared {
+                    network_id,
+                    highest_seen: expected.revision,
+                });
+            }
+            (Some(current), None) => {
+                if current.metadata.revision == 0 && current.state.as_bytes() == state {
+                    return Ok(current.metadata);
+                }
+                return Err(StoreError::DepositStateTransferIntentsRevisionConflict {
+                    network_id,
+                    revision: current.metadata.revision,
+                });
+            }
+            (Some(current), Some(expected)) if current.metadata == expected => {
+                let revision = expected.revision.checked_add(1).ok_or(
+                    StoreError::DepositStateTransferIntentsRevisionExhausted { network_id },
+                )?;
+                (revision, expected.snapshot_hash)
+            }
+            (Some(current), Some(expected))
+                if expected.revision.checked_add(1) == Some(current.metadata.revision)
+                    && current.metadata.previous_snapshot_hash == expected.snapshot_hash =>
+            {
+                if current.state.as_bytes() == state {
+                    return Ok(current.metadata);
+                }
+                return Err(StoreError::DepositStateTransferIntentsRevisionConflict {
+                    network_id,
+                    revision: current.metadata.revision,
+                });
+            }
+            (Some(current), Some(expected)) if current.metadata.revision == expected.revision => {
+                return Err(StoreError::DepositStateTransferIntentsForkDetected {
+                    network_id,
+                    revision: current.metadata.revision,
+                });
+            }
+            (Some(current), Some(expected)) => {
+                return Err(StoreError::DepositStateTransferIntentsMismatch {
+                    network_id,
+                    expected_revision: expected.revision,
+                    actual_revision: current.metadata.revision,
+                });
+            }
+        };
+
+        let plaintext = Zeroizing::new(encode_deposit_state_transfer_intents_snapshot(
+            self.party,
+            network_id,
+            revision,
+            previous_snapshot_hash,
+            state,
+        )?);
+        let (metadata, _) = decode_deposit_state_transfer_intents_snapshot(
+            self.party,
+            network_id,
+            plaintext.as_slice(),
+        )?;
+        let context = ProtocolRecordContext::DepositStateTransferIntents { network_id };
+        let sealed = self.seal_protocol_record(
+            context,
+            plaintext.as_slice(),
+            MAX_DEPOSIT_STATE_TRANSFER_INTENTS_SNAPSHOT_BYTES,
+            rng,
+        )?;
+        // A reported replacement error is never converted to success from a merely readable
+        // destination: the parent-directory fsync may have failed. The caller sends no network
+        // request and retries this exact CAS. That retry fsyncs the directory before recognizing
+        // the already-installed immediate successor above.
+        atomic_replace(&destination, &sealed.encoded, sealed.nonce).await?;
+
+        let durable = self.open_deposit_state_transfer_intents(network_id).await?;
+        if durable.metadata != metadata || durable.state.as_bytes() != state {
+            return Err(StoreError::DepositStateTransferIntentsForkDetected {
+                network_id,
+                revision,
+            });
+        }
+        Self::observe_deposit_state_transfer_intents_snapshot(
+            &mut mutation.deposit_state_transfer_intents,
+            durable.metadata,
+        )?;
+        Ok(durable.metadata)
+    }
+
+    /// Load the fixed state-transfer intent snapshot without enumerating protocol storage.
+    pub async fn load_deposit_state_transfer_intents(
+        &self,
+        network_id: [u8; 32],
+    ) -> Result<Option<DepositStateTransferIntentsBlob>, StoreError> {
+        validate_deposit_state_transfer_intents_network(network_id)?;
+        let mut mutation = self.mutation.lock().await;
+        if !directory_exists(&self.directory).await? {
+            if let Some(highest) = mutation.deposit_state_transfer_intents.get(&network_id) {
+                return Err(StoreError::DepositStateTransferIntentsDisappeared {
+                    network_id,
+                    highest_seen: highest.revision,
+                });
+            }
+            return Ok(None);
+        }
+        let path = self.deposit_state_transfer_intents_path();
+        if !entry_exists_regular(&path).await? {
+            if let Some(highest) = mutation.deposit_state_transfer_intents.get(&network_id) {
+                return Err(StoreError::DepositStateTransferIntentsDisappeared {
+                    network_id,
+                    highest_seen: highest.revision,
+                });
+            }
+            return Ok(None);
+        }
+        let durable = self.open_deposit_state_transfer_intents(network_id).await?;
+        Self::observe_deposit_state_transfer_intents_snapshot(
+            &mut mutation.deposit_state_transfer_intents,
+            durable.metadata,
+        )?;
+        Ok(Some(durable))
     }
 
     /// Atomically replace the authenticated proactive-refresh deadline for this transport trust
@@ -2163,293 +2692,11 @@ impl ProtocolStore {
         Ok(keys)
     }
 
-    /// Persist the exact canonical consolidation-attempt safety state at its embedded revision.
+    /// Create an immutable, canonical key-rotation decision certificate.
     ///
-    /// Revision zero creates the record. Every later write must be its immediate hash-chained
-    /// successor. Retrying an uncertain write is idempotent only when the revision and canonical
-    /// state bytes are exact. This byte-oriented boundary lets callers persist the exact payload
-    /// hidden behind a pending share-exposure or share-unexposed capability.
-    #[allow(clippy::too_many_arguments)]
-    pub async fn save_consolidation_attempt_safety<R: RngCore + CryptoRng>(
-        &self,
-        expected_context: &ConsensusContext,
-        expected_intent: &ConsolidationIntent,
-        intent_certificate: &ConsolidationIntentCertificate,
-        canonical_state: &[u8],
-        rng: &mut R,
-    ) -> Result<ConsolidationAttemptSafetyMetadata, StoreError> {
-        let state = ConsolidationAttemptSafety::restore(
-            canonical_state,
-            expected_context,
-            expected_intent,
-            intent_certificate,
-        )?;
-        if state.local_party() != self.party {
-            return Err(StoreError::WrongContext);
-        }
-        let key = state.key();
-        validate_consolidation_attempt_safety_key(key, expected_intent)?;
-        if canonical_state.len() > MAX_CONSOLIDATION_ATTEMPT_SAFETY_STATE_BYTES {
-            return Err(StoreError::BlobTooLarge {
-                kind: "consolidation attempt safety state",
-                actual: canonical_state.len(),
-                maximum: MAX_CONSOLIDATION_ATTEMPT_SAFETY_STATE_BYTES,
-            });
-        }
-
-        let mut mutation = self.mutation.lock().await;
-        ensure_private_directory(&self.directory).await?;
-        let destination = self.consolidation_attempt_safety_path(key);
-        let current = if entry_exists_regular(&destination).await? {
-            let current = self
-                .open_consolidation_attempt_safety(
-                    key,
-                    expected_context,
-                    expected_intent,
-                    intent_certificate,
-                )
-                .await?;
-            Self::observe_consolidation_attempt_safety_snapshot(
-                &mut mutation.consolidation_attempt_safety_heads,
-                current.metadata,
-            )?;
-            Some(current)
-        } else {
-            if let Some(highest) = mutation.consolidation_attempt_safety_heads.get(&key) {
-                return Err(StoreError::ConsolidationAttemptSafetySnapshotDisappeared {
-                    key,
-                    highest_seen: highest.revision,
-                });
-            }
-            None
-        };
-
-        let revision = state.revision();
-        let previous_snapshot_hash = if let Some(current) = current {
-            if current.is_closed() {
-                return Err(StoreError::ConsolidationAttemptSafetyClosed(key));
-            }
-            if revision == current.metadata.revision {
-                if current.canonical_state() == canonical_state {
-                    return Ok(current.metadata);
-                }
-                return Err(StoreError::ConsolidationAttemptSafetyRevisionConflict {
-                    key,
-                    revision,
-                });
-            }
-            let expected = current
-                .metadata
-                .revision
-                .checked_add(1)
-                .ok_or(StoreError::ConsolidationAttemptSafetyRevisionExhausted(key))?;
-            if revision != expected {
-                return Err(StoreError::ConsolidationAttemptSafetyRevisionNotNext {
-                    key,
-                    expected,
-                    actual: revision,
-                });
-            }
-            current.metadata.snapshot_hash
-        } else {
-            if revision != 0 {
-                return Err(StoreError::ConsolidationAttemptSafetyRevisionMustStartAtZero {
-                    key,
-                    actual: revision,
-                });
-            }
-            [0_u8; 32]
-        };
-
-        let plaintext = Zeroizing::new(encode_consolidation_attempt_safety_snapshot(
-            self.party,
-            key,
-            revision,
-            previous_snapshot_hash,
-            false,
-            canonical_state,
-        )?);
-        let metadata =
-            decode_consolidation_attempt_safety_snapshot_header(self.party, key, &plaintext)?.0;
-        let record_context = consolidation_attempt_safety_record_context(key);
-        let sealed = self.seal_protocol_record(
-            record_context,
-            &plaintext,
-            MAX_CONSOLIDATION_ATTEMPT_SAFETY_SNAPSHOT_BYTES,
-            rng,
-        )?;
-        atomic_replace(&destination, &sealed.encoded, sealed.nonce).await?;
-        mutation.consolidation_attempt_safety_heads.insert(key, metadata);
-        Ok(metadata)
-    }
-
-    /// Load one exact attempt by key and validate it against trusted intent consensus state.
-    ///
-    /// `canonical_state()` on the returned record is an authenticated disk readback, not the
-    /// caller's input buffer, and is suitable for releasing pending one-way capabilities.
-    #[allow(clippy::too_many_arguments)]
-    pub async fn load_consolidation_attempt_safety(
-        &self,
-        key: AttemptSafetyKey,
-        expected_context: &ConsensusContext,
-        expected_intent: &ConsolidationIntent,
-        intent_certificate: &ConsolidationIntentCertificate,
-    ) -> Result<Option<StoredConsolidationAttemptSafety>, StoreError> {
-        validate_consolidation_attempt_safety_key(key, expected_intent)?;
-        let mut mutation = self.mutation.lock().await;
-        let destination = self.consolidation_attempt_safety_path(key);
-        if !directory_exists(&self.directory).await? || !entry_exists_regular(&destination).await? {
-            if let Some(highest) = mutation.consolidation_attempt_safety_heads.get(&key) {
-                return Err(StoreError::ConsolidationAttemptSafetySnapshotDisappeared {
-                    key,
-                    highest_seen: highest.revision,
-                });
-            }
-            return Ok(None);
-        }
-        let stored = self
-            .open_consolidation_attempt_safety(
-                key,
-                expected_context,
-                expected_intent,
-                intent_certificate,
-            )
-            .await?;
-        Self::observe_consolidation_attempt_safety_snapshot(
-            &mut mutation.consolidation_attempt_safety_heads,
-            stored.metadata,
-        )?;
-        Ok(Some(stored))
-    }
-
-    /// Permanently close an exact terminal safety record while retaining its full canonical state.
-    ///
-    /// Closure never deletes the keyed record. It changes the authenticated form to a one-way
-    /// marker and is accepted only for `ThresholdExposed` or `AbandonedCertified`; an exact retry
-    /// is idempotent. Consequently a restart cannot reinterpret a completed attempt as fresh.
-    #[allow(clippy::too_many_arguments)]
-    pub async fn close_consolidation_attempt_safety<R: RngCore + CryptoRng>(
-        &self,
-        key: AttemptSafetyKey,
-        expected_context: &ConsensusContext,
-        expected_intent: &ConsolidationIntent,
-        intent_certificate: &ConsolidationIntentCertificate,
-        rng: &mut R,
-    ) -> Result<ConsolidationAttemptSafetyMetadata, StoreError> {
-        validate_consolidation_attempt_safety_key(key, expected_intent)?;
-        let mut mutation = self.mutation.lock().await;
-        let destination = self.consolidation_attempt_safety_path(key);
-        if !directory_exists(&self.directory).await? || !entry_exists_regular(&destination).await? {
-            let highest_seen = mutation
-                .consolidation_attempt_safety_heads
-                .get(&key)
-                .map_or(0, |metadata| metadata.revision);
-            return Err(StoreError::ConsolidationAttemptSafetySnapshotDisappeared {
-                key,
-                highest_seen,
-            });
-        }
-        let current = self
-            .open_consolidation_attempt_safety(
-                key,
-                expected_context,
-                expected_intent,
-                intent_certificate,
-            )
-            .await?;
-        Self::observe_consolidation_attempt_safety_snapshot(
-            &mut mutation.consolidation_attempt_safety_heads,
-            current.metadata,
-        )?;
-        if !current.state.is_transition_terminal() {
-            return Err(StoreError::ConsolidationAttemptSafetyNotTerminal(key));
-        }
-        if current.is_closed() {
-            return Ok(current.metadata);
-        }
-
-        let plaintext = Zeroizing::new(encode_consolidation_attempt_safety_snapshot(
-            self.party,
-            key,
-            current.metadata.revision,
-            current.metadata.previous_snapshot_hash,
-            true,
-            current.canonical_state(),
-        )?);
-        let closed_metadata =
-            decode_consolidation_attempt_safety_snapshot_header(self.party, key, &plaintext)?.0;
-        let sealed = self.seal_protocol_record(
-            consolidation_attempt_safety_record_context(key),
-            &plaintext,
-            MAX_CONSOLIDATION_ATTEMPT_SAFETY_SNAPSHOT_BYTES,
-            rng,
-        )?;
-        atomic_replace(&destination, &sealed.encoded, sealed.nonce).await?;
-        mutation.consolidation_attempt_safety_heads.insert(key, closed_metadata);
-        Ok(closed_metadata)
-    }
-
-    /// Enumerate and authenticate consolidation safety records with a traversal bound.
-    ///
-    /// This startup/audit operation validates storage structure, canonical state encoding, and
-    /// filename binding. Call `load_consolidation_attempt_safety` with trusted consensus state for
-    /// full semantic validation of an individual record.
-    pub async fn consolidation_attempt_safety_records_bounded(
-        &self,
-        maximum: usize,
-    ) -> Result<Vec<AttemptSafetyKey>, StoreError> {
-        if !directory_exists(&self.directory).await? {
-            return Ok(Vec::new());
-        }
-        let filename_keys = enumerate_protocol_directory_bounded(
-            &self.consolidation_attempt_safety_directory(),
-            parse_consolidation_attempt_safety_filename,
-            maximum,
-            "consolidation attempt safety record",
-        )
-        .await?;
-        let mut keys = Vec::with_capacity(filename_keys.len());
-        for filename_key in filename_keys {
-            let expected = ProtocolRecordContext::ConsolidationAttemptSafety {
-                session: filename_key.session,
-                attempt_digest: filename_key.attempt_digest,
-            };
-            let path = self.consolidation_attempt_safety_directory().join(
-                consolidation_attempt_safety_filename_parts(
-                    filename_key.session,
-                    filename_key.attempt_digest,
-                ),
-            );
-            let (_, plaintext) = self
-                .open_protocol_record(
-                    &path,
-                    ExpectedProtocolContext::Exact(expected),
-                    MAX_CONSOLIDATION_ATTEMPT_SAFETY_SNAPSHOT_BYTES,
-                )
-                .await?;
-            let (header, state_bytes) = decode_consolidation_attempt_safety_snapshot_header_parts(
-                self.party,
-                filename_key,
-                &plaintext,
-            )?;
-            let state: ConsolidationAttemptSafety =
-                decode_canonical_exact(state_bytes, "consolidation attempt safety state")?;
-            if state.local_party() != self.party
-                || state.key().session() != filename_key.session
-                || state.key().attempt_digest() != filename_key.attempt_digest
-                || state.revision() != header.revision
-                || (header.closed && !state.is_transition_terminal())
-            {
-                return Err(StoreError::WrongContext);
-            }
-            keys.push(state.key());
-        }
-        keys.sort();
-        Ok(keys)
-    }
-
-    /// Create an immutable, canonical key-rotation decision certificate. An exact retry is
-    /// idempotent; conflicting bytes for the same context are rejected.
+    /// The first valid witness-bearing representation remains the local durable artifact.
+    /// Byte-distinct quorum subsets proving the same semantic decision are idempotent; a
+    /// certificate proving another rotation value for this context is rejected.
     pub async fn save_key_rotation_certificate<R: RngCore + CryptoRng>(
         &self,
         context: &KeyRotationContext,
@@ -2464,7 +2711,7 @@ impl ProtocolStore {
         let destination = self.key_rotation_certificate_path(key);
         if entry_exists_regular(&destination).await? {
             let durable = self.open_key_rotation_certificate(context).await?;
-            if durable == *certificate {
+            if durable.proves_same_decision(certificate, context)? {
                 return Ok(());
             }
             return Err(StoreError::KeyRotationCertificateConflict(key));
@@ -2481,7 +2728,7 @@ impl ProtocolStore {
         )?;
         if !atomic_create_new(&destination, &sealed.encoded, sealed.nonce).await? {
             let durable = self.open_key_rotation_certificate(context).await?;
-            if durable != *certificate {
+            if !durable.proves_same_decision(certificate, context)? {
                 return Err(StoreError::KeyRotationCertificateConflict(key));
             }
         }
@@ -2501,6 +2748,28 @@ impl ProtocolStore {
             return Ok(None);
         }
         Ok(Some(self.open_key_rotation_certificate(context).await?))
+    }
+
+    /// Load the node's exact immutable witness artifact and prove that `candidate` certifies the
+    /// same rotation decision.
+    ///
+    /// Honest collectors may retain different PRECOMMIT witness subsets for one value. All
+    /// downstream receipts and erasure authorizations must nevertheless use this node's first
+    /// durable representation, otherwise the same decision could acquire multiple local digests.
+    async fn canonical_key_rotation_certificate(
+        &self,
+        context: &KeyRotationContext,
+        candidate: &KeyRotationCertificate,
+    ) -> Result<KeyRotationCertificate, StoreError> {
+        let key = key_rotation_round_key(context);
+        if !entry_exists_regular(&self.key_rotation_certificate_path(key)).await? {
+            return Err(StoreError::KeyRotationCertificateMissing(key));
+        }
+        let durable = self.open_key_rotation_certificate(context).await?;
+        if !durable.proves_same_decision(candidate, context)? {
+            return Err(StoreError::KeyRotationCertificateConflict(key));
+        }
+        Ok(durable)
     }
 
     /// List immutable certificate keys with a hard traversal bound. Semantic verification still
@@ -2569,17 +2838,10 @@ impl ProtocolStore {
         rng: &mut R,
     ) -> Result<(), StoreError> {
         context.validate()?;
-        let certificate_bytes = Zeroizing::new(certificate.encode(context)?);
         let key = key_rotation_round_key(context);
         let _mutation = self.mutation.lock().await;
-        let durable = if entry_exists_regular(&self.key_rotation_certificate_path(key)).await? {
-            self.open_key_rotation_certificate(context).await?
-        } else {
-            return Err(StoreError::KeyRotationCertificateMissing(key));
-        };
-        if durable != *certificate {
-            return Err(StoreError::KeyRotationCertificateConflict(key));
-        }
+        let durable = self.canonical_key_rotation_certificate(context, certificate).await?;
+        let certificate_bytes = Zeroizing::new(durable.encode(context)?);
         let destination = self.key_rotation_round_path(key);
         let expected_retirement_digest = key_rotation_certificate_digest(key, &certificate_bytes);
         match self.open_key_rotation_round(context).await? {
@@ -2590,7 +2852,10 @@ impl ProtocolStore {
                 return Err(StoreError::KeyRotationCertificateConflict(key));
             }
             OpenKeyRotationRound::Active(snapshot) => {
-                if snapshot.round.certificate().as_ref() != Some(certificate) {
+                let Some(round_certificate) = snapshot.round.certificate() else {
+                    return Err(StoreError::KeyRotationCertificateConflict(key));
+                };
+                if !round_certificate.proves_same_decision(&durable, context)? {
                     return Err(StoreError::KeyRotationCertificateConflict(key));
                 }
             }
@@ -2612,8 +2877,9 @@ impl ProtocolStore {
         destroy_temporary_replacements(&destination).await
     }
 
-    /// Persist a caller-generated dynamic X25519 secret with create-new semantics. An exact retry
-    /// is idempotent; a different secret or a retirement marker for the epoch is authoritative.
+    /// Persist the externally provisioned epoch-zero X25519 secret, or verify an already-existing
+    /// dynamic identity exactly. New post-genesis candidates must use
+    /// [`Self::save_epoch_identity_candidate_secret`] so their current policy is durable.
     pub async fn save_epoch_identity_secret<R: RngCore + CryptoRng>(
         &self,
         identity: &EpochEncryptionSecret,
@@ -2628,16 +2894,78 @@ impl ProtocolStore {
             });
         }
         ensure_private_directory(&self.directory).await?;
-        self.save_epoch_identity_secret_locked(identity, rng).await
+        let destination = self.epoch_identity_path(identity.epoch());
+        if entry_exists_regular(&destination).await? {
+            let (stored_public_key, existing) =
+                self.open_epoch_identity_record(identity.epoch()).await?;
+            return match &existing {
+                EpochIdentityRecord::Active(active)
+                    if stored_public_key == identity.public_key()
+                        && active.secret.as_slice() == identity.secret_bytes() =>
+                {
+                    Ok(())
+                }
+                EpochIdentityRecord::Retired(retirement) => Err(StoreError::EpochIdentityRetired {
+                    epoch: identity.epoch(),
+                    successor_epoch: retirement.successor_epoch,
+                }),
+                EpochIdentityRecord::Active(_) => {
+                    Err(StoreError::EpochIdentityConflict { epoch: identity.epoch() })
+                }
+            };
+        }
+        if identity.epoch() != 0 {
+            return Err(StoreError::EpochIdentityPolicyConflict { epoch: identity.epoch() });
+        }
+        self.save_epoch_identity_secret_locked(identity, None, rng).await
+    }
+
+    /// Persist a caller-supplied post-genesis candidate under the exact current rotation policy.
+    /// This is primarily useful to restore externally constructed test fixtures; production
+    /// candidates are generated by [`Self::load_or_create_epoch_identity_secret`].
+    pub async fn save_epoch_identity_candidate_secret<R: RngCore + CryptoRng>(
+        &self,
+        context: &KeyRotationContext,
+        identity: &EpochEncryptionSecret,
+        rng: &mut R,
+    ) -> Result<(), StoreError> {
+        context.validate()?;
+        context.target_policy().eligible().member(self.party).map_err(KeyRotationError::from)?;
+        validate_epoch_identity_secret(self.party, identity)?;
+        if identity.epoch() != context.target_epoch() {
+            return Err(StoreError::EpochIdentityPolicyConflict { epoch: identity.epoch() });
+        }
+        let _mutation = self.mutation.lock().await;
+        ensure_private_directory(&self.directory).await?;
+        self.save_epoch_identity_secret_locked(identity, Some(context.digest()), rng).await
+    }
+
+    /// Create a current-format non-genesis fixture without manufacturing a rotation certificate.
+    #[cfg(test)]
+    pub(crate) async fn save_epoch_identity_secret_for_test<R: RngCore + CryptoRng>(
+        &self,
+        identity: &EpochEncryptionSecret,
+        candidate_context: [u8; 32],
+        rng: &mut R,
+    ) -> Result<(), StoreError> {
+        if identity.epoch() == 0 || candidate_context == [0_u8; 32] {
+            return Err(StoreError::EpochIdentityPolicyConflict { epoch: identity.epoch() });
+        }
+        let _mutation = self.mutation.lock().await;
+        ensure_private_directory(&self.directory).await?;
+        self.save_epoch_identity_secret_locked(identity, Some(candidate_context), rng).await
     }
 
     /// Recover an existing dynamic X25519 secret or generate and durably create one exactly once.
     /// The returned value is safe to use only after this method succeeds.
     pub async fn load_or_create_epoch_identity_secret<R: RngCore + CryptoRng>(
         &self,
-        epoch: u64,
+        context: &KeyRotationContext,
         rng: &mut R,
     ) -> Result<EpochEncryptionSecret, StoreError> {
+        context.validate()?;
+        context.target_policy().eligible().member(self.party).map_err(KeyRotationError::from)?;
+        let epoch = context.target_epoch();
         let mut mutation = self.mutation.lock().await;
         if let Some(retirement) = mutation.retired_epoch_identities.get(&epoch) {
             return Err(StoreError::EpochIdentityRetired {
@@ -2651,7 +2979,7 @@ impl ProtocolStore {
             None
         } else {
             let identity = EpochEncryptionSecret::generate(self.party, epoch, rng)?;
-            self.save_epoch_identity_secret_locked(&identity, rng).await?;
+            self.save_epoch_identity_secret_locked(&identity, Some(context.digest()), rng).await?;
             Some(identity)
         };
 
@@ -2662,6 +2990,9 @@ impl ProtocolStore {
         let (stored_public_key, existing) = self.open_epoch_identity_record(epoch).await?;
         match &existing {
             EpochIdentityRecord::Active(active) => {
+                if active.candidate_context != Some(context.digest()) {
+                    return Err(StoreError::EpochIdentityPolicyConflict { epoch });
+                }
                 let durable = epoch_identity_from_active(self.party, active)?;
                 if stored_public_key != durable.public_key()
                     || generated.as_ref().is_some_and(|candidate| candidate != &durable)
@@ -2689,15 +3020,16 @@ impl ProtocolStore {
     /// key-rotation advertisement boundary.
     pub async fn load_or_create_epoch_advertisement_identity<R: RngCore + CryptoRng>(
         &self,
-        epoch: u64,
+        context: &KeyRotationContext,
         signing_seed: &[u8; 32],
         expected_signing_public_key: [u8; 32],
         rng: &mut R,
     ) -> Result<PersistedKeyAdvertisementIdentity, StoreError> {
         validate_signing_seed(signing_seed, expected_signing_public_key)?;
-        let secret = self.load_or_create_epoch_identity_secret(epoch, rng).await?;
+        let secret = self.load_or_create_epoch_identity_secret(context, rng).await?;
         self.load_persisted_key_advertisement_identity(
             &secret,
+            Some(context.digest()),
             signing_seed,
             expected_signing_public_key,
             secret.public_key(),
@@ -2726,6 +3058,7 @@ impl ProtocolStore {
         self.save_epoch_identity_secret(secret, rng).await?;
         self.load_persisted_key_advertisement_identity(
             secret,
+            None,
             signing_seed,
             expected_signing_public_key,
             expected_encryption_public_key,
@@ -2752,19 +3085,26 @@ impl ProtocolStore {
         rng: &mut R,
     ) -> Result<EpochEncryptionSecret, StoreError> {
         context.validate()?;
-        let target = certificate.verify(context)?;
         context.target_policy().eligible().member(self.party).map_err(KeyRotationError::from)?;
-        let target_member = target.member(self.party).map_err(KeyRotationError::from)?;
         validate_epoch_identity_secret(self.party, candidate)?;
         if candidate.epoch() != context.target_epoch() {
             return Err(StoreError::EpochIdentityConflict { epoch: candidate.epoch() });
         }
+        let key = key_rotation_round_key(context);
+        let mut mutation = self.mutation.lock().await;
+        if let Some(retirement) = mutation.retired_epoch_identities.get(&context.target_epoch()) {
+            return Err(StoreError::EpochIdentityRetired {
+                epoch: context.target_epoch(),
+                successor_epoch: retirement.successor_epoch,
+            });
+        }
+        let durable = self.canonical_key_rotation_certificate(context, certificate).await?;
+        let target = durable.verify(context)?;
+        let target_member = target.member(self.party).map_err(KeyRotationError::from)?;
         if candidate.public_key() != target_member.encryption_key {
             return Err(StoreError::EpochIdentityConflict { epoch: context.target_epoch() });
         }
-
-        let certificate_bytes = Zeroizing::new(certificate.encode(context)?);
-        let key = key_rotation_round_key(context);
+        let certificate_bytes = Zeroizing::new(durable.encode(context)?);
         let certification = EpochIdentityCertification {
             version: EPOCH_IDENTITY_CERTIFICATION_VERSION,
             source_epoch: context.source().epoch,
@@ -2773,22 +3113,6 @@ impl ProtocolStore {
             context_digest: context.digest(),
             certificate_digest: key_rotation_certificate_digest(key, &certificate_bytes),
         };
-
-        let mut mutation = self.mutation.lock().await;
-        if let Some(retirement) = mutation.retired_epoch_identities.get(&context.target_epoch()) {
-            return Err(StoreError::EpochIdentityRetired {
-                epoch: context.target_epoch(),
-                successor_epoch: retirement.successor_epoch,
-            });
-        }
-        let durable = if entry_exists_regular(&self.key_rotation_certificate_path(key)).await? {
-            self.open_key_rotation_certificate(context).await?
-        } else {
-            return Err(StoreError::KeyRotationCertificateMissing(key));
-        };
-        if durable != *certificate {
-            return Err(StoreError::KeyRotationCertificateConflict(key));
-        }
 
         // A source-committee member must prove continuity with its durable source-epoch identity:
         // the certified decision's authority flowed through that exact key. A joiner promoted into
@@ -2825,6 +3149,9 @@ impl ProtocolStore {
             }
             EpochIdentityRecord::Active(active) => active,
         };
+        if target_active.candidate_context != Some(context.digest()) {
+            return Err(StoreError::EpochIdentityPolicyConflict { epoch: context.target_epoch() });
+        }
         if let Some(existing) = target_active.certification {
             if existing != certification || stored_target_public_key != target_member.encryption_key
             {
@@ -2850,6 +3177,7 @@ impl ProtocolStore {
             epoch: promoted.epoch(),
             public_key: promoted.public_key(),
             secret: *promoted.secret_bytes(),
+            candidate_context: Some(context.digest()),
             certification: Some(certification),
         });
         let encoded = Zeroizing::new(
@@ -2887,6 +3215,48 @@ impl ProtocolStore {
             return Err(StoreError::EpochIdentityConflict { epoch: context.target_epoch() });
         }
         Ok(durable_promoted)
+    }
+
+    /// Permanently erase this party's unselected target candidate after authenticating the exact
+    /// terminal rotation certificate.
+    ///
+    /// The immutable certificate is the deletion authority. A selected candidate, a candidate
+    /// created for another context, or an already-certified identity fails closed. Replaying the
+    /// same certificate after the file is absent is idempotent, which also makes restart clean up
+    /// a rolled-back unselected candidate before it can be advertised again.
+    pub async fn destroy_unselected_epoch_identity_secret(
+        &self,
+        context: &KeyRotationContext,
+        certificate: &KeyRotationCertificate,
+    ) -> Result<bool, StoreError> {
+        context.validate()?;
+        context.target_policy().eligible().member(self.party).map_err(KeyRotationError::from)?;
+        let _mutation = self.mutation.lock().await;
+        let durable = self.canonical_key_rotation_certificate(context, certificate).await?;
+        let target = durable.verify(context)?;
+        if target.member(self.party).is_ok() {
+            return Err(StoreError::EpochIdentityPolicyConflict { epoch: context.target_epoch() });
+        }
+        let path = self.epoch_identity_path(context.target_epoch());
+        if !entry_exists_regular(&path).await? {
+            return Ok(false);
+        }
+        let (_, record) = self.open_epoch_identity_record(context.target_epoch()).await?;
+        match &record {
+            EpochIdentityRecord::Active(active)
+                if active.candidate_context == Some(context.digest())
+                    && active.certification.is_none() =>
+            {
+                drop(epoch_identity_from_active(self.party, active)?);
+            }
+            _ => {
+                return Err(StoreError::EpochIdentityPolicyConflict {
+                    epoch: context.target_epoch(),
+                });
+            }
+        }
+        destroy_file_and_sync_parent(&path).await?;
+        Ok(true)
     }
 
     /// Load a dynamic epoch identity and exact-bind it to the committee's expected public key.
@@ -2934,6 +3304,7 @@ impl ProtocolStore {
     async fn load_persisted_key_advertisement_identity(
         &self,
         expected_secret: &EpochEncryptionSecret,
+        expected_candidate_context: Option<[u8; 32]>,
         signing_seed: &[u8; 32],
         expected_signing_public_key: [u8; 32],
         expected_encryption_public_key: [u8; 32],
@@ -2972,6 +3343,9 @@ impl ProtocolStore {
             // candidate. Reissuing an advertisement capability here could make an honest restart
             // equivocate solely because its persistence receipt changed.
             return Err(StoreError::EpochIdentityCertificationConflict { epoch });
+        }
+        if active.candidate_context != expected_candidate_context {
+            return Err(StoreError::EpochIdentityPolicyConflict { epoch });
         }
         if stored_public_key != expected_encryption_public_key {
             return Err(StoreError::EpochIdentityConflict { epoch });
@@ -3058,19 +3432,12 @@ impl ProtocolStore {
         certificate: &KeyRotationCertificate,
         rng: &mut R,
     ) -> Result<EpochIdentityRetirement, StoreError> {
-        let (retirement, target_certification) =
-            epoch_identity_retirement_authorization(self.party, context, certificate)?;
-        let key = key_rotation_round_key(context);
+        context.validate()?;
         let mut mutation = self.mutation.lock().await;
         ensure_private_directory(&self.directory).await?;
-        let durable = if entry_exists_regular(&self.key_rotation_certificate_path(key)).await? {
-            self.open_key_rotation_certificate(context).await?
-        } else {
-            return Err(StoreError::KeyRotationCertificateMissing(key));
-        };
-        if durable != *certificate {
-            return Err(StoreError::KeyRotationCertificateConflict(key));
-        }
+        let durable = self.canonical_key_rotation_certificate(context, certificate).await?;
+        let (retirement, target_certification) =
+            epoch_identity_retirement_authorization(self.party, context, &durable)?;
 
         if let Some((target_public_key, expected_certification)) = target_certification {
             let target_path = self.epoch_identity_path(context.target_epoch());
@@ -3203,22 +3570,27 @@ impl ProtocolStore {
         rng: &mut R,
     ) -> Result<(), StoreError> {
         let _mutation = self.mutation.lock().await;
-        ensure_private_directory(&self.directory).await?;
+        let _namespace = self.lock_session_namespace().await?;
         if entry_exists_regular(&self.session_tombstone_path(session)).await? {
             return Err(StoreError::SessionTombstoned(session));
         }
-        if directory_exists(&self.session_directory()).await? {
-            for key in enumerate_protocol_directory(
-                &self.session_directory(),
-                parse_session_state_filename,
-            )
-            .await?
-            {
-                if key.session == session && key.context_digest != context_digest {
-                    drop(self.load_session_state(key.session, key.context_digest).await?);
-                    return Err(StoreError::SessionContextConflict { session });
-                }
+        let keys = self.session_state_keys_bounded().await?;
+        let mut matching_state = false;
+        for key in &keys {
+            if key.session != session {
+                continue;
             }
+            drop(self.load_session_state(key.session, key.context_digest).await?);
+            if key.context_digest != context_digest {
+                return Err(StoreError::SessionContextConflict { session });
+            }
+            matching_state = true;
+        }
+        if !matching_state && keys.len() == MAX_SESSION_STATE_RECORDS {
+            return Err(StoreError::ProtocolEntryLimit {
+                kind: "session state",
+                maximum: MAX_SESSION_STATE_RECORDS,
+            });
         }
         let context = ProtocolRecordContext::SessionState { session, context_digest };
         let sealed = self.seal_protocol_record(context, state, MAX_SESSION_STATE_BYTES, rng)?;
@@ -3247,18 +3619,18 @@ impl ProtocolStore {
         Ok(plaintext)
     }
 
-    /// List and authenticate all active session-state snapshots.
-    pub async fn session_states(&self) -> Result<Vec<SessionStateKey>, StoreError> {
+    /// Boundedly list and authenticate every active session-state snapshot.
+    ///
+    /// Directory traversal rejects record `MAX_SESSION_STATE_RECORDS + 1` before opening any
+    /// ciphertext. Every accepted ciphertext is returned from that one authentication pass.
+    pub async fn session_states(&self) -> Result<Vec<StoredSessionState>, StoreError> {
+        let _mutation = self.mutation.lock().await;
         if !directory_exists(&self.directory).await? {
             return Ok(Vec::new());
         }
-        let keys =
-            enumerate_protocol_directory(&self.session_directory(), parse_session_state_filename)
-                .await?;
-        for key in &keys {
-            drop(self.load_session_state(key.session, key.context_digest).await?);
-        }
-        Ok(keys)
+        let _namespace = self.lock_session_namespace().await?;
+        let keys = self.session_state_keys_bounded().await?;
+        self.authenticate_session_states(keys).await
     }
 
     /// Move an authenticated session snapshot to quarantine; no destructive delete API exists.
@@ -3270,6 +3642,7 @@ impl ProtocolStore {
         context_digest: [u8; 32],
     ) -> Result<PathBuf, StoreError> {
         let _mutation = self.mutation.lock().await;
+        let _namespace = self.lock_session_namespace().await?;
         require_directory(&self.directory).await?;
         drop(self.load_session_state(session, context_digest).await?);
         self.retire_protocol_file(
@@ -3293,13 +3666,25 @@ impl ProtocolStore {
         context_digest: [u8; 32],
     ) -> Result<(), StoreError> {
         let _mutation = self.mutation.lock().await;
+        let _namespace = self.lock_session_namespace().await?;
         require_directory(&self.directory).await?;
         drop(self.load_session_tombstone(session).await?);
+        let keys = self.session_state_keys_bounded().await?;
+        let mut matching_state = false;
+        for key in keys {
+            if key.session != session {
+                continue;
+            }
+            drop(self.load_session_state(key.session, key.context_digest).await?);
+            if key.context_digest != context_digest {
+                return Err(StoreError::SessionContextConflict { session });
+            }
+            matching_state = true;
+        }
         let path = self.session_state_path(session, context_digest);
-        if entry_exists_regular(&path).await? {
-            drop(self.load_session_state(session, context_digest).await?);
+        if matching_state {
             destroy_file_and_sync_parent(&path).await?;
-        } else {
+        } else if directory_exists(&self.session_directory()).await? {
             destroy_temporary_replacements(&path).await?;
         }
         Ok(())
@@ -3503,18 +3888,11 @@ impl ProtocolStore {
         }
 
         let _mutation = self.mutation.lock().await;
-        ensure_private_directory(&self.directory).await?;
-        if directory_exists(&self.session_directory()).await? {
-            for key in enumerate_protocol_directory(
-                &self.session_directory(),
-                parse_session_state_filename,
-            )
-            .await?
-            {
-                if key.session == session {
-                    drop(self.load_session_state(key.session, key.context_digest).await?);
-                    return Err(StoreError::LiveSessionState(session));
-                }
+        let _namespace = self.lock_session_namespace().await?;
+        for key in self.session_state_keys_bounded().await? {
+            if key.session == session {
+                drop(self.load_session_state(key.session, key.context_digest).await?);
+                return Err(StoreError::LiveSessionState(session));
             }
         }
         let destination = self.session_tombstone_path(session);
@@ -3561,24 +3939,17 @@ impl ProtocolStore {
             });
         }
         let _mutation = self.mutation.lock().await;
-        ensure_private_directory(&self.directory).await?;
+        let _namespace = self.lock_session_namespace().await?;
         let mut matching_state = false;
-        if directory_exists(&self.session_directory()).await? {
-            for key in enumerate_protocol_directory(
-                &self.session_directory(),
-                parse_session_state_filename,
-            )
-            .await?
-            {
-                if key.session != session {
-                    continue;
-                }
-                drop(self.load_session_state(key.session, key.context_digest).await?);
-                if key.context_digest != context_digest {
-                    return Err(StoreError::SessionContextConflict { session });
-                }
-                matching_state = true;
+        for key in self.session_state_keys_bounded().await? {
+            if key.session != session {
+                continue;
             }
+            drop(self.load_session_state(key.session, key.context_digest).await?);
+            if key.context_digest != context_digest {
+                return Err(StoreError::SessionContextConflict { session });
+            }
+            matching_state = true;
         }
         let destination = self.session_tombstone_path(session);
         if entry_exists_regular(&destination).await? {
@@ -3597,7 +3968,10 @@ impl ProtocolStore {
         }
         if matching_state {
             destroy_file_and_sync_parent(&self.session_state_path(session, context_digest)).await?;
-        } else {
+        } else if directory_exists(&self.session_directory()).await? {
+            // A public-history catch-up party may never have owned this AVSS reducer. The
+            // certificate still authorizes installing its permanent tombstone, but there is no
+            // session directory (and therefore no temporary replacement) to scan or erase.
             destroy_temporary_replacements(&self.session_state_path(session, context_digest))
                 .await?;
         }
@@ -3623,22 +3997,6 @@ impl ProtocolStore {
             return Err(StoreError::WrongContext);
         }
         Ok(SessionTombstone { session, purpose })
-    }
-
-    /// List and authenticate every permanent session tombstone.
-    pub async fn session_tombstones(&self) -> Result<Vec<SessionId>, StoreError> {
-        if !directory_exists(&self.directory).await? {
-            return Ok(Vec::new());
-        }
-        let sessions = enumerate_protocol_directory(
-            &self.tombstone_directory(),
-            parse_session_tombstone_filename,
-        )
-        .await?;
-        for session in &sessions {
-            drop(self.load_session_tombstone(*session).await?);
-        }
-        Ok(sessions)
     }
 
     /// Persist a certificate before immutably publishing its exact transition lookup.
@@ -3942,43 +4300,41 @@ impl ProtocolStore {
         .await
     }
 
-    #[allow(clippy::too_many_arguments)]
-    async fn open_consolidation_attempt_safety(
+    async fn open_deposit_sync_spool_head(
         &self,
-        key: AttemptSafetyKey,
-        expected_context: &ConsensusContext,
-        expected_intent: &ConsolidationIntent,
-        intent_certificate: &ConsolidationIntentCertificate,
-    ) -> Result<StoredConsolidationAttemptSafety, StoreError> {
-        validate_consolidation_attempt_safety_key(key, expected_intent)?;
-        let expected = consolidation_attempt_safety_record_context(key);
+        key: DepositSyncSpoolHeadKey,
+    ) -> Result<DepositSyncSpoolHeadBlob, StoreError> {
         let (_, plaintext) = self
             .open_protocol_record(
-                &self.consolidation_attempt_safety_path(key),
-                ExpectedProtocolContext::Exact(expected),
-                MAX_CONSOLIDATION_ATTEMPT_SAFETY_SNAPSHOT_BYTES,
+                &self.deposit_sync_spool_head_path(key),
+                ExpectedProtocolContext::Exact(deposit_sync_spool_head_context(key)),
+                MAX_DEPOSIT_SYNC_SPOOL_HEAD_SNAPSHOT_BYTES,
             )
             .await?;
-        let (metadata, state_bytes) =
-            decode_consolidation_attempt_safety_snapshot_header(self.party, key, &plaintext)?;
-        let state = ConsolidationAttemptSafety::restore(
-            state_bytes,
-            expected_context,
-            expected_intent,
-            intent_certificate,
+        let (metadata, state) =
+            decode_deposit_sync_spool_head_snapshot(self.party, key, plaintext.as_bytes())?;
+        Ok(DepositSyncSpoolHeadBlob { metadata, state: ProtocolBlob(state.to_vec()) })
+    }
+
+    async fn open_deposit_state_transfer_intents(
+        &self,
+        network_id: [u8; 32],
+    ) -> Result<DepositStateTransferIntentsBlob, StoreError> {
+        let (_, plaintext) = self
+            .open_protocol_record(
+                &self.deposit_state_transfer_intents_path(),
+                ExpectedProtocolContext::Exact(
+                    ProtocolRecordContext::DepositStateTransferIntents { network_id },
+                ),
+                MAX_DEPOSIT_STATE_TRANSFER_INTENTS_SNAPSHOT_BYTES,
+            )
+            .await?;
+        let (metadata, state) = decode_deposit_state_transfer_intents_snapshot(
+            self.party,
+            network_id,
+            plaintext.as_bytes(),
         )?;
-        if state.local_party() != self.party
-            || state.key() != key
-            || state.revision() != metadata.revision
-            || (metadata.closed && !state.is_transition_terminal())
-        {
-            return Err(StoreError::WrongContext);
-        }
-        Ok(StoredConsolidationAttemptSafety {
-            metadata,
-            state,
-            canonical_state: ProtocolBlob(state_bytes.to_vec()),
-        })
+        Ok(DepositStateTransferIntentsBlob { metadata, state: ProtocolBlob(state.to_vec()) })
     }
 
     async fn open_key_rotation_round(
@@ -4041,6 +4397,7 @@ impl ProtocolStore {
     async fn save_epoch_identity_secret_locked<R: RngCore + CryptoRng>(
         &self,
         identity: &EpochEncryptionSecret,
+        candidate_context: Option<[u8; 32]>,
         rng: &mut R,
     ) -> Result<(), StoreError> {
         validate_epoch_identity_secret(self.party, identity)?;
@@ -4052,7 +4409,8 @@ impl ProtocolStore {
             return match &existing {
                 EpochIdentityRecord::Active(active)
                     if stored_public_key == public_key
-                        && active.secret.as_slice() == identity.secret_bytes() =>
+                        && active.secret.as_slice() == identity.secret_bytes()
+                        && active.candidate_context == candidate_context =>
                 {
                     Ok(())
                 }
@@ -4068,6 +4426,7 @@ impl ProtocolStore {
             epoch,
             public_key,
             secret: *identity.secret_bytes(),
+            candidate_context,
             certification: None,
         });
         let encoded =
@@ -4084,7 +4443,8 @@ impl ProtocolStore {
             match &existing {
                 EpochIdentityRecord::Active(active)
                     if stored_public_key == public_key
-                        && active.secret.as_slice() == identity.secret_bytes() => {}
+                        && active.secret.as_slice() == identity.secret_bytes()
+                        && active.candidate_context == candidate_context => {}
                 EpochIdentityRecord::Retired(retirement) => {
                     return Err(StoreError::EpochIdentityRetired {
                         epoch,
@@ -4127,6 +4487,9 @@ impl ProtocolStore {
                     || active.public_key != public_key
                     || X25519PublicKey::from(&StaticSecret::from(active.secret)).to_bytes()
                         != public_key
+                    || (epoch == 0 && active.candidate_context.is_some())
+                    || (epoch > 0
+                        && active.candidate_context.is_none_or(|digest| digest == [0_u8; 32]))
                 {
                     return Err(StoreError::WrongContext);
                 }
@@ -4136,6 +4499,7 @@ impl ProtocolStore {
                             != Some(certification.target_epoch)
                         || certification.target_epoch != epoch
                         || certification.target_public_key != public_key
+                        || active.candidate_context != Some(certification.context_digest)
                         || certification.context_digest == [0_u8; 32]
                         || certification.certificate_digest == [0_u8; 32])
                 {
@@ -4197,16 +4561,16 @@ impl ProtocolStore {
         Ok(())
     }
 
-    fn observe_consolidation_attempt_safety_snapshot(
-        observed: &mut BTreeMap<AttemptSafetyKey, ConsolidationAttemptSafetyMetadata>,
-        found: ConsolidationAttemptSafetyMetadata,
+    fn observe_deposit_sync_spool_head_snapshot(
+        observed: &mut BTreeMap<DepositSyncSpoolHeadKey, DepositSyncSpoolHeadMetadata>,
+        found: DepositSyncSpoolHeadMetadata,
     ) -> Result<(), StoreError> {
         let Some(highest) = observed.get(&found.key).copied() else {
             observed.insert(found.key, found);
             return Ok(());
         };
         if found.revision < highest.revision {
-            return Err(StoreError::ConsolidationAttemptSafetyRollbackDetected {
+            return Err(StoreError::DepositSyncSpoolHeadRollbackDetected {
                 key: found.key,
                 highest_seen: highest.revision,
                 found: found.revision,
@@ -4214,29 +4578,26 @@ impl ProtocolStore {
         }
         if found.revision == highest.revision {
             if found != highest {
-                return Err(StoreError::ConsolidationAttemptSafetyForkDetected {
+                return Err(StoreError::DepositSyncSpoolHeadForkDetected {
                     key: found.key,
                     revision: found.revision,
                 });
             }
             return Ok(());
         }
-        if highest.closed {
-            return Err(StoreError::ConsolidationAttemptSafetyClosed(found.key));
-        }
         let expected = highest
             .revision
             .checked_add(1)
-            .ok_or(StoreError::ConsolidationAttemptSafetyRevisionExhausted(found.key))?;
+            .ok_or(StoreError::DepositSyncSpoolHeadRevisionExhausted(found.key))?;
         if found.revision != expected {
-            return Err(StoreError::ConsolidationAttemptSafetyRevisionNotNext {
+            return Err(StoreError::DepositSyncSpoolHeadMismatch {
                 key: found.key,
-                expected,
-                actual: found.revision,
+                expected_revision: expected,
+                actual_revision: found.revision,
             });
         }
-        if found.closed || found.previous_snapshot_hash != highest.snapshot_hash {
-            return Err(StoreError::ConsolidationAttemptSafetyHashChainMismatch {
+        if found.previous_snapshot_hash != highest.snapshot_hash {
+            return Err(StoreError::DepositSyncSpoolHeadHashChainMismatch {
                 key: found.key,
                 revision: found.revision,
             });
@@ -4245,8 +4606,143 @@ impl ProtocolStore {
         Ok(())
     }
 
+    fn observe_deposit_state_transfer_intents_snapshot(
+        observed: &mut BTreeMap<[u8; 32], DepositStateTransferIntentsMetadata>,
+        found: DepositStateTransferIntentsMetadata,
+    ) -> Result<(), StoreError> {
+        let network_id = found.network_id;
+        let Some(highest) = observed.get(&network_id).copied() else {
+            observed.insert(network_id, found);
+            return Ok(());
+        };
+        if found.revision < highest.revision {
+            return Err(StoreError::DepositStateTransferIntentsRollbackDetected {
+                network_id,
+                highest_seen: highest.revision,
+                found: found.revision,
+            });
+        }
+        if found.revision == highest.revision {
+            if found != highest {
+                return Err(StoreError::DepositStateTransferIntentsForkDetected {
+                    network_id,
+                    revision: found.revision,
+                });
+            }
+            return Ok(());
+        }
+        let expected = highest
+            .revision
+            .checked_add(1)
+            .ok_or(StoreError::DepositStateTransferIntentsRevisionExhausted { network_id })?;
+        if found.revision != expected {
+            return Err(StoreError::DepositStateTransferIntentsMismatch {
+                network_id,
+                expected_revision: expected,
+                actual_revision: found.revision,
+            });
+        }
+        if found.previous_snapshot_hash != highest.snapshot_hash {
+            return Err(StoreError::DepositStateTransferIntentsHashChainMismatch {
+                network_id,
+                revision: found.revision,
+            });
+        }
+        observed.insert(network_id, found);
+        Ok(())
+    }
+
     fn session_directory(&self) -> PathBuf {
         self.directory.join(SESSION_STATE_DIRECTORY)
+    }
+
+    fn session_namespace_lock_path(&self) -> PathBuf {
+        self.directory.join(SESSION_NAMESPACE_LOCK_FILE)
+    }
+
+    async fn lock_session_namespace(&self) -> Result<SessionNamespaceLock, StoreError> {
+        ensure_private_directory(&self.directory).await?;
+        let path = self.session_namespace_lock_path();
+        let open_path = path.clone();
+        let (file, created) =
+            tokio::task::spawn_blocking(move || -> Result<(std::fs::File, bool), StoreError> {
+                let (file, created) = {
+                    let mut options = std::fs::OpenOptions::new();
+                    options.read(true).write(true).create_new(true);
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::OpenOptionsExt;
+
+                        options.mode(0o600);
+                    }
+                    match options.open(&open_path) {
+                        Ok(file) => (file, true),
+                        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                            let link_metadata = std::fs::symlink_metadata(&open_path)?;
+                            if !link_metadata.is_file() {
+                                return Err(StoreError::NotRegularFile(open_path));
+                            }
+                            let file = std::fs::OpenOptions::new()
+                                .read(true)
+                                .write(true)
+                                .open(&open_path)?;
+                            let opened_metadata = file.metadata()?;
+                            let current_link_metadata = std::fs::symlink_metadata(&open_path)?;
+                            if !opened_metadata.is_file()
+                                || !current_link_metadata.is_file()
+                                || !same_file_identity(&opened_metadata, &current_link_metadata)
+                            {
+                                return Err(StoreError::NotRegularFile(open_path));
+                            }
+                            (file, false)
+                        }
+                        Err(error) => return Err(error.into()),
+                    }
+                };
+                if created {
+                    file.sync_all()?;
+                }
+                file.lock()?;
+                Ok((file, created))
+            })
+            .await
+            .map_err(io::Error::other)??;
+        if created {
+            sync_directory(&self.directory).await?;
+        }
+        Ok(SessionNamespaceLock(file))
+    }
+
+    async fn session_state_keys_bounded(&self) -> Result<Vec<SessionStateKey>, StoreError> {
+        enumerate_protocol_directory_bounded(
+            &self.session_directory(),
+            parse_session_state_filename,
+            MAX_SESSION_STATE_RECORDS,
+            "session state",
+        )
+        .await
+    }
+
+    async fn authenticate_session_states(
+        &self,
+        keys: Vec<SessionStateKey>,
+    ) -> Result<Vec<StoredSessionState>, StoreError> {
+        let mut contexts = BTreeMap::new();
+        let mut states = Vec::with_capacity(keys.len());
+        for key in keys {
+            let state = self.load_session_state(key.session, key.context_digest).await?;
+            if let Some(existing) = contexts.insert(key.session, key.context_digest)
+                && existing != key.context_digest
+            {
+                return Err(StoreError::SessionContextConflict { session: key.session });
+            }
+            states.push(StoredSessionState {
+                session: key.session,
+                context_digest: key.context_digest,
+                state,
+            });
+        }
+        Ok(states)
     }
 
     fn tombstone_directory(&self) -> PathBuf {
@@ -4269,16 +4765,16 @@ impl ProtocolStore {
         self.directory.join(KEY_ROTATION_CERTIFICATE_DIRECTORY)
     }
 
-    fn consolidation_attempt_safety_directory(&self) -> PathBuf {
-        self.directory.join(CONSOLIDATION_ATTEMPT_SAFETY_DIRECTORY)
-    }
-
     fn sweep_signing_high_water_directory(&self) -> PathBuf {
         self.directory.join(SWEEP_SIGNING_HIGH_WATER_DIRECTORY)
     }
 
     fn deposit_index_journal_directory(&self) -> PathBuf {
         self.directory.join(DEPOSIT_INDEX_JOURNAL_DIRECTORY)
+    }
+
+    fn deposit_sync_spool_head_directory(&self) -> PathBuf {
+        self.directory.join(DEPOSIT_SYNC_SPOOL_HEAD_DIRECTORY)
     }
 
     fn epoch_identity_directory(&self) -> PathBuf {
@@ -4779,6 +5275,29 @@ impl WalletArtifactStore {
             key,
             mutation: Mutex::new(()),
         })
+    }
+
+    /// Derive a secret subkey for authenticated metadata colocated with wallet artifacts.
+    ///
+    /// The artifact-store root key is never exposed. Callers must use a permanent,
+    /// protocol-specific domain label; the local party is already bound into the root key.
+    pub(crate) fn derive_subkey(
+        &self,
+        domain: &'static [u8],
+    ) -> Result<Zeroizing<[u8; 32]>, StoreError> {
+        if domain.is_empty() {
+            return Err(StoreError::KeyDerivation);
+        }
+        let hk = Hkdf::<Sha256>::new(
+            Some(b"threshold-monero/wallet-artifact-store/subkey/v1"),
+            &self.key,
+        );
+        let mut key = Zeroizing::new([0_u8; 32]);
+        hk.expand(domain, key.as_mut()).map_err(|_| StoreError::KeyDerivation)?;
+        if key.as_ref() == &[0_u8; 32] {
+            return Err(StoreError::KeyDerivation);
+        }
+        Ok(key)
     }
 
     #[must_use]
@@ -5643,6 +6162,243 @@ fn protocol_associated_data(header: &ProtocolRecordHeader) -> Result<Vec<u8>, St
     Ok(aad)
 }
 
+fn deposit_sync_spool_head_snapshot_hash(
+    party: PartyId,
+    key: DepositSyncSpoolHeadKey,
+    revision: u64,
+    previous_snapshot_hash: [u8; 32],
+    state: &[u8],
+) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new_derive_key("threshold-monero/deposit-sync-spool-head/v1");
+    hasher.update(&DEPOSIT_SYNC_SPOOL_HEAD_SNAPSHOT_VERSION.to_le_bytes());
+    hasher.update(&party.0.to_le_bytes());
+    hasher.update(&key.network_id);
+    hasher.update(&key.wallet_id.0);
+    hasher.update(&revision.to_le_bytes());
+    hasher.update(&previous_snapshot_hash);
+    hasher.update(&(state.len() as u64).to_le_bytes());
+    hasher.update(state);
+    *hasher.finalize().as_bytes()
+}
+
+fn encode_deposit_sync_spool_head_snapshot(
+    party: PartyId,
+    key: DepositSyncSpoolHeadKey,
+    revision: u64,
+    previous_snapshot_hash: [u8; 32],
+    state: &[u8],
+) -> Result<Vec<u8>, StoreError> {
+    key.validate()?;
+    if state.len() > MAX_DEPOSIT_SYNC_SPOOL_HEAD_BYTES {
+        return Err(StoreError::BlobTooLarge {
+            kind: "deposit sync spool head state",
+            actual: state.len(),
+            maximum: MAX_DEPOSIT_SYNC_SPOOL_HEAD_BYTES,
+        });
+    }
+    if (revision == 0) != (previous_snapshot_hash == [0_u8; 32]) {
+        return Err(StoreError::DepositSyncSpoolHeadHashChainMismatch { key, revision });
+    }
+    let state_len = u64::try_from(state.len()).map_err(|_| StoreError::Serialization)?;
+    let snapshot_hash =
+        deposit_sync_spool_head_snapshot_hash(party, key, revision, previous_snapshot_hash, state);
+    let mut encoded =
+        Vec::with_capacity(DEPOSIT_SYNC_SPOOL_HEAD_SNAPSHOT_HEADER_BYTES + state.len());
+    encoded.extend_from_slice(&DEPOSIT_SYNC_SPOOL_HEAD_SNAPSHOT_VERSION.to_le_bytes());
+    encoded.extend_from_slice(&revision.to_le_bytes());
+    encoded.extend_from_slice(&previous_snapshot_hash);
+    encoded.extend_from_slice(&snapshot_hash);
+    encoded.extend_from_slice(&state_len.to_le_bytes());
+    encoded.extend_from_slice(state);
+    Ok(encoded)
+}
+
+fn decode_deposit_sync_spool_head_snapshot<'a>(
+    party: PartyId,
+    key: DepositSyncSpoolHeadKey,
+    encoded: &'a [u8],
+) -> Result<(DepositSyncSpoolHeadMetadata, &'a [u8]), StoreError> {
+    key.validate()?;
+    if encoded.len() < DEPOSIT_SYNC_SPOOL_HEAD_SNAPSHOT_HEADER_BYTES {
+        return Err(StoreError::NonCanonicalEncoding { kind: "deposit sync spool head snapshot" });
+    }
+    let version =
+        u16::from_le_bytes(encoded[..2].try_into().map_err(|_| StoreError::Serialization)?);
+    if version != DEPOSIT_SYNC_SPOOL_HEAD_SNAPSHOT_VERSION {
+        return Err(StoreError::WrongContext);
+    }
+    let revision =
+        u64::from_le_bytes(encoded[2..10].try_into().map_err(|_| StoreError::Serialization)?);
+    let mut previous_snapshot_hash = [0_u8; 32];
+    previous_snapshot_hash.copy_from_slice(&encoded[10..42]);
+    let mut snapshot_hash = [0_u8; 32];
+    snapshot_hash.copy_from_slice(&encoded[42..74]);
+    let state_len =
+        u64::from_le_bytes(encoded[74..82].try_into().map_err(|_| StoreError::Serialization)?);
+    let state_len = usize::try_from(state_len).map_err(|_| StoreError::Serialization)?;
+    if state_len > MAX_DEPOSIT_SYNC_SPOOL_HEAD_BYTES {
+        return Err(StoreError::BlobTooLarge {
+            kind: "deposit sync spool head state",
+            actual: state_len,
+            maximum: MAX_DEPOSIT_SYNC_SPOOL_HEAD_BYTES,
+        });
+    }
+    if encoded.len() != DEPOSIT_SYNC_SPOOL_HEAD_SNAPSHOT_HEADER_BYTES + state_len {
+        return Err(StoreError::NonCanonicalEncoding { kind: "deposit sync spool head snapshot" });
+    }
+    let state = &encoded[DEPOSIT_SYNC_SPOOL_HEAD_SNAPSHOT_HEADER_BYTES..];
+    if snapshot_hash
+        != deposit_sync_spool_head_snapshot_hash(
+            party,
+            key,
+            revision,
+            previous_snapshot_hash,
+            state,
+        )
+    {
+        return Err(StoreError::Authentication);
+    }
+    if snapshot_hash == [0_u8; 32] || (revision == 0) != (previous_snapshot_hash == [0_u8; 32]) {
+        return Err(StoreError::DepositSyncSpoolHeadHashChainMismatch { key, revision });
+    }
+    Ok((
+        DepositSyncSpoolHeadMetadata { key, revision, previous_snapshot_hash, snapshot_hash },
+        state,
+    ))
+}
+
+fn validate_deposit_state_transfer_intents_network(network_id: [u8; 32]) -> Result<(), StoreError> {
+    if network_id == [0_u8; 32] {
+        return Err(StoreError::InvalidDepositStateTransferIntentsNetwork);
+    }
+    Ok(())
+}
+
+fn deposit_state_transfer_intents_snapshot_hash(
+    party: PartyId,
+    network_id: [u8; 32],
+    revision: u64,
+    previous_snapshot_hash: [u8; 32],
+    state: &[u8],
+) -> [u8; 32] {
+    let mut hasher =
+        blake3::Hasher::new_derive_key("threshold-monero/deposit-state-transfer-intents/v1");
+    hasher.update(&DEPOSIT_STATE_TRANSFER_INTENTS_SNAPSHOT_VERSION.to_le_bytes());
+    hasher.update(&party.0.to_le_bytes());
+    hasher.update(&network_id);
+    hasher.update(&revision.to_le_bytes());
+    hasher.update(&previous_snapshot_hash);
+    hasher.update(&(state.len() as u64).to_le_bytes());
+    hasher.update(state);
+    *hasher.finalize().as_bytes()
+}
+
+fn encode_deposit_state_transfer_intents_snapshot(
+    party: PartyId,
+    network_id: [u8; 32],
+    revision: u64,
+    previous_snapshot_hash: [u8; 32],
+    state: &[u8],
+) -> Result<Vec<u8>, StoreError> {
+    validate_deposit_state_transfer_intents_network(network_id)?;
+    if state.len() > MAX_DEPOSIT_STATE_TRANSFER_INTENTS_BYTES {
+        return Err(StoreError::BlobTooLarge {
+            kind: "deposit state-transfer intent state",
+            actual: state.len(),
+            maximum: MAX_DEPOSIT_STATE_TRANSFER_INTENTS_BYTES,
+        });
+    }
+    if (revision == 0) != (previous_snapshot_hash == [0_u8; 32]) {
+        return Err(StoreError::DepositStateTransferIntentsHashChainMismatch {
+            network_id,
+            revision,
+        });
+    }
+    let state_len = u64::try_from(state.len()).map_err(|_| StoreError::Serialization)?;
+    let snapshot_hash = deposit_state_transfer_intents_snapshot_hash(
+        party,
+        network_id,
+        revision,
+        previous_snapshot_hash,
+        state,
+    );
+    let mut encoded =
+        Vec::with_capacity(DEPOSIT_STATE_TRANSFER_INTENTS_SNAPSHOT_HEADER_BYTES + state.len());
+    encoded.extend_from_slice(&DEPOSIT_STATE_TRANSFER_INTENTS_SNAPSHOT_VERSION.to_le_bytes());
+    encoded.extend_from_slice(&revision.to_le_bytes());
+    encoded.extend_from_slice(&previous_snapshot_hash);
+    encoded.extend_from_slice(&snapshot_hash);
+    encoded.extend_from_slice(&state_len.to_le_bytes());
+    encoded.extend_from_slice(state);
+    Ok(encoded)
+}
+
+fn decode_deposit_state_transfer_intents_snapshot<'a>(
+    party: PartyId,
+    network_id: [u8; 32],
+    encoded: &'a [u8],
+) -> Result<(DepositStateTransferIntentsMetadata, &'a [u8]), StoreError> {
+    validate_deposit_state_transfer_intents_network(network_id)?;
+    if encoded.len() < DEPOSIT_STATE_TRANSFER_INTENTS_SNAPSHOT_HEADER_BYTES {
+        return Err(StoreError::NonCanonicalEncoding {
+            kind: "deposit state-transfer intent snapshot",
+        });
+    }
+    let version =
+        u16::from_le_bytes(encoded[..2].try_into().map_err(|_| StoreError::Serialization)?);
+    if version != DEPOSIT_STATE_TRANSFER_INTENTS_SNAPSHOT_VERSION {
+        return Err(StoreError::WrongContext);
+    }
+    let revision =
+        u64::from_le_bytes(encoded[2..10].try_into().map_err(|_| StoreError::Serialization)?);
+    let mut previous_snapshot_hash = [0_u8; 32];
+    previous_snapshot_hash.copy_from_slice(&encoded[10..42]);
+    let mut snapshot_hash = [0_u8; 32];
+    snapshot_hash.copy_from_slice(&encoded[42..74]);
+    let state_len =
+        u64::from_le_bytes(encoded[74..82].try_into().map_err(|_| StoreError::Serialization)?);
+    let state_len = usize::try_from(state_len).map_err(|_| StoreError::Serialization)?;
+    if state_len > MAX_DEPOSIT_STATE_TRANSFER_INTENTS_BYTES {
+        return Err(StoreError::BlobTooLarge {
+            kind: "deposit state-transfer intent state",
+            actual: state_len,
+            maximum: MAX_DEPOSIT_STATE_TRANSFER_INTENTS_BYTES,
+        });
+    }
+    if encoded.len() != DEPOSIT_STATE_TRANSFER_INTENTS_SNAPSHOT_HEADER_BYTES + state_len {
+        return Err(StoreError::NonCanonicalEncoding {
+            kind: "deposit state-transfer intent snapshot",
+        });
+    }
+    let state = &encoded[DEPOSIT_STATE_TRANSFER_INTENTS_SNAPSHOT_HEADER_BYTES..];
+    if snapshot_hash
+        != deposit_state_transfer_intents_snapshot_hash(
+            party,
+            network_id,
+            revision,
+            previous_snapshot_hash,
+            state,
+        )
+    {
+        return Err(StoreError::Authentication);
+    }
+    if snapshot_hash == [0_u8; 32] || (revision == 0) != (previous_snapshot_hash == [0_u8; 32]) {
+        return Err(StoreError::DepositStateTransferIntentsHashChainMismatch {
+            network_id,
+            revision,
+        });
+    }
+    Ok((
+        DepositStateTransferIntentsMetadata {
+            network_id,
+            revision,
+            previous_snapshot_hash,
+            snapshot_hash,
+        },
+        state,
+    ))
+}
+
 fn key_rotation_round_key(context: &KeyRotationContext) -> KeyRotationRoundKey {
     KeyRotationRoundKey { target_epoch: context.target_epoch(), context_digest: context.digest() }
 }
@@ -5654,7 +6410,7 @@ fn key_rotation_snapshot_hash(
     previous_snapshot_hash: [u8; 32],
     state: &[u8],
 ) -> [u8; 32] {
-    let mut hasher = blake3::Hasher::new_derive_key("threshold-monero/key-rotation-snapshot/v1");
+    let mut hasher = blake3::Hasher::new_derive_key("threshold-monero/key-rotation-snapshot/v2");
     hasher.update(&party.0.to_le_bytes());
     hasher.update(&key.target_epoch.to_le_bytes());
     hasher.update(&key.context_digest);
@@ -5741,7 +6497,7 @@ fn decode_key_rotation_snapshot_header<'a>(
 }
 
 fn key_rotation_certificate_digest(key: KeyRotationRoundKey, encoded: &[u8]) -> [u8; 32] {
-    let mut hasher = blake3::Hasher::new_derive_key("threshold-monero/key-rotation-certificate/v1");
+    let mut hasher = blake3::Hasher::new_derive_key("threshold-monero/key-rotation-certificate/v2");
     hasher.update(&key.target_epoch.to_le_bytes());
     hasher.update(&key.context_digest);
     hasher.update(&(encoded.len() as u64).to_le_bytes());
@@ -5807,193 +6563,6 @@ fn epoch_identity_retirement_authorization(
         )
     });
     Ok((retirement, certification))
-}
-
-fn consolidation_attempt_safety_record_context(key: AttemptSafetyKey) -> ProtocolRecordContext {
-    ProtocolRecordContext::ConsolidationAttemptSafety {
-        session: key.session(),
-        attempt_digest: key.attempt_digest(),
-    }
-}
-
-fn validate_consolidation_attempt_safety_key(
-    key: AttemptSafetyKey,
-    expected_intent: &ConsolidationIntent,
-) -> Result<(), StoreError> {
-    if key.session() != expected_intent.attempt().session()
-        || key.attempt_digest() != expected_intent.attempt().digest()
-    {
-        return Err(StoreError::ConsolidationAttemptSafetyKeyMismatch);
-    }
-    Ok(())
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct ConsolidationAttemptSafetySnapshotHeader {
-    revision: u64,
-    previous_snapshot_hash: [u8; 32],
-    snapshot_hash: [u8; 32],
-    closed: bool,
-}
-
-fn consolidation_attempt_safety_snapshot_hash(
-    party: PartyId,
-    key: ConsolidationAttemptSafetyFilenameKey,
-    revision: u64,
-    previous_snapshot_hash: [u8; 32],
-    closed: bool,
-    state: &[u8],
-) -> [u8; 32] {
-    let mut hasher =
-        blake3::Hasher::new_derive_key("threshold-monero/consolidation-attempt-safety/v1");
-    hasher.update(&party.0.to_le_bytes());
-    hasher.update(&key.session.0);
-    hasher.update(&key.attempt_digest);
-    hasher.update(&revision.to_le_bytes());
-    hasher.update(&previous_snapshot_hash);
-    hasher.update(&[u8::from(closed)]);
-    hasher.update(&(state.len() as u64).to_le_bytes());
-    hasher.update(state);
-    *hasher.finalize().as_bytes()
-}
-
-fn encode_consolidation_attempt_safety_snapshot(
-    party: PartyId,
-    key: AttemptSafetyKey,
-    revision: u64,
-    previous_snapshot_hash: [u8; 32],
-    closed: bool,
-    state: &[u8],
-) -> Result<Vec<u8>, StoreError> {
-    if state.len() > MAX_CONSOLIDATION_ATTEMPT_SAFETY_STATE_BYTES {
-        return Err(StoreError::BlobTooLarge {
-            kind: "consolidation attempt safety state",
-            actual: state.len(),
-            maximum: MAX_CONSOLIDATION_ATTEMPT_SAFETY_STATE_BYTES,
-        });
-    }
-    if revision == 0 && previous_snapshot_hash != [0_u8; 32] {
-        return Err(StoreError::ConsolidationAttemptSafetyHashChainMismatch { key, revision });
-    }
-    let filename_key = ConsolidationAttemptSafetyFilenameKey {
-        session: key.session(),
-        attempt_digest: key.attempt_digest(),
-    };
-    let snapshot_hash = consolidation_attempt_safety_snapshot_hash(
-        party,
-        filename_key,
-        revision,
-        previous_snapshot_hash,
-        closed,
-        state,
-    );
-    let state_len = u64::try_from(state.len()).map_err(|_| StoreError::Serialization)?;
-    let mut encoded =
-        Vec::with_capacity(CONSOLIDATION_ATTEMPT_SAFETY_SNAPSHOT_HEADER_BYTES + state.len());
-    encoded.push(u8::from(closed));
-    encoded.extend_from_slice(&CONSOLIDATION_ATTEMPT_SAFETY_SNAPSHOT_VERSION.to_le_bytes());
-    encoded.extend_from_slice(&revision.to_le_bytes());
-    encoded.extend_from_slice(&previous_snapshot_hash);
-    encoded.extend_from_slice(&snapshot_hash);
-    encoded.extend_from_slice(&state_len.to_le_bytes());
-    encoded.extend_from_slice(state);
-    Ok(encoded)
-}
-
-fn decode_consolidation_attempt_safety_snapshot_header<'a>(
-    party: PartyId,
-    key: AttemptSafetyKey,
-    encoded: &'a [u8],
-) -> Result<(ConsolidationAttemptSafetyMetadata, &'a [u8]), StoreError> {
-    let filename_key = ConsolidationAttemptSafetyFilenameKey {
-        session: key.session(),
-        attempt_digest: key.attempt_digest(),
-    };
-    let (header, state) =
-        decode_consolidation_attempt_safety_snapshot_header_parts(party, filename_key, encoded)?;
-    Ok((
-        ConsolidationAttemptSafetyMetadata {
-            key,
-            revision: header.revision,
-            previous_snapshot_hash: header.previous_snapshot_hash,
-            snapshot_hash: header.snapshot_hash,
-            closed: header.closed,
-        },
-        state,
-    ))
-}
-
-fn decode_consolidation_attempt_safety_snapshot_header_parts<'a>(
-    party: PartyId,
-    key: ConsolidationAttemptSafetyFilenameKey,
-    encoded: &'a [u8],
-) -> Result<(ConsolidationAttemptSafetySnapshotHeader, &'a [u8]), StoreError> {
-    if encoded.len() < CONSOLIDATION_ATTEMPT_SAFETY_SNAPSHOT_HEADER_BYTES
-        || !matches!(encoded[0], 0 | 1)
-    {
-        return Err(StoreError::NonCanonicalEncoding {
-            kind: "consolidation attempt safety snapshot",
-        });
-    }
-    let closed = encoded[0] == 1;
-    let version =
-        u16::from_le_bytes(encoded[1..3].try_into().map_err(|_| StoreError::Serialization)?);
-    if version != CONSOLIDATION_ATTEMPT_SAFETY_SNAPSHOT_VERSION {
-        return Err(StoreError::WrongContext);
-    }
-    let revision =
-        u64::from_le_bytes(encoded[3..11].try_into().map_err(|_| StoreError::Serialization)?);
-    let mut previous_snapshot_hash = [0_u8; 32];
-    previous_snapshot_hash.copy_from_slice(&encoded[11..43]);
-    let mut snapshot_hash = [0_u8; 32];
-    snapshot_hash.copy_from_slice(&encoded[43..75]);
-    let state_len =
-        u64::from_le_bytes(encoded[75..83].try_into().map_err(|_| StoreError::Serialization)?);
-    let state_len = usize::try_from(state_len).map_err(|_| StoreError::Serialization)?;
-    if state_len > MAX_CONSOLIDATION_ATTEMPT_SAFETY_STATE_BYTES {
-        return Err(StoreError::BlobTooLarge {
-            kind: "consolidation attempt safety state",
-            actual: state_len,
-            maximum: MAX_CONSOLIDATION_ATTEMPT_SAFETY_STATE_BYTES,
-        });
-    }
-    if encoded.len() != CONSOLIDATION_ATTEMPT_SAFETY_SNAPSHOT_HEADER_BYTES + state_len {
-        return Err(StoreError::NonCanonicalEncoding {
-            kind: "consolidation attempt safety snapshot",
-        });
-    }
-    let state = &encoded[CONSOLIDATION_ATTEMPT_SAFETY_SNAPSHOT_HEADER_BYTES..];
-    if snapshot_hash
-        != consolidation_attempt_safety_snapshot_hash(
-            party,
-            key,
-            revision,
-            previous_snapshot_hash,
-            closed,
-            state,
-        )
-    {
-        return Err(StoreError::Authentication);
-    }
-    if revision == 0 && previous_snapshot_hash != [0_u8; 32] {
-        return Err(StoreError::ConsolidationAttemptSafetyHashChainMismatch {
-            key: decode_canonical_exact::<ConsolidationAttemptSafety>(
-                state,
-                "consolidation attempt safety state",
-            )?
-            .key(),
-            revision,
-        });
-    }
-    Ok((
-        ConsolidationAttemptSafetySnapshotHeader {
-            revision,
-            previous_snapshot_hash,
-            snapshot_hash,
-            closed,
-        },
-        state,
-    ))
 }
 
 fn validate_epoch_identity_secret(
@@ -6111,10 +6680,6 @@ fn key_rotation_certificate_filename(key: KeyRotationRoundKey) -> String {
     format!("{}.{}.rotation-certificate", key.target_epoch, hex::encode(key.context_digest))
 }
 
-fn consolidation_attempt_safety_filename(key: AttemptSafetyKey) -> String {
-    consolidation_attempt_safety_filename_parts(key.session(), key.attempt_digest())
-}
-
 fn deposit_index_journal_filename(key: DepositIndexJournalKey) -> String {
     let scope = match key.scope {
         DepositIndexJournalScope::Portable => "portable",
@@ -6137,11 +6702,19 @@ fn deposit_index_journal_context(key: DepositIndexJournalKey) -> ProtocolRecordC
     }
 }
 
-fn consolidation_attempt_safety_filename_parts(
-    session: SessionId,
-    attempt_digest: [u8; 32],
-) -> String {
-    format!("{}.{}.consolidation-safety", session, hex::encode(attempt_digest))
+fn deposit_sync_spool_head_filename(key: DepositSyncSpoolHeadKey) -> String {
+    format!(
+        "{}.{}.deposit-sync-spool-head",
+        hex::encode(key.network_id),
+        hex::encode(key.wallet_id.0)
+    )
+}
+
+fn deposit_sync_spool_head_context(key: DepositSyncSpoolHeadKey) -> ProtocolRecordContext {
+    ProtocolRecordContext::DepositSyncSpoolHead {
+        network_id: key.network_id,
+        wallet_id: key.wallet_id,
+    }
 }
 
 fn sweep_signing_high_water_filename(wallet: DepositWalletId, sweep: SweepId) -> String {
@@ -6162,11 +6735,6 @@ fn parse_session_state_filename(filename: &str) -> Option<SessionStateKey> {
         session: SessionId(decode_canonical_hex(session)?),
         context_digest: decode_canonical_hex(context_digest)?,
     })
-}
-
-fn parse_session_tombstone_filename(filename: &str) -> Option<SessionId> {
-    let session = filename.strip_suffix(".tombstone")?;
-    Some(SessionId(decode_canonical_hex(session)?))
 }
 
 fn parse_activation_filename(filename: &str) -> Option<ActivationCertificateKey> {
@@ -6209,20 +6777,6 @@ fn parse_key_rotation_certificate_filename(filename: &str) -> Option<KeyRotation
     parse_key_rotation_filename(filename, ".rotation-certificate")
 }
 
-fn parse_consolidation_attempt_safety_filename(
-    filename: &str,
-) -> Option<ConsolidationAttemptSafetyFilenameKey> {
-    let stem = filename.strip_suffix(".consolidation-safety")?;
-    let (session, attempt_digest) = stem.split_once('.')?;
-    if attempt_digest.contains('.') {
-        return None;
-    }
-    Some(ConsolidationAttemptSafetyFilenameKey {
-        session: SessionId(decode_canonical_hex(session)?),
-        attempt_digest: decode_canonical_hex(attempt_digest)?,
-    })
-}
-
 fn parse_key_rotation_filename(filename: &str, suffix: &str) -> Option<KeyRotationRoundKey> {
     let stem = filename.strip_suffix(suffix)?;
     let (target_epoch_text, context_digest) = stem.split_once('.')?;
@@ -6262,13 +6816,6 @@ fn documented_temporary_file<T>(filename: &str, parser: fn(&str) -> Option<T>) -
         return false;
     };
     parser(destination).is_some() && decode_canonical_hex::<24>(token).is_some()
-}
-
-async fn enumerate_protocol_directory<T: Ord>(
-    directory: &Path,
-    parser: fn(&str) -> Option<T>,
-) -> Result<Vec<T>, StoreError> {
-    enumerate_protocol_directory_bounded(directory, parser, usize::MAX, "protocol record").await
 }
 
 async fn enumerate_protocol_directory_bounded<T: Ord>(
@@ -6393,10 +6940,10 @@ fn same_file_identity(_left: &std::fs::Metadata, _right: &std::fs::Metadata) -> 
 }
 
 async fn ensure_private_directory(path: &Path) -> Result<(), StoreError> {
-    let existed = match tokio::fs::symlink_metadata(path).await {
-        Ok(metadata) if metadata.is_dir() => true,
+    let existing = match tokio::fs::symlink_metadata(path).await {
+        Ok(metadata) if metadata.is_dir() => Some(metadata),
         Ok(_) => return Err(StoreError::UnexpectedEntry(path.to_path_buf())),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => false,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
         Err(error) => return Err(error.into()),
     };
     tokio::fs::create_dir_all(path).await?;
@@ -6404,10 +6951,17 @@ async fn ensure_private_directory(path: &Path) -> Result<(), StoreError> {
     {
         use std::os::unix::fs::PermissionsExt;
 
-        tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).await?;
+        // Even chmod(0700) on an already-private directory dirties its inode. Artifact reads
+        // use this helper too; avoid forcing a fresh journal commit on every authenticated read.
+        if existing.as_ref().is_none_or(|metadata| metadata.permissions().mode() & 0o7777 != 0o700)
+        {
+            tokio::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).await?;
+        }
     }
     sync_directory(path).await?;
-    if !existed && let Some(parent) = path.parent() {
+    if existing.is_none()
+        && let Some(parent) = path.parent()
+    {
         sync_directory(parent).await?;
     }
     Ok(())
@@ -6624,7 +7178,7 @@ async fn sync_directory(path: &Path) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
 
     use curve25519_dalek::Scalar;
     use rand_core::OsRng;
@@ -6632,11 +7186,9 @@ mod tests {
     use super::*;
     use crate::{
         committee::{Committee, Member},
-        consolidation_consensus::CONSOLIDATION_INTENT_APPLICATION,
         deposit_consensus::{
-            CommitCertificate, ConsensusBinding, ConsensusMessageBody, Vote, sign_consensus_message,
+            CommitCertificate, ConsensusMessageBody, Vote, sign_consensus_message,
         },
-        deposit_consolidation::{AttemptBinding, OpaqueIntentBinding, TransactionAuthorization},
         deposit_wallet::{DepositWalletId, SweepId},
         identity::{Identity, PersistedKeyAdvertisementIdentity},
         key_rotation::{
@@ -6644,13 +7196,8 @@ mod tests {
             KeyRotationWire, sign_key_advertisement,
         },
         keys::{SecretPolynomial, aggregate_dkg, make_dkg_output},
+        receiver_key_accumulator::ReceiverKeyAccumulatorStore,
     };
-
-    struct ConsolidationSafetyFixture {
-        context: ConsensusContext,
-        intent: ConsolidationIntent,
-        certificate: ConsolidationIntentCertificate,
-    }
 
     fn explicit_test_identity(
         party: PartyId,
@@ -6663,474 +7210,6 @@ mod tests {
             "tests must model independently provisioned signing and encryption material"
         );
         Identity::from_test_secrets(party, epoch, &signing_seed, x25519_secret).unwrap()
-    }
-
-    fn consolidation_safety_fixture() -> ConsolidationSafetyFixture {
-        let identities = (1_u16..=4)
-            .map(|id| {
-                explicit_test_identity(
-                    PartyId(id),
-                    7,
-                    [u8::try_from(id).unwrap(); 32],
-                    [u8::try_from(id).unwrap().wrapping_add(0x40); 32],
-                )
-            })
-            .collect::<Vec<_>>();
-        let committee = Committee {
-            epoch: 7,
-            threshold: 2,
-            members: identities
-                .iter()
-                .map(|identity| Member {
-                    id: identity.party(),
-                    signing_key: identity.signing_public_key(),
-                    encryption_key: identity.encryption_public_key(),
-                })
-                .collect(),
-        };
-        committee.validate_async_security_with_faults(1).unwrap();
-        let context = ConsensusContext::new(
-            ConsensusBinding {
-                domain: [0x11; 32],
-                application: CONSOLIDATION_INTENT_APPLICATION.to_vec(),
-                wallet: [0x22; 32],
-                network: [0x33; 32],
-                registry: [0x44; 32],
-                activation: [0x55; 32],
-            },
-            SessionId([0x71; 32]),
-            committee,
-            1,
-            0,
-            41,
-            [0; 32],
-        )
-        .unwrap();
-        let authorization = TransactionAuthorization::new(
-            DepositWalletId(context.binding().wallet),
-            SweepId([0x61; 32]),
-            OpaqueIntentBinding([0x62; 32]),
-            [0x63; 32],
-            [0x64; 32],
-            [0x65; 32],
-            2,
-            50_000,
-            1_000,
-            2_000,
-        )
-        .unwrap();
-        let attempt = AttemptBinding::new(
-            1,
-            context.epoch(),
-            context.binding().registry,
-            context.committee().digest(),
-            context.binding().activation,
-            authorization.root_group_key(),
-            context.committee().threshold,
-            context
-                .committee()
-                .members
-                .iter()
-                .take(usize::from(context.committee().threshold + context.fault_bound()))
-                .map(|member| member.id)
-                .collect(),
-            [0x66; 32],
-            SessionId([0x67; 32]),
-            [0x68; 32],
-        )
-        .unwrap();
-        let intent = ConsolidationIntent::new(&context, authorization, attempt).unwrap();
-        let value = intent.to_consensus_value().unwrap();
-        let witnesses = identities
-            .iter()
-            .take(context.quorum())
-            .map(|identity| {
-                sign_consensus_message(
-                    &context,
-                    identity,
-                    ConsensusMessageBody::Precommit(Vote { view: 0, value: value.digest() }),
-                )
-                .unwrap()
-            })
-            .collect();
-        let commit = CommitCertificate::from_witnesses(&context, 0, value, witnesses).unwrap();
-        let certificate = ConsolidationIntentCertificate::new(context.clone(), commit).unwrap();
-        certificate.verify_expected(&context, &intent).unwrap();
-        ConsolidationSafetyFixture { context, intent, certificate }
-    }
-
-    #[tokio::test]
-    async fn consolidation_safety_readback_cas_and_terminal_closure_are_exact() {
-        let directory = tempfile::tempdir().unwrap();
-        let identity_seed = [0xB1; 32];
-        let store = ProtocolStore::new(directory.path(), PartyId(1), &identity_seed).unwrap();
-        let fixture = consolidation_safety_fixture();
-        let mut state = ConsolidationAttemptSafety::new(
-            PartyId(1),
-            &fixture.context,
-            fixture.intent.clone(),
-            &fixture.certificate,
-        )
-        .unwrap();
-        let key = state.key();
-
-        let initial = state.encode().unwrap();
-        let initial_metadata = store
-            .save_consolidation_attempt_safety(
-                &fixture.context,
-                &fixture.intent,
-                &fixture.certificate,
-                &initial,
-                &mut OsRng,
-            )
-            .await
-            .unwrap();
-        assert_eq!(initial_metadata.revision, 0);
-        assert!(!initial_metadata.closed);
-        let initial_file =
-            tokio::fs::read(store.consolidation_attempt_safety_path(key)).await.unwrap();
-        let retry_metadata = store
-            .save_consolidation_attempt_safety(
-                &fixture.context,
-                &fixture.intent,
-                &fixture.certificate,
-                &initial,
-                &mut OsRng,
-            )
-            .await
-            .unwrap();
-        assert_eq!(retry_metadata, initial_metadata);
-        assert_eq!(
-            tokio::fs::read(store.consolidation_attempt_safety_path(key)).await.unwrap(),
-            initial_file,
-            "an exact same-revision retry must not reseal the record"
-        );
-        let loaded = store
-            .load_consolidation_attempt_safety(
-                key,
-                &fixture.context,
-                &fixture.intent,
-                &fixture.certificate,
-            )
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(loaded.canonical_state(), initial);
-        assert_eq!(loaded.state, state);
-
-        state.mark_nonce_released(&fixture.context, &fixture.intent, &fixture.certificate).unwrap();
-        let nonce_released = state.encode().unwrap();
-        store
-            .save_consolidation_attempt_safety(
-                &fixture.context,
-                &fixture.intent,
-                &fixture.certificate,
-                &nonce_released,
-                &mut OsRng,
-            )
-            .await
-            .unwrap();
-        let payload = b"exact outbound FROST share".to_vec();
-        let pending = state
-            .prepare_share_exposure(
-                &fixture.context,
-                &fixture.intent,
-                &fixture.certificate,
-                payload.clone(),
-            )
-            .unwrap();
-        let exposed_metadata = store
-            .save_consolidation_attempt_safety(
-                &fixture.context,
-                &fixture.intent,
-                &fixture.certificate,
-                pending.state_to_persist(),
-                &mut OsRng,
-            )
-            .await
-            .unwrap();
-        assert_eq!(exposed_metadata.revision, 2);
-        let exposed = store
-            .load_consolidation_attempt_safety(
-                key,
-                &fixture.context,
-                &fixture.intent,
-                &fixture.certificate,
-            )
-            .await
-            .unwrap()
-            .unwrap();
-        let released = pending
-            .release_after_persisted_state(
-                exposed.canonical_state(),
-                &fixture.context,
-                &fixture.intent,
-                &fixture.certificate,
-            )
-            .unwrap();
-        assert_eq!(released.payload(), payload);
-        let sealed = tokio::fs::read(store.consolidation_attempt_safety_path(key)).await.unwrap();
-        assert!(!sealed.windows(payload.len()).any(|window| window == payload));
-        assert!(matches!(
-            store
-                .close_consolidation_attempt_safety(
-                    key,
-                    &fixture.context,
-                    &fixture.intent,
-                    &fixture.certificate,
-                    &mut OsRng,
-                )
-                .await,
-            Err(StoreError::ConsolidationAttemptSafetyNotTerminal(found)) if found == key
-        ));
-
-        state
-            .mark_threshold_exposed(&fixture.context, &fixture.intent, &fixture.certificate)
-            .unwrap();
-        let terminal = state.encode().unwrap();
-        store
-            .save_consolidation_attempt_safety(
-                &fixture.context,
-                &fixture.intent,
-                &fixture.certificate,
-                &terminal,
-                &mut OsRng,
-            )
-            .await
-            .unwrap();
-        let active_terminal_file =
-            tokio::fs::read(store.consolidation_attempt_safety_path(key)).await.unwrap();
-        let closed = store
-            .close_consolidation_attempt_safety(
-                key,
-                &fixture.context,
-                &fixture.intent,
-                &fixture.certificate,
-                &mut OsRng,
-            )
-            .await
-            .unwrap();
-        assert!(closed.closed);
-        assert_eq!(closed.revision, state.revision());
-        let durable_closed = store
-            .load_consolidation_attempt_safety(
-                key,
-                &fixture.context,
-                &fixture.intent,
-                &fixture.certificate,
-            )
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(durable_closed.is_closed());
-        assert_eq!(durable_closed.canonical_state(), terminal);
-        assert_eq!(
-            store
-                .close_consolidation_attempt_safety(
-                    key,
-                    &fixture.context,
-                    &fixture.intent,
-                    &fixture.certificate,
-                    &mut OsRng,
-                )
-                .await
-                .unwrap(),
-            closed
-        );
-        assert!(matches!(
-            store
-                .save_consolidation_attempt_safety(
-                    &fixture.context,
-                    &fixture.intent,
-                    &fixture.certificate,
-                    &terminal,
-                    &mut OsRng,
-                )
-                .await,
-            Err(StoreError::ConsolidationAttemptSafetyClosed(found)) if found == key
-        ));
-
-        // A replay of the valid pre-closure ciphertext is still a same-revision fork because the
-        // authenticated closure bit is part of the locally observed head.
-        tokio::fs::write(store.consolidation_attempt_safety_path(key), active_terminal_file)
-            .await
-            .unwrap();
-        assert!(matches!(
-            store
-                .load_consolidation_attempt_safety(
-                    key,
-                    &fixture.context,
-                    &fixture.intent,
-                    &fixture.certificate,
-                )
-                .await,
-            Err(StoreError::ConsolidationAttemptSafetyForkDetected { key: found, .. })
-                if found == key
-        ));
-    }
-
-    #[tokio::test]
-    async fn consolidation_safety_detects_rollback_fork_deletion_and_bounded_traversal() {
-        let directory = tempfile::tempdir().unwrap();
-        let identity_seed = [0xB2; 32];
-        let store = ProtocolStore::new(directory.path(), PartyId(1), &identity_seed).unwrap();
-        let fixture = consolidation_safety_fixture();
-        let mut state = ConsolidationAttemptSafety::new(
-            PartyId(1),
-            &fixture.context,
-            fixture.intent.clone(),
-            &fixture.certificate,
-        )
-        .unwrap();
-        let key = state.key();
-        let initial = state.encode().unwrap();
-        store
-            .save_consolidation_attempt_safety(
-                &fixture.context,
-                &fixture.intent,
-                &fixture.certificate,
-                &initial,
-                &mut OsRng,
-            )
-            .await
-            .unwrap();
-        let revision_zero_file =
-            tokio::fs::read(store.consolidation_attempt_safety_path(key)).await.unwrap();
-        state.mark_nonce_released(&fixture.context, &fixture.intent, &fixture.certificate).unwrap();
-        let revision_one_state = state.clone();
-        let revision_one = state.encode().unwrap();
-        let revision_one_metadata = store
-            .save_consolidation_attempt_safety(
-                &fixture.context,
-                &fixture.intent,
-                &fixture.certificate,
-                &revision_one,
-                &mut OsRng,
-            )
-            .await
-            .unwrap();
-        let revision_one_file =
-            tokio::fs::read(store.consolidation_attempt_safety_path(key)).await.unwrap();
-
-        tokio::fs::write(store.consolidation_attempt_safety_path(key), &revision_zero_file)
-            .await
-            .unwrap();
-        assert!(matches!(
-            store
-                .load_consolidation_attempt_safety(
-                    key,
-                    &fixture.context,
-                    &fixture.intent,
-                    &fixture.certificate,
-                )
-                .await,
-            Err(StoreError::ConsolidationAttemptSafetyRollbackDetected {
-                key: found,
-                highest_seen: 1,
-                found: 0,
-            }) if found == key
-        ));
-        tokio::fs::write(store.consolidation_attempt_safety_path(key), &revision_one_file)
-            .await
-            .unwrap();
-
-        let pending = state
-            .prepare_share_exposure(
-                &fixture.context,
-                &fixture.intent,
-                &fixture.certificate,
-                b"main share".to_vec(),
-            )
-            .unwrap();
-        store
-            .save_consolidation_attempt_safety(
-                &fixture.context,
-                &fixture.intent,
-                &fixture.certificate,
-                pending.state_to_persist(),
-                &mut OsRng,
-            )
-            .await
-            .unwrap();
-        let revision_two_file =
-            tokio::fs::read(store.consolidation_attempt_safety_path(key)).await.unwrap();
-
-        let mut fork = revision_one_state;
-        fork.mark_threshold_exposed(&fixture.context, &fixture.intent, &fixture.certificate)
-            .unwrap();
-        let fork_state = fork.encode().unwrap();
-        let fork_plaintext = encode_consolidation_attempt_safety_snapshot(
-            PartyId(1),
-            key,
-            fork.revision(),
-            revision_one_metadata.snapshot_hash,
-            false,
-            &fork_state,
-        )
-        .unwrap();
-        let fork_sealed = store
-            .seal_protocol_record(
-                consolidation_attempt_safety_record_context(key),
-                &fork_plaintext,
-                MAX_CONSOLIDATION_ATTEMPT_SAFETY_SNAPSHOT_BYTES,
-                &mut OsRng,
-            )
-            .unwrap();
-        tokio::fs::write(store.consolidation_attempt_safety_path(key), fork_sealed.encoded)
-            .await
-            .unwrap();
-        assert!(matches!(
-            store
-                .load_consolidation_attempt_safety(
-                    key,
-                    &fixture.context,
-                    &fixture.intent,
-                    &fixture.certificate,
-                )
-                .await,
-            Err(StoreError::ConsolidationAttemptSafetyForkDetected { key: found, .. })
-                if found == key
-        ));
-        tokio::fs::write(store.consolidation_attempt_safety_path(key), revision_two_file)
-            .await
-            .unwrap();
-
-        assert_eq!(store.consolidation_attempt_safety_records_bounded(1).await.unwrap(), vec![key]);
-        assert!(matches!(
-            store.consolidation_attempt_safety_records_bounded(0).await,
-            Err(StoreError::ProtocolEntryLimit {
-                kind: "consolidation attempt safety record",
-                maximum: 0,
-            })
-        ));
-        let wrong_key = AttemptSafetyKey::from_parts(key.session(), [0xFF; 32]).unwrap();
-        assert!(matches!(
-            store
-                .load_consolidation_attempt_safety(
-                    wrong_key,
-                    &fixture.context,
-                    &fixture.intent,
-                    &fixture.certificate,
-                )
-                .await,
-            Err(StoreError::ConsolidationAttemptSafetyKeyMismatch)
-        ));
-
-        tokio::fs::remove_file(store.consolidation_attempt_safety_path(key)).await.unwrap();
-        assert!(matches!(
-            store
-                .load_consolidation_attempt_safety(
-                    key,
-                    &fixture.context,
-                    &fixture.intent,
-                    &fixture.certificate,
-                )
-                .await,
-            Err(StoreError::ConsolidationAttemptSafetySnapshotDisappeared {
-                key: found,
-                highest_seen: 2,
-            }) if found == key
-        ));
     }
 
     fn share() -> EpochShare {
@@ -7188,6 +7267,7 @@ mod tests {
 
     struct RotationFixture {
         context: KeyRotationContext,
+        receiver_keys: ReceiverKeyAccumulatorStore,
         source: Vec<Identity>,
         target: Vec<Identity>,
     }
@@ -7241,6 +7321,22 @@ mod tests {
         }
     }
 
+    fn rotation_receiver_key_store(
+        network: [u8; 32],
+        source: &Committee,
+        eligible: &Committee,
+    ) -> ReceiverKeyAccumulatorStore {
+        let entries = source
+            .members
+            .iter()
+            .chain(&eligible.members)
+            .map(|member| (member.id, member.encryption_key))
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        ReceiverKeyAccumulatorStore::from_entries_at_epoch(network, source.epoch, &entries).unwrap()
+    }
+
     fn rotation_identity_from_secret(secret: &EpochEncryptionSecret) -> Identity {
         explicit_test_identity(
             secret.party(),
@@ -7279,40 +7375,64 @@ mod tests {
             .collect::<Vec<_>>();
         let committee = rotation_committee(source_epoch, &source);
         // Async-security selection requires a certified target of n=4 (n >= 3f+1 with f=1) and an
-        // eligible pool floor of desired_n + f = 5, so extend the baseline with a single joiner
+        // eligible pool floor of desired_n + f = 5, so extend the pool with a single joiner
         // spare that is eligible but never advertised and therefore never selected.
         let spare = rotation_bootstrap_identity(PartyId(5), target_epoch);
-        let mut target_baseline = committee.clone();
-        target_baseline.epoch = target_epoch;
-        target_baseline.members.push(Member {
+        let mut eligible = committee.clone();
+        eligible.epoch = target_epoch;
+        eligible.members.push(Member {
             id: PartyId(5),
             signing_key: spare.signing_public_key(),
             encryption_key: spare.encryption_public_key(),
         });
-        let target_policy =
-            KeyRotationTargetPolicy::new(&committee, target_baseline, 4, 1).unwrap();
+        let network = [0x31; 32];
+        let receiver_keys = rotation_receiver_key_store(network, &committee, &eligible);
+        let target_policy = KeyRotationTargetPolicy::new(
+            &committee,
+            1,
+            eligible.clone(),
+            4,
+            1,
+            receiver_keys.commitment(),
+            10_000,
+        )
+        .unwrap();
         let context =
-            KeyRotationContext::new([0x31; 32], committee, [0x41; 32], 1, target_policy).unwrap();
-        RotationFixture { context, source, target }
+            KeyRotationContext::new(network, committee, [0x41; 32], 1, target_policy).unwrap();
+        RotationFixture { context, receiver_keys, source, target }
     }
 
     fn committed_rotation_rounds(fixture: &RotationFixture) -> Vec<KeyRotationRound> {
-        committed_rotation_rounds_for(&fixture.context, &fixture.source, &fixture.target, 4)
+        committed_rotation_rounds_for(
+            &fixture.context,
+            &fixture.receiver_keys,
+            &fixture.source,
+            &fixture.target,
+            4,
+        )
     }
 
     fn committed_rotation_rounds_for(
         context: &KeyRotationContext,
+        receiver_keys: &ReceiverKeyAccumulatorStore,
         source: &[Identity],
         target: &[Identity],
         advertiser_count: usize,
     ) -> Vec<KeyRotationRound> {
         let advertisers =
             target.iter().take(advertiser_count).map(Identity::party).collect::<Vec<_>>();
-        committed_rotation_rounds_for_advertisers(context, source, target, &advertisers)
+        committed_rotation_rounds_for_advertisers(
+            context,
+            receiver_keys,
+            source,
+            target,
+            &advertisers,
+        )
     }
 
     fn committed_rotation_rounds_for_advertisers(
         context: &KeyRotationContext,
+        receiver_keys: &ReceiverKeyAccumulatorStore,
         source: &[Identity],
         target: &[Identity],
         advertisers: &[PartyId],
@@ -7331,8 +7451,34 @@ mod tests {
                         *advertiser,
                         KeyRotationWire::Advertisement(advertisement.clone()),
                         local_identity,
+                        receiver_keys,
                     )
                     .unwrap();
+            }
+        }
+        let retained_source =
+            advertisers.iter().filter(|party| context.source().member(**party).is_ok()).count();
+        if retained_source < context.primary_source_overlap() {
+            let votes = source
+                .iter()
+                .map(|identity| {
+                    crate::key_rotation::sign_selection_fallback_vote(context, identity).unwrap()
+                })
+                .collect::<Vec<_>>();
+            for (round, identity) in rounds.iter_mut().zip(source) {
+                round.authorize_fallback(identity, receiver_keys).unwrap();
+                for vote in &votes {
+                    if vote.from != identity.party() {
+                        round
+                            .handle_wire(
+                                vote.from,
+                                KeyRotationWire::FallbackVote(vote.clone()),
+                                identity,
+                                receiver_keys,
+                            )
+                            .unwrap();
+                    }
+                }
             }
         }
         for _ in 0..512 {
@@ -7357,6 +7503,7 @@ mod tests {
                         sender,
                         pending.wire,
                         &source[recipient_index],
+                        receiver_keys,
                     ) {
                         Ok(_) => {
                             assert_eq!(rounds[sender_index].acknowledge(&[pending.id]).unwrap(), 1);
@@ -7404,6 +7551,31 @@ mod tests {
             tokio::fs::symlink_metadata(&lock_path).await.unwrap().is_file(),
             "normal drop must unlock but never delete the permanent inode"
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn private_directory_rechecks_do_not_dirty_an_already_private_inode() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("private");
+        ensure_private_directory(&path).await.unwrap();
+        tokio::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).await.unwrap();
+        ensure_private_directory(&path).await.unwrap();
+        let before = tokio::fs::symlink_metadata(&path).await.unwrap();
+        assert_eq!(before.permissions().mode() & 0o7777, 0o700);
+        ensure_private_directory(&path).await.unwrap();
+        let after = tokio::fs::symlink_metadata(&path).await.unwrap();
+        assert_eq!((after.ctime(), after.ctime_nsec()), (before.ctime(), before.ctime_nsec()));
+        assert_eq!(after.permissions().mode() & 0o7777, 0o700);
+
+        let link = root.path().join("link");
+        std::os::unix::fs::symlink(&path, &link).unwrap();
+        assert!(matches!(
+            ensure_private_directory(&link).await,
+            Err(StoreError::UnexpectedEntry(_))
+        ));
     }
 
     #[tokio::test]
@@ -7512,6 +7684,104 @@ mod tests {
                 .await
                 .unwrap()
         );
+    }
+
+    fn bounded_session_state_fixture(index: usize) -> (SessionId, [u8; 32], [u8; 8]) {
+        let index = u64::try_from(index).unwrap();
+        let mut session = [0xA5; 32];
+        session[..8].copy_from_slice(&index.to_be_bytes());
+        let mut context = [0x5A; 32];
+        context[..8].copy_from_slice(&index.to_be_bytes());
+        (SessionId(session), context, index.to_be_bytes())
+    }
+
+    #[tokio::test]
+    async fn session_state_restore_rejects_cap_plus_one_before_authentication() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = ProtocolStore::new(directory.path(), PartyId(1), &[0x41; 32]).unwrap();
+        ensure_private_directory(&store.session_directory()).await.unwrap();
+
+        // Every entry is deliberately unauthenticated. The cap must be established by bounded
+        // filename traversal before restoration opens even the first ciphertext.
+        for index in 0..=MAX_SESSION_STATE_RECORDS {
+            let (session, context, _) = bounded_session_state_fixture(index);
+            tokio::fs::write(
+                store.session_state_path(session, context),
+                b"deliberately unauthenticated",
+            )
+            .await
+            .unwrap();
+        }
+
+        assert!(matches!(
+            store.session_states().await,
+            Err(StoreError::ProtocolEntryLimit {
+                kind: "session state",
+                maximum: MAX_SESSION_STATE_RECORDS,
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn session_state_restore_accepts_exact_protocol_maximum_and_returns_blobs() {
+        let directory = tempfile::tempdir().unwrap();
+        let identity_seed = [0x42; 32];
+        let store = ProtocolStore::new(directory.path(), PartyId(1), &identity_seed).unwrap();
+
+        for index in 0..MAX_SESSION_STATE_RECORDS {
+            let (session, context, state) = bounded_session_state_fixture(index);
+            store.save_session_state(session, context, &state, &mut OsRng).await.unwrap();
+        }
+        let (overflow_session, overflow_context, overflow_state) =
+            bounded_session_state_fixture(MAX_SESSION_STATE_RECORDS);
+        assert!(matches!(
+            store
+                .save_session_state(
+                    overflow_session,
+                    overflow_context,
+                    &overflow_state,
+                    &mut OsRng,
+                )
+                .await,
+            Err(StoreError::ProtocolEntryLimit {
+                kind: "session state",
+                maximum: MAX_SESSION_STATE_RECORDS,
+            })
+        ));
+
+        let restarted = ProtocolStore::new(directory.path(), PartyId(1), &identity_seed).unwrap();
+        let restored = restarted.session_states().await.unwrap();
+        assert_eq!(restored.len(), MAX_SESSION_STATE_RECORDS);
+        for (index, restored) in restored.into_iter().enumerate() {
+            let (session, context, state) = bounded_session_state_fixture(index);
+            assert_eq!(restored.session, session);
+            assert_eq!(restored.context_digest, context);
+            assert_eq!(restored.state.as_bytes(), state);
+        }
+    }
+
+    #[tokio::test]
+    async fn session_context_claim_is_serialized_across_store_handles() {
+        let directory = tempfile::tempdir().unwrap();
+        let first = ProtocolStore::new(directory.path(), PartyId(1), &[0x43; 32]).unwrap();
+        let second = ProtocolStore::new(directory.path(), PartyId(1), &[0x43; 32]).unwrap();
+        let session = SessionId([0x44; 32]);
+        let mut first_rng = OsRng;
+        let mut second_rng = OsRng;
+        let (first_result, second_result) = tokio::join!(
+            first.save_session_state(session, [0x45; 32], b"first", &mut first_rng),
+            second.save_session_state(session, [0x46; 32], b"second", &mut second_rng),
+        );
+
+        assert_eq!(usize::from(first_result.is_ok()) + usize::from(second_result.is_ok()), 1);
+        let rejected = if first_result.is_err() { first_result } else { second_result };
+        assert!(matches!(
+            rejected,
+            Err(StoreError::SessionContextConflict { session: found }) if found == session
+        ));
+        let restored = first.session_states().await.unwrap();
+        assert_eq!(restored.len(), 1);
+        assert_eq!(restored[0].session, session);
     }
 
     #[tokio::test]
@@ -8021,6 +8291,527 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn deposit_state_transfer_intents_create_replace_clear_restart_and_exact_retry() {
+        let directory = tempfile::tempdir().unwrap();
+        let identity_seed = [0x31; 32];
+        let network_id = [0x32; 32];
+        let store = ProtocolStore::new(directory.path(), PartyId(1), &identity_seed).unwrap();
+        assert!(store.load_deposit_state_transfer_intents(network_id).await.unwrap().is_none());
+
+        let empty = store
+            .save_deposit_state_transfer_intents(network_id, None, b"", &mut OsRng)
+            .await
+            .unwrap();
+        assert_eq!(empty.revision, 0);
+        assert_eq!(empty.previous_snapshot_hash, [0_u8; 32]);
+        assert_eq!(
+            store
+                .save_deposit_state_transfer_intents(network_id, None, b"", &mut OsRng)
+                .await
+                .unwrap(),
+            empty,
+            "an uncertain revision-zero response must be exactly retryable"
+        );
+
+        let populated_state = b"recipient=2/request=deterministic/scope=export-seal";
+        let populated = store
+            .save_deposit_state_transfer_intents(
+                network_id,
+                Some(empty),
+                populated_state,
+                &mut OsRng,
+            )
+            .await
+            .unwrap();
+        assert_eq!(populated.revision, 1);
+        assert_eq!(populated.previous_snapshot_hash, empty.snapshot_hash);
+        assert_eq!(
+            store
+                .save_deposit_state_transfer_intents(
+                    network_id,
+                    Some(empty),
+                    populated_state,
+                    &mut OsRng,
+                )
+                .await
+                .unwrap(),
+            populated,
+            "an uncertain successor response must return the authenticated successor"
+        );
+
+        let cleared = store
+            .save_deposit_state_transfer_intents(network_id, Some(populated), b"", &mut OsRng)
+            .await
+            .unwrap();
+        assert_eq!(cleared.revision, 2);
+        assert_eq!(cleared.previous_snapshot_hash, populated.snapshot_hash);
+        assert!(
+            tokio::fs::symlink_metadata(store.deposit_state_transfer_intents_path())
+                .await
+                .unwrap()
+                .is_file(),
+            "clearing intents must persist an empty head rather than delete the rollback fence"
+        );
+
+        let restarted = ProtocolStore::new(directory.path(), PartyId(1), &identity_seed).unwrap();
+        let loaded =
+            restarted.load_deposit_state_transfer_intents(network_id).await.unwrap().unwrap();
+        assert_eq!(loaded.metadata, cleared);
+        assert!(loaded.state.is_empty());
+    }
+
+    #[tokio::test]
+    async fn deposit_state_transfer_intents_enforce_network_and_plaintext_bounds() {
+        let directory = tempfile::tempdir().unwrap();
+        let network_id = [0x33; 32];
+        let store = ProtocolStore::new(directory.path(), PartyId(1), &[0x34; 32]).unwrap();
+        assert!(matches!(
+            store.save_deposit_state_transfer_intents([0_u8; 32], None, b"", &mut OsRng).await,
+            Err(StoreError::InvalidDepositStateTransferIntentsNetwork)
+        ));
+        assert!(matches!(
+            store.load_deposit_state_transfer_intents([0_u8; 32]).await,
+            Err(StoreError::InvalidDepositStateTransferIntentsNetwork)
+        ));
+
+        let maximum = vec![0x35; MAX_DEPOSIT_STATE_TRANSFER_INTENTS_BYTES];
+        let head = store
+            .save_deposit_state_transfer_intents(network_id, None, &maximum, &mut OsRng)
+            .await
+            .unwrap();
+        let oversized = vec![0x36; MAX_DEPOSIT_STATE_TRANSFER_INTENTS_BYTES + 1];
+        assert!(matches!(
+            store
+                .save_deposit_state_transfer_intents(
+                    network_id,
+                    Some(head),
+                    &oversized,
+                    &mut OsRng,
+                )
+                .await,
+            Err(StoreError::BlobTooLarge {
+                kind: "deposit state-transfer intent state",
+                actual,
+                maximum: MAX_DEPOSIT_STATE_TRANSFER_INTENTS_BYTES,
+            }) if actual == MAX_DEPOSIT_STATE_TRANSFER_INTENTS_BYTES + 1
+        ));
+        assert_eq!(
+            store
+                .load_deposit_state_transfer_intents(network_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .state
+                .as_bytes(),
+            maximum,
+            "an oversized successor must not replace the authenticated head"
+        );
+    }
+
+    #[tokio::test]
+    async fn deposit_state_transfer_intents_reject_forks_wrong_context_and_wrong_key() {
+        let directory = tempfile::tempdir().unwrap();
+        let identity_seed = [0x37; 32];
+        let network_id = [0x38; 32];
+        let store = ProtocolStore::new(directory.path(), PartyId(2), &identity_seed).unwrap();
+        let first = store
+            .save_deposit_state_transfer_intents(network_id, None, b"first", &mut OsRng)
+            .await
+            .unwrap();
+        let second = store
+            .save_deposit_state_transfer_intents(network_id, Some(first), b"second", &mut OsRng)
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            store
+                .save_deposit_state_transfer_intents(
+                    network_id,
+                    Some(first),
+                    b"competing-second",
+                    &mut OsRng,
+                )
+                .await,
+            Err(StoreError::DepositStateTransferIntentsRevisionConflict {
+                network_id: found,
+                revision: 1,
+            }) if found == network_id
+        ));
+        let forged = DepositStateTransferIntentsMetadata { snapshot_hash: [0x39; 32], ..second };
+        assert!(matches!(
+            store
+                .save_deposit_state_transfer_intents(
+                    network_id,
+                    Some(forged),
+                    b"third",
+                    &mut OsRng,
+                )
+                .await,
+            Err(StoreError::DepositStateTransferIntentsForkDetected {
+                network_id: found,
+                revision: 1,
+            }) if found == network_id
+        ));
+        assert_eq!(
+            store
+                .load_deposit_state_transfer_intents(network_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .state
+                .as_bytes(),
+            b"second"
+        );
+
+        assert!(matches!(
+            store.load_deposit_state_transfer_intents([0x3A; 32]).await,
+            Err(StoreError::WrongContext)
+        ));
+        let wrong_key_store =
+            ProtocolStore::new(directory.path(), PartyId(2), &[0x3B; 32]).unwrap();
+        assert!(matches!(
+            wrong_key_store.load_deposit_state_transfer_intents(network_id).await,
+            Err(StoreError::Authentication)
+        ));
+    }
+
+    #[tokio::test]
+    async fn deposit_state_transfer_intents_detect_rollback_and_disappearance_in_process() {
+        let directory = tempfile::tempdir().unwrap();
+        let network_id = [0x3C; 32];
+        let store = ProtocolStore::new(directory.path(), PartyId(3), &[0x3D; 32]).unwrap();
+        let first = store
+            .save_deposit_state_transfer_intents(network_id, None, b"first", &mut OsRng)
+            .await
+            .unwrap();
+        let path = store.deposit_state_transfer_intents_path();
+        let first_record = tokio::fs::read(&path).await.unwrap();
+        let second = store
+            .save_deposit_state_transfer_intents(network_id, Some(first), b"second", &mut OsRng)
+            .await
+            .unwrap();
+        let second_record = tokio::fs::read(&path).await.unwrap();
+
+        tokio::fs::write(&path, &first_record).await.unwrap();
+        assert!(matches!(
+            store.load_deposit_state_transfer_intents(network_id).await,
+            Err(StoreError::DepositStateTransferIntentsRollbackDetected {
+                network_id: found,
+                highest_seen: 1,
+                found: 0,
+            }) if found == network_id
+        ));
+
+        tokio::fs::write(&path, &second_record).await.unwrap();
+        assert_eq!(
+            store.load_deposit_state_transfer_intents(network_id).await.unwrap().unwrap().metadata,
+            second
+        );
+        tokio::fs::remove_file(&path).await.unwrap();
+        assert!(matches!(
+            store.load_deposit_state_transfer_intents(network_id).await,
+            Err(StoreError::DepositStateTransferIntentsDisappeared {
+                network_id: found,
+                highest_seen: 1,
+            }) if found == network_id
+        ));
+    }
+
+    #[tokio::test]
+    async fn deposit_state_transfer_intents_reject_tampered_and_noncanonical_sealed_records() {
+        let directory = tempfile::tempdir().unwrap();
+        let network_id = [0x3E; 32];
+        let store = ProtocolStore::new(directory.path(), PartyId(4), &[0x3F; 32]).unwrap();
+        store
+            .save_deposit_state_transfer_intents(network_id, None, b"intent", &mut OsRng)
+            .await
+            .unwrap();
+        let path = store.deposit_state_transfer_intents_path();
+        let original = tokio::fs::read(&path).await.unwrap();
+
+        let mut tampered = original.clone();
+        let last = tampered.len() - 1;
+        tampered[last] ^= 1;
+        tokio::fs::write(&path, tampered).await.unwrap();
+        assert!(matches!(
+            store.load_deposit_state_transfer_intents(network_id).await,
+            Err(StoreError::Authentication)
+                | Err(StoreError::NonCanonicalEncoding { kind: "sealed protocol record" })
+        ));
+
+        let mut trailing = original;
+        trailing.push(0);
+        tokio::fs::write(&path, trailing).await.unwrap();
+        assert!(matches!(
+            store.load_deposit_state_transfer_intents(network_id).await,
+            Err(StoreError::TrailingBytes { kind: "sealed protocol record", trailing: 1 })
+        ));
+    }
+
+    #[test]
+    fn deposit_state_transfer_intents_inner_snapshot_is_canonical_bounded_and_hash_chained() {
+        let party = PartyId(5);
+        let network_id = [0x40; 32];
+        let encoded =
+            encode_deposit_state_transfer_intents_snapshot(party, network_id, 0, [0; 32], b"")
+                .unwrap();
+        let (metadata, state) =
+            decode_deposit_state_transfer_intents_snapshot(party, network_id, &encoded).unwrap();
+        assert_eq!(metadata.revision, 0);
+        assert!(state.is_empty());
+
+        let mut trailing = encoded.clone();
+        trailing.push(0);
+        assert!(matches!(
+            decode_deposit_state_transfer_intents_snapshot(party, network_id, &trailing),
+            Err(StoreError::NonCanonicalEncoding {
+                kind: "deposit state-transfer intent snapshot",
+            })
+        ));
+
+        let mut wrong_version = encoded.clone();
+        wrong_version[..2].copy_from_slice(&u16::MAX.to_le_bytes());
+        assert!(matches!(
+            decode_deposit_state_transfer_intents_snapshot(party, network_id, &wrong_version,),
+            Err(StoreError::WrongContext)
+        ));
+
+        let mut oversized_claim = encoded.clone();
+        oversized_claim[74..82].copy_from_slice(
+            &u64::try_from(MAX_DEPOSIT_STATE_TRANSFER_INTENTS_BYTES + 1).unwrap().to_le_bytes(),
+        );
+        assert!(matches!(
+            decode_deposit_state_transfer_intents_snapshot(
+                party,
+                network_id,
+                &oversized_claim,
+            ),
+            Err(StoreError::BlobTooLarge {
+                kind: "deposit state-transfer intent state",
+                actual,
+                maximum: MAX_DEPOSIT_STATE_TRANSFER_INTENTS_BYTES,
+            }) if actual == MAX_DEPOSIT_STATE_TRANSFER_INTENTS_BYTES + 1
+        ));
+
+        let mut invalid_chain = encoded;
+        let previous = [0x41; 32];
+        invalid_chain[10..42].copy_from_slice(&previous);
+        let hash =
+            deposit_state_transfer_intents_snapshot_hash(party, network_id, 0, previous, b"");
+        invalid_chain[42..74].copy_from_slice(&hash);
+        assert!(matches!(
+            decode_deposit_state_transfer_intents_snapshot(
+                party,
+                network_id,
+                &invalid_chain,
+            ),
+            Err(StoreError::DepositStateTransferIntentsHashChainMismatch {
+                network_id: found,
+                revision: 0,
+            }) if found == network_id
+        ));
+
+        assert!(matches!(
+            encode_deposit_state_transfer_intents_snapshot(
+                party,
+                network_id,
+                1,
+                [0; 32],
+                b"intent",
+            ),
+            Err(StoreError::DepositStateTransferIntentsHashChainMismatch {
+                network_id: found,
+                revision: 1,
+            }) if found == network_id
+        ));
+        let oversized = vec![0x42; MAX_DEPOSIT_STATE_TRANSFER_INTENTS_BYTES + 1];
+        assert!(matches!(
+            encode_deposit_state_transfer_intents_snapshot(
+                party,
+                network_id,
+                0,
+                [0; 32],
+                &oversized,
+            ),
+            Err(StoreError::BlobTooLarge {
+                kind: "deposit state-transfer intent state",
+                actual,
+                maximum: MAX_DEPOSIT_STATE_TRANSFER_INTENTS_BYTES,
+            }) if actual == MAX_DEPOSIT_STATE_TRANSFER_INTENTS_BYTES + 1
+        ));
+    }
+
+    #[tokio::test]
+    async fn deposit_sync_spool_head_create_successor_restart_and_exact_retry_are_durable() {
+        let directory = tempfile::tempdir().unwrap();
+        let identity_seed = [0x8A; 32];
+        let key = DepositSyncSpoolHeadKey {
+            network_id: [0x8B; 32],
+            wallet_id: DepositWalletId([0x8C; 32]),
+        };
+        let store = ProtocolStore::new(directory.path(), PartyId(1), &identity_seed).unwrap();
+        assert!(store.load_deposit_sync_spool_head(key).await.unwrap().is_none());
+
+        let first_state = b"deposit-sync-spool-head/revision-0";
+        let first =
+            store.save_deposit_sync_spool_head(key, None, first_state, &mut OsRng).await.unwrap();
+        assert_eq!(first.revision, 0);
+        assert_eq!(first.previous_snapshot_hash, [0_u8; 32]);
+        assert_eq!(
+            store.save_deposit_sync_spool_head(key, None, first_state, &mut OsRng).await.unwrap(),
+            first,
+            "an uncertain revision-zero response must be exactly retryable"
+        );
+
+        let second_state = b"deposit-sync-spool-head/revision-1";
+        let second = store
+            .save_deposit_sync_spool_head(key, Some(first), second_state, &mut OsRng)
+            .await
+            .unwrap();
+        assert_eq!(second.revision, 1);
+        assert_eq!(second.previous_snapshot_hash, first.snapshot_hash);
+        assert_eq!(
+            store
+                .save_deposit_sync_spool_head(key, Some(first), second_state, &mut OsRng)
+                .await
+                .unwrap(),
+            second,
+            "an uncertain successor response must authenticate and return the durable successor"
+        );
+
+        let restarted = ProtocolStore::new(directory.path(), PartyId(1), &identity_seed).unwrap();
+        let loaded = restarted.load_deposit_sync_spool_head(key).await.unwrap().unwrap();
+        assert_eq!(loaded.metadata, second);
+        assert_eq!(loaded.state.as_bytes(), second_state);
+    }
+
+    #[tokio::test]
+    async fn deposit_sync_spool_head_rejects_oversized_state_without_creating_a_record() {
+        let directory = tempfile::tempdir().unwrap();
+        let key = DepositSyncSpoolHeadKey {
+            network_id: [0x8D; 32],
+            wallet_id: DepositWalletId([0x8E; 32]),
+        };
+        let store = ProtocolStore::new(directory.path(), PartyId(1), &[0x8C; 32]).unwrap();
+        let oversized = vec![0x8F; MAX_DEPOSIT_SYNC_SPOOL_HEAD_BYTES + 1];
+
+        assert!(matches!(
+            store
+                .save_deposit_sync_spool_head(key, None, &oversized, &mut OsRng)
+                .await,
+            Err(StoreError::BlobTooLarge {
+                kind: "deposit sync spool head state",
+                actual,
+                maximum: MAX_DEPOSIT_SYNC_SPOOL_HEAD_BYTES,
+            }) if actual == MAX_DEPOSIT_SYNC_SPOOL_HEAD_BYTES + 1
+        ));
+        assert!(
+            store.load_deposit_sync_spool_head(key).await.unwrap().is_none(),
+            "an oversized candidate must not create a spool-head record"
+        );
+    }
+
+    #[tokio::test]
+    async fn deposit_sync_spool_head_rejects_successor_forks_and_wrong_storage_key() {
+        let directory = tempfile::tempdir().unwrap();
+        let identity_seed = [0x8D; 32];
+        let key = DepositSyncSpoolHeadKey {
+            network_id: [0x8E; 32],
+            wallet_id: DepositWalletId([0x8F; 32]),
+        };
+        let store = ProtocolStore::new(directory.path(), PartyId(2), &identity_seed).unwrap();
+        let first =
+            store.save_deposit_sync_spool_head(key, None, b"first", &mut OsRng).await.unwrap();
+        let second = store
+            .save_deposit_sync_spool_head(key, Some(first), b"second", &mut OsRng)
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            store
+                .save_deposit_sync_spool_head(key, Some(first), b"competing-second", &mut OsRng)
+                .await,
+            Err(StoreError::DepositSyncSpoolHeadRevisionConflict {
+                key: found_key,
+                revision: 1
+            }) if found_key == key
+        ));
+        let forged = DepositSyncSpoolHeadMetadata { snapshot_hash: [0x90; 32], ..second };
+        assert!(matches!(
+            store
+                .save_deposit_sync_spool_head(key, Some(forged), b"third", &mut OsRng)
+                .await,
+            Err(StoreError::DepositSyncSpoolHeadForkDetected {
+                key: found_key,
+                revision: 1
+            }) if found_key == key
+        ));
+        assert_eq!(
+            store.load_deposit_sync_spool_head(key).await.unwrap().unwrap().state.as_bytes(),
+            b"second",
+            "a rejected fork must not replace the durable head"
+        );
+
+        let wrong_context_key =
+            DepositSyncSpoolHeadKey { network_id: [0x90; 32], wallet_id: key.wallet_id };
+        tokio::fs::copy(
+            store.deposit_sync_spool_head_path(key),
+            store.deposit_sync_spool_head_path(wrong_context_key),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            store.load_deposit_sync_spool_head(wrong_context_key).await,
+            Err(StoreError::WrongContext)
+        ));
+
+        let wrong_key_store =
+            ProtocolStore::new(directory.path(), PartyId(2), &[0x91; 32]).unwrap();
+        assert!(matches!(
+            wrong_key_store.load_deposit_sync_spool_head(key).await,
+            Err(StoreError::Authentication)
+        ));
+    }
+
+    #[tokio::test]
+    async fn deposit_sync_spool_head_destroy_requires_exact_head_and_bytes_then_resets_chain() {
+        let directory = tempfile::tempdir().unwrap();
+        let key = DepositSyncSpoolHeadKey {
+            network_id: [0x92; 32],
+            wallet_id: DepositWalletId([0x93; 32]),
+        };
+        let store = ProtocolStore::new(directory.path(), PartyId(3), &[0x94; 32]).unwrap();
+        let state = b"ready-to-delete-spool-head";
+        let head = store.save_deposit_sync_spool_head(key, None, state, &mut OsRng).await.unwrap();
+
+        assert!(matches!(
+            store.destroy_deposit_sync_spool_head(key, head, b"other-spool-head").await,
+            Err(StoreError::DepositSyncSpoolHeadRevisionConflict {
+                key: found_key,
+                revision: 0
+            }) if found_key == key
+        ));
+        let forged = DepositSyncSpoolHeadMetadata { snapshot_hash: [0x95; 32], ..head };
+        assert!(matches!(
+            store.destroy_deposit_sync_spool_head(key, forged, state).await,
+            Err(StoreError::DepositSyncSpoolHeadForkDetected {
+                key: found_key,
+                revision: 0
+            }) if found_key == key
+        ));
+        assert!(store.destroy_deposit_sync_spool_head(key, head, state).await.unwrap());
+        assert!(!store.destroy_deposit_sync_spool_head(key, head, state).await.unwrap());
+        assert!(store.load_deposit_sync_spool_head(key).await.unwrap().is_none());
+
+        let fresh = store
+            .save_deposit_sync_spool_head(key, None, b"fresh-spool-head", &mut OsRng)
+            .await
+            .unwrap();
+        assert_eq!(fresh.revision, 0);
+        assert_ne!(fresh.snapshot_hash, head.snapshot_hash);
+    }
+
+    #[tokio::test]
     async fn key_rotation_round_snapshot_is_monotonic_canonical_and_rollback_fenced() {
         let directory = tempfile::tempdir().unwrap();
         let fixture = rotation_fixture();
@@ -8041,11 +8832,71 @@ mod tests {
 
         let mut advertised = initial.clone();
         let capability = rotation_advertisement_capability(&fixture.target[0]);
-        advertised.advertise(&capability).unwrap();
+        advertised.advertise(&capability, &fixture.receiver_keys).unwrap();
+
+        // Model process termination after a complete revision-one replacement was fsynced under
+        // the canonical temporary-file name but before its atomic rename. The candidate is a
+        // fully authenticated key-rotation record, not arbitrary placeholder bytes.
+        let pending_plaintext = encode_key_rotation_snapshot(
+            PartyId(1),
+            first.key,
+            1,
+            first.snapshot_hash,
+            &advertised.encode().unwrap(),
+        )
+        .unwrap();
+        let pending_context = ProtocolRecordContext::KeyRotationRound {
+            target_epoch: first.key.target_epoch,
+            context_digest: first.key.context_digest,
+        };
+        let pending = store
+            .seal_protocol_record(
+                pending_context.clone(),
+                &pending_plaintext,
+                MAX_KEY_ROTATION_SNAPSHOT_BYTES,
+                &mut OsRng,
+            )
+            .unwrap();
+        let crash_temporary =
+            temporary_path(&store.key_rotation_round_path(first.key), pending.nonce).unwrap();
+        write_private_file(&crash_temporary, &pending.encoded).await.unwrap();
+        let (_, opened_pending) = store
+            .open_protocol_record(
+                &crash_temporary,
+                ExpectedProtocolContext::Exact(pending_context),
+                MAX_KEY_ROTATION_SNAPSHOT_BYTES,
+            )
+            .await
+            .unwrap();
+        assert_eq!(opened_pending.as_bytes(), pending_plaintext);
+        drop(store);
+
+        let store = ProtocolStore::new(directory.path(), PartyId(1), &identity_seed).unwrap();
+        let restored_first =
+            store.load_key_rotation_round(&fixture.context).await.unwrap().unwrap();
+        assert_eq!(restored_first.metadata, first);
+        assert_eq!(
+            restored_first.round, initial,
+            "an unrenamed successor became authoritative after restart"
+        );
+        assert_eq!(
+            store.key_rotation_rounds_bounded(1).await.unwrap(),
+            vec![first.key],
+            "the canonical crash temporary changed startup enumeration"
+        );
+        assert!(
+            tokio::fs::try_exists(&crash_temporary).await.unwrap(),
+            "restart unexpectedly treated an unrenamed replacement as committed"
+        );
+
         let second = store
             .save_key_rotation_round(&fixture.context, 1, &advertised, &mut OsRng)
             .await
             .unwrap();
+        assert!(
+            !tokio::fs::try_exists(&crash_temporary).await.unwrap(),
+            "exact successor replay did not sweep its pre-rename crash temporary"
+        );
         assert_eq!(second.previous_snapshot_hash, first.snapshot_hash);
         assert_eq!(
             store.load_key_rotation_round(&fixture.context).await.unwrap().unwrap().round,
@@ -8089,8 +8940,18 @@ mod tests {
         let identity_seed = [0x92; 32];
         let store = ProtocolStore::new(directory.path(), PartyId(1), &identity_seed).unwrap();
         let secret = fixture.target[0].export_encryption_secret();
-        store.save_epoch_identity_secret(&secret, &mut OsRng).await.unwrap();
-        store.save_epoch_identity_secret(&secret, &mut OsRng).await.unwrap();
+        assert!(matches!(
+            store.save_epoch_identity_secret(&secret, &mut OsRng).await,
+            Err(StoreError::EpochIdentityPolicyConflict { .. })
+        ));
+        store
+            .save_epoch_identity_candidate_secret(&fixture.context, &secret, &mut OsRng)
+            .await
+            .unwrap();
+        store
+            .save_epoch_identity_candidate_secret(&fixture.context, &secret, &mut OsRng)
+            .await
+            .unwrap();
 
         let loaded = store
             .load_epoch_identity_secret(secret.epoch(), secret.public_key())
@@ -8119,12 +8980,12 @@ mod tests {
         let signing_seed = rotation_signing_seed(PartyId(1));
         let signing_public_key = fixture.target[0].signing_public_key();
         let advertisable = store
-            .persist_epoch_advertisement_identity(
+            .load_persisted_key_advertisement_identity(
                 &secret,
+                Some(fixture.context.digest()),
                 &signing_seed,
                 signing_public_key,
                 secret.public_key(),
-                &mut OsRng,
             )
             .await
             .unwrap();
@@ -8136,12 +8997,12 @@ mod tests {
         let first_readback_digest = advertisable.durable_record_digest();
         assert_eq!(
             store
-                .persist_epoch_advertisement_identity(
+                .load_persisted_key_advertisement_identity(
                     &secret,
+                    Some(fixture.context.digest()),
                     &signing_seed,
                     signing_public_key,
                     secret.public_key(),
-                    &mut OsRng,
                 )
                 .await
                 .unwrap()
@@ -8151,24 +9012,24 @@ mod tests {
         );
         assert!(matches!(
             store
-                .persist_epoch_advertisement_identity(
+                .load_persisted_key_advertisement_identity(
                     &secret,
+                    Some(fixture.context.digest()),
                     &[0xEE; 32],
                     signing_public_key,
                     secret.public_key(),
-                    &mut OsRng,
                 )
                 .await,
             Err(StoreError::InvalidIdentity(IdentityError::WrongSigningPublicKey))
         ));
         assert!(matches!(
             store
-                .persist_epoch_advertisement_identity(
+                .load_persisted_key_advertisement_identity(
                     &secret,
+                    Some(fixture.context.digest()),
                     &signing_seed,
                     signing_public_key,
                     [0xEF; 32],
-                    &mut OsRng,
                 )
                 .await,
             Err(StoreError::EpochIdentityConflict { .. })
@@ -8189,37 +9050,34 @@ mod tests {
             Err(StoreError::EpochIdentityConflict { .. })
         ));
 
-        let generated = store
-            .load_or_create_epoch_identity_secret(secret.epoch() + 1, &mut OsRng)
-            .await
-            .unwrap();
+        let generated =
+            store.load_or_create_epoch_identity_secret(&fixture.context, &mut OsRng).await.unwrap();
         assert_eq!(generated.party(), PartyId(1));
         assert_eq!(
-            store
-                .load_or_create_epoch_identity_secret(generated.epoch(), &mut OsRng)
-                .await
-                .unwrap(),
+            store.load_or_create_epoch_identity_secret(&fixture.context, &mut OsRng).await.unwrap(),
             generated
         );
 
-        let advertisement_epoch = generated.epoch() + 1;
         let generated_capability = store
             .load_or_create_epoch_advertisement_identity(
-                advertisement_epoch,
+                &fixture.context,
                 &signing_seed,
                 signing_public_key,
                 &mut OsRng,
             )
             .await
             .unwrap();
-        assert_eq!(generated_capability.identity().encryption_epoch(), advertisement_epoch);
+        assert_eq!(
+            generated_capability.identity().encryption_epoch(),
+            fixture.context.target_epoch()
+        );
         assert_eq!(generated_capability.identity().signing_public_key(), signing_public_key);
         assert_ne!(generated_capability.durable_record_digest(), [0_u8; 32]);
         let generated_public_key = generated_capability.identity().encryption_public_key();
         let generated_digest = generated_capability.durable_record_digest();
         let retried_capability = store
             .load_or_create_epoch_advertisement_identity(
-                advertisement_epoch,
+                &fixture.context,
                 &signing_seed,
                 signing_public_key,
                 &mut OsRng,
@@ -8247,14 +9105,25 @@ mod tests {
             signing_key: bootstrap.signing_public_key(),
             encryption_key: bootstrap.encryption_public_key(),
         });
-        let target_policy =
-            KeyRotationTargetPolicy::new(&source_committee, eligible, 4, 1).unwrap();
+        let network = [0x51; 32];
+        let receiver_keys = rotation_receiver_key_store(network, &source_committee, &eligible);
+        let target_policy = KeyRotationTargetPolicy::new(
+            &source_committee,
+            1,
+            eligible.clone(),
+            4,
+            1,
+            receiver_keys.commitment(),
+            10_000,
+        )
+        .unwrap();
         let context =
-            KeyRotationContext::new([0x51; 32], source_committee, [0x52; 32], 1, target_policy)
+            KeyRotationContext::new(network, source_committee, [0x52; 32], 1, target_policy)
                 .unwrap();
 
         let selected_certificate = committed_rotation_rounds_for_advertisers(
             &context,
+            &receiver_keys,
             &source,
             &target,
             &[PartyId(1), PartyId(2), PartyId(3), PartyId(5)],
@@ -8270,7 +9139,10 @@ mod tests {
         let selected_directory = tempfile::tempdir().unwrap();
         let selected_store =
             ProtocolStore::new(selected_directory.path(), PartyId(5), &[0x53; 32]).unwrap();
-        selected_store.save_epoch_identity_secret(&candidate, &mut OsRng).await.unwrap();
+        selected_store
+            .save_epoch_identity_candidate_secret(&context, &candidate, &mut OsRng)
+            .await
+            .unwrap();
         selected_store
             .save_key_rotation_certificate(&context, &selected_certificate, &mut OsRng)
             .await
@@ -8288,6 +9160,7 @@ mod tests {
 
         let omitted_certificate = committed_rotation_rounds_for_advertisers(
             &context,
+            &receiver_keys,
             &source,
             &target,
             &[PartyId(1), PartyId(2), PartyId(3), PartyId(4)],
@@ -8299,7 +9172,10 @@ mod tests {
         let omitted_directory = tempfile::tempdir().unwrap();
         let omitted_store =
             ProtocolStore::new(omitted_directory.path(), PartyId(5), &[0x54; 32]).unwrap();
-        omitted_store.save_epoch_identity_secret(&candidate, &mut OsRng).await.unwrap();
+        omitted_store
+            .save_epoch_identity_candidate_secret(&context, &candidate, &mut OsRng)
+            .await
+            .unwrap();
         omitted_store
             .save_key_rotation_certificate(&context, &omitted_certificate, &mut OsRng)
             .await
@@ -8315,13 +9191,25 @@ mod tests {
                 .await
                 .is_err()
         );
-        assert_eq!(
+        assert!(
             omitted_store
-                .load_epoch_identity_secret(target_epoch, candidate.public_key())
+                .destroy_unselected_epoch_identity_secret(&context, &omitted_certificate)
                 .await
                 .unwrap(),
-            Some(candidate),
-            "an omitted candidate remains uncertified and cannot receive a successor share"
+            "the certificate must authorize erasure of the omitted candidate"
+        );
+        assert!(
+            !tokio::fs::try_exists(omitted_store.epoch_identity_path(target_epoch)).await.unwrap(),
+            "an omitted candidate secret must not survive the terminal certificate"
+        );
+        let restarted =
+            ProtocolStore::new(omitted_directory.path(), PartyId(5), &[0x54; 32]).unwrap();
+        assert!(
+            !restarted
+                .destroy_unselected_epoch_identity_secret(&context, &omitted_certificate)
+                .await
+                .unwrap(),
+            "restart cleanup is idempotent once the omitted secret is absent"
         );
     }
 
@@ -8337,19 +9225,30 @@ mod tests {
         // The eligible pool must satisfy the desired_n + f floor (4 + 1 = 5), so all five source
         // members remain eligible. Party 5 is simply never advertised and therefore never selected
         // into the certified target of desired_n=4, which is what leaves it without a successor.
-        let mut baseline = rotation_committee(target_epoch, &source);
+        let mut eligible = rotation_committee(target_epoch, &source);
         for (baseline_member, source_member) in
-            baseline.members.iter_mut().zip(&source_committee.members)
+            eligible.members.iter_mut().zip(&source_committee.members)
         {
             baseline_member.encryption_key = source_member.encryption_key;
         }
-        let target_policy =
-            KeyRotationTargetPolicy::new(&source_committee, baseline, 4, 1).unwrap();
+        let network = [0x61; 32];
+        let receiver_keys = rotation_receiver_key_store(network, &source_committee, &eligible);
+        let target_policy = KeyRotationTargetPolicy::new(
+            &source_committee,
+            1,
+            eligible.clone(),
+            4,
+            1,
+            receiver_keys.commitment(),
+            10_000,
+        )
+        .unwrap();
         let context =
-            KeyRotationContext::new([0x61; 32], source_committee, [0x62; 32], 1, target_policy)
+            KeyRotationContext::new(network, source_committee, [0x62; 32], 1, target_policy)
                 .unwrap();
         let certificate = committed_rotation_rounds_for_advertisers(
             &context,
+            &receiver_keys,
             &source,
             &target,
             &[PartyId(1), PartyId(2), PartyId(3), PartyId(4)],
@@ -8361,7 +9260,14 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let store = ProtocolStore::new(directory.path(), PartyId(5), &[0x63; 32]).unwrap();
         let source_secret = source[4].export_encryption_secret();
-        store.save_epoch_identity_secret(&source_secret, &mut OsRng).await.unwrap();
+        store
+            .save_epoch_identity_secret_for_test(
+                &source_secret,
+                context.source_activation(),
+                &mut OsRng,
+            )
+            .await
+            .unwrap();
         store.save_key_rotation_certificate(&context, &certificate, &mut OsRng).await.unwrap();
         let retirement =
             store.retire_epoch_identity_secret(&context, &certificate, &mut OsRng).await.unwrap();
@@ -8392,8 +9298,18 @@ mod tests {
         let store = ProtocolStore::new(directory.path(), PartyId(1), &[0xA0; 32]).unwrap();
         let source = fixture.source[0].export_encryption_secret();
         let candidate = fixture.target[0].export_encryption_secret();
-        store.save_epoch_identity_secret(&source, &mut OsRng).await.unwrap();
-        store.save_epoch_identity_secret(&candidate, &mut OsRng).await.unwrap();
+        store
+            .save_epoch_identity_secret_for_test(
+                &source,
+                fixture.context.source_activation(),
+                &mut OsRng,
+            )
+            .await
+            .unwrap();
+        store
+            .save_epoch_identity_candidate_secret(&fixture.context, &candidate, &mut OsRng)
+            .await
+            .unwrap();
         store
             .save_key_rotation_certificate(&fixture.context, &certificate, &mut OsRng)
             .await
@@ -8412,7 +9328,7 @@ mod tests {
         assert!(matches!(
             store
                 .load_or_create_epoch_advertisement_identity(
-                    candidate.epoch(),
+                    &fixture.context,
                     &rotation_signing_seed(PartyId(1)),
                     fixture.target[0].signing_public_key(),
                     &mut OsRng,
@@ -8463,8 +9379,18 @@ mod tests {
         let source = fixture.source[3].export_encryption_secret();
         let candidate = fixture.target[3].export_encryption_secret();
         let store = ProtocolStore::new(directory.path(), party, &identity_seed).unwrap();
-        store.save_epoch_identity_secret(&source, &mut OsRng).await.unwrap();
-        store.save_epoch_identity_secret(&candidate, &mut OsRng).await.unwrap();
+        store
+            .save_epoch_identity_secret_for_test(
+                &source,
+                fixture.context.source_activation(),
+                &mut OsRng,
+            )
+            .await
+            .unwrap();
+        store
+            .save_epoch_identity_candidate_secret(&fixture.context, &candidate, &mut OsRng)
+            .await
+            .unwrap();
         store
             .save_key_rotation_certificate(&fixture.context, &certificate, &mut OsRng)
             .await
@@ -8519,8 +9445,18 @@ mod tests {
         let missing_certificate =
             ProtocolStore::new(missing_certificate_directory.path(), PartyId(1), &[0xA3; 32])
                 .unwrap();
-        missing_certificate.save_epoch_identity_secret(&source, &mut OsRng).await.unwrap();
-        missing_certificate.save_epoch_identity_secret(&selected, &mut OsRng).await.unwrap();
+        missing_certificate
+            .save_epoch_identity_secret_for_test(
+                &source,
+                fixture.context.source_activation(),
+                &mut OsRng,
+            )
+            .await
+            .unwrap();
+        missing_certificate
+            .save_epoch_identity_candidate_secret(&fixture.context, &selected, &mut OsRng)
+            .await
+            .unwrap();
         assert!(matches!(
             missing_certificate
                 .promote_certified_epoch_identity_secret(
@@ -8539,8 +9475,18 @@ mod tests {
         let unrelated_source =
             explicit_test_identity(PartyId(1), source.epoch(), [0xA5; 32], [0xD5; 32])
                 .export_encryption_secret();
-        wrong_source.save_epoch_identity_secret(&unrelated_source, &mut OsRng).await.unwrap();
-        wrong_source.save_epoch_identity_secret(&selected, &mut OsRng).await.unwrap();
+        wrong_source
+            .save_epoch_identity_secret_for_test(
+                &unrelated_source,
+                fixture.context.source_activation(),
+                &mut OsRng,
+            )
+            .await
+            .unwrap();
+        wrong_source
+            .save_epoch_identity_candidate_secret(&fixture.context, &selected, &mut OsRng)
+            .await
+            .unwrap();
         wrong_source
             .save_key_rotation_certificate(&fixture.context, &certificate, &mut OsRng)
             .await
@@ -8563,8 +9509,18 @@ mod tests {
         let unrelated_target =
             explicit_test_identity(PartyId(1), selected.epoch(), [0xA7; 32], [0xD7; 32])
                 .export_encryption_secret();
-        wrong_target.save_epoch_identity_secret(&source, &mut OsRng).await.unwrap();
-        wrong_target.save_epoch_identity_secret(&unrelated_target, &mut OsRng).await.unwrap();
+        wrong_target
+            .save_epoch_identity_secret_for_test(
+                &source,
+                fixture.context.source_activation(),
+                &mut OsRng,
+            )
+            .await
+            .unwrap();
+        wrong_target
+            .save_epoch_identity_candidate_secret(&fixture.context, &unrelated_target, &mut OsRng)
+            .await
+            .unwrap();
         wrong_target
             .save_key_rotation_certificate(&fixture.context, &certificate, &mut OsRng)
             .await
@@ -8584,8 +9540,18 @@ mod tests {
         let conflicting_directory = tempfile::tempdir().unwrap();
         let conflicting =
             ProtocolStore::new(conflicting_directory.path(), PartyId(1), &[0xA8; 32]).unwrap();
-        conflicting.save_epoch_identity_secret(&source, &mut OsRng).await.unwrap();
-        conflicting.save_epoch_identity_secret(&selected, &mut OsRng).await.unwrap();
+        conflicting
+            .save_epoch_identity_secret_for_test(
+                &source,
+                fixture.context.source_activation(),
+                &mut OsRng,
+            )
+            .await
+            .unwrap();
+        conflicting
+            .save_epoch_identity_candidate_secret(&fixture.context, &selected, &mut OsRng)
+            .await
+            .unwrap();
         conflicting
             .save_key_rotation_certificate(&fixture.context, &certificate, &mut OsRng)
             .await
@@ -8611,6 +9577,7 @@ mod tests {
         .unwrap();
         let alternate = RotationFixture {
             context: alternate_context,
+            receiver_keys: alternate_base.receiver_keys,
             source: alternate_base.source,
             target: alternate_base.target,
         };
@@ -8628,9 +9595,153 @@ mod tests {
                     &mut OsRng,
                 )
                 .await,
-            Err(StoreError::EpochIdentityCertificationConflict { epoch })
+            Err(StoreError::EpochIdentityPolicyConflict { epoch })
                 if epoch == selected.epoch()
         ));
+    }
+
+    #[tokio::test]
+    async fn equivalent_rotation_witness_subsets_normalize_every_durable_side_effect() {
+        let directory = tempfile::tempdir().unwrap();
+        let fixture = rotation_fixture();
+        let mut rounds = committed_rotation_rounds(&fixture);
+        let canonical = rounds.remove(0).certificate().unwrap();
+        let consensus = fixture.context.consensus_context().unwrap();
+        let value = canonical.commit_certificate().value().clone();
+        let view = canonical.commit_certificate().view();
+        let canonical_signers = canonical
+            .commit_certificate()
+            .witnesses()
+            .iter()
+            .map(|witness| witness.from)
+            .collect::<BTreeSet<_>>();
+        let alternate_indices: &[usize] =
+            if canonical_signers == BTreeSet::from([PartyId(1), PartyId(2), PartyId(3)]) {
+                &[1, 2, 3]
+            } else {
+                &[0, 1, 2]
+            };
+        let alternate_witnesses = alternate_indices
+            .iter()
+            .map(|index| {
+                sign_consensus_message(
+                    &consensus,
+                    &fixture.source[*index],
+                    ConsensusMessageBody::Precommit(Vote { view, value: value.digest() }),
+                )
+                .unwrap()
+            })
+            .collect();
+        let alternate_commit =
+            CommitCertificate::from_witnesses(&consensus, view, value, alternate_witnesses)
+                .unwrap();
+        let alternate =
+            KeyRotationCertificate::from_commit(&fixture.context, alternate_commit).unwrap();
+        assert_ne!(alternate, canonical);
+        assert!(alternate.proves_same_decision(&canonical, &fixture.context).unwrap());
+
+        let identity_seed = [0x95; 32];
+        let store = ProtocolStore::new(directory.path(), PartyId(1), &identity_seed).unwrap();
+        let mut alternate_round =
+            KeyRotationRound::new(fixture.context.clone(), PartyId(1)).unwrap();
+        alternate_round
+            .handle_wire(
+                PartyId(2),
+                KeyRotationWire::Certificate(alternate.clone()),
+                &fixture.source[0],
+                &fixture.receiver_keys,
+            )
+            .unwrap();
+        assert_eq!(alternate_round.certificate(), Some(alternate.clone()));
+        store
+            .save_key_rotation_round(&fixture.context, 0, &alternate_round, &mut OsRng)
+            .await
+            .unwrap();
+
+        let source_secret = fixture.source[0].export_encryption_secret();
+        let target_secret = fixture.target[0].export_encryption_secret();
+        store
+            .save_epoch_identity_secret_for_test(
+                &source_secret,
+                fixture.context.source_activation(),
+                &mut OsRng,
+            )
+            .await
+            .unwrap();
+        store
+            .save_epoch_identity_candidate_secret(&fixture.context, &target_secret, &mut OsRng)
+            .await
+            .unwrap();
+        store
+            .save_key_rotation_certificate(&fixture.context, &canonical, &mut OsRng)
+            .await
+            .unwrap();
+        store
+            .save_key_rotation_certificate(&fixture.context, &alternate, &mut OsRng)
+            .await
+            .unwrap();
+        assert_eq!(
+            store.load_key_rotation_certificate(&fixture.context).await.unwrap(),
+            Some(canonical.clone()),
+            "semantic retry replaced the node's exact durable witness artifact"
+        );
+
+        assert_eq!(
+            store
+                .promote_certified_epoch_identity_secret(
+                    &fixture.context,
+                    &alternate,
+                    &target_secret,
+                    &mut OsRng,
+                )
+                .await
+                .unwrap(),
+            target_secret,
+            "promotion must derive its receipt from the first durable certificate"
+        );
+        let retirement = store
+            .retire_epoch_identity_secret(&fixture.context, &alternate, &mut OsRng)
+            .await
+            .unwrap();
+        store.verify_epoch_identity_retirement(retirement, &fixture.context, &canonical).unwrap();
+        store.retire_key_rotation_round(&fixture.context, &alternate, &mut OsRng).await.unwrap();
+        assert!(matches!(
+            store.load_key_rotation_round(&fixture.context).await,
+            Err(StoreError::KeyRotationRoundRetired(_))
+        ));
+
+        let omitted_directory = tempfile::tempdir().unwrap();
+        let omitted_store =
+            ProtocolStore::new(omitted_directory.path(), PartyId(5), &[0x96; 32]).unwrap();
+        let omitted_candidate = rotation_identity(PartyId(5), fixture.context.target_epoch())
+            .export_encryption_secret();
+        omitted_store
+            .save_epoch_identity_candidate_secret(&fixture.context, &omitted_candidate, &mut OsRng)
+            .await
+            .unwrap();
+        omitted_store
+            .save_key_rotation_certificate(&fixture.context, &canonical, &mut OsRng)
+            .await
+            .unwrap();
+        assert!(
+            omitted_store
+                .destroy_unselected_epoch_identity_secret(&fixture.context, &alternate)
+                .await
+                .unwrap(),
+            "unselected cleanup must accept an equivalent witness subset"
+        );
+        assert!(
+            !omitted_store
+                .destroy_unselected_epoch_identity_secret(&fixture.context, &alternate)
+                .await
+                .unwrap()
+        );
+
+        let restarted = ProtocolStore::new(directory.path(), PartyId(1), &identity_seed).unwrap();
+        assert_eq!(
+            restarted.load_key_rotation_certificate(&fixture.context).await.unwrap(),
+            Some(canonical)
+        );
     }
 
     #[tokio::test]
@@ -8645,7 +9756,14 @@ mod tests {
         let metadata =
             store.save_key_rotation_round(&fixture.context, 0, &round, &mut OsRng).await.unwrap();
         let source_secret = fixture.source[0].export_encryption_secret();
-        store.save_epoch_identity_secret(&source_secret, &mut OsRng).await.unwrap();
+        store
+            .save_epoch_identity_secret_for_test(
+                &source_secret,
+                fixture.context.source_activation(),
+                &mut OsRng,
+            )
+            .await
+            .unwrap();
         let active_identity_record =
             tokio::fs::read(store.epoch_identity_path(source_secret.epoch())).await.unwrap();
 
@@ -8674,7 +9792,10 @@ mod tests {
         // Source retirement requires the durable certified successor identity: persist and
         // promote the advertised target candidate exactly as the live handoff does.
         let target_secret = fixture.target[0].export_encryption_secret();
-        store.save_epoch_identity_secret(&target_secret, &mut OsRng).await.unwrap();
+        store
+            .save_epoch_identity_candidate_secret(&fixture.context, &target_secret, &mut OsRng)
+            .await
+            .unwrap();
         store
             .promote_certified_epoch_identity_secret(
                 &fixture.context,

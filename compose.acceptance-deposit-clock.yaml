@@ -1,0 +1,50 @@
+# Acceptance-only private-Regtest clock for the focused 30-day deposit-expiry boundary campaign.
+# The ordinary application does not declare this environment variable or mount. Every party can
+# read one shared clock directory but cannot modify it; only the one-shot E2E driver receives a
+# writable mount and advances the canonical generation file atomically.
+services:
+  p1:
+    environment:
+      TM_ACCEPTANCE_DEPOSIT_CLOCK_FILE: /run/threshold-monero-acceptance/deposit-clock
+    volumes:
+      - ${TM_ACCEPTANCE_DEPOSIT_CLOCK_DIR:?set by the deposit-ttl campaign}:/run/threshold-monero-acceptance:ro
+  p2:
+    environment:
+      TM_ACCEPTANCE_DEPOSIT_CLOCK_FILE: /run/threshold-monero-acceptance/deposit-clock
+    volumes:
+      - ${TM_ACCEPTANCE_DEPOSIT_CLOCK_DIR:?set by the deposit-ttl campaign}:/run/threshold-monero-acceptance:ro
+  p3:
+    environment:
+      TM_ACCEPTANCE_DEPOSIT_CLOCK_FILE: /run/threshold-monero-acceptance/deposit-clock
+    volumes:
+      - ${TM_ACCEPTANCE_DEPOSIT_CLOCK_DIR:?set by the deposit-ttl campaign}:/run/threshold-monero-acceptance:ro
+  p4:
+    environment:
+      TM_ACCEPTANCE_DEPOSIT_CLOCK_FILE: /run/threshold-monero-acceptance/deposit-clock
+    volumes:
+      - ${TM_ACCEPTANCE_DEPOSIT_CLOCK_DIR:?set by the deposit-ttl campaign}:/run/threshold-monero-acceptance:ro
+  p5:
+    environment:
+      TM_ACCEPTANCE_DEPOSIT_CLOCK_FILE: /run/threshold-monero-acceptance/deposit-clock
+    volumes:
+      - ${TM_ACCEPTANCE_DEPOSIT_CLOCK_DIR:?set by the deposit-ttl campaign}:/run/threshold-monero-acceptance:ro
+  p6:
+    environment:
+      TM_ACCEPTANCE_DEPOSIT_CLOCK_FILE: /run/threshold-monero-acceptance/deposit-clock
+    volumes:
+      - ${TM_ACCEPTANCE_DEPOSIT_CLOCK_DIR:?set by the deposit-ttl campaign}:/run/threshold-monero-acceptance:ro
+  p7:
+    environment:
+      TM_ACCEPTANCE_DEPOSIT_CLOCK_FILE: /run/threshold-monero-acceptance/deposit-clock
+    volumes:
+      - ${TM_ACCEPTANCE_DEPOSIT_CLOCK_DIR:?set by the deposit-ttl campaign}:/run/threshold-monero-acceptance:ro
+  p8:
+    environment:
+      TM_ACCEPTANCE_DEPOSIT_CLOCK_FILE: /run/threshold-monero-acceptance/deposit-clock
+    volumes:
+      - ${TM_ACCEPTANCE_DEPOSIT_CLOCK_DIR:?set by the deposit-ttl campaign}:/run/threshold-monero-acceptance:ro
+  e2e:
+    environment:
+      TM_E2E_DEPOSIT_CLOCK_FILE: /run/threshold-monero-acceptance/deposit-clock
+    volumes:
+      - ${TM_ACCEPTANCE_DEPOSIT_CLOCK_DIR:?set by the deposit-ttl campaign}:/run/threshold-monero-acceptance

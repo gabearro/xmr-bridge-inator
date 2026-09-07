@@ -33,6 +33,76 @@ pub struct Identity {
     encryption: StaticSecret,
 }
 
+/// Narrow, non-serializable Ed25519 capability for historical deposit-registry consensus.
+///
+/// Proactive retirement must erase an epoch's X25519 receiver secret even when that epoch's
+/// committee still needs to attest the deterministic deposit-registry handoff. This capability
+/// derives only the stable signing key, is bound to one exact committee digest, epoch, and party,
+/// and has no encryption or AVSS API. Operator/HSM custody remains outside the protocol
+/// implementation.
+pub(crate) struct StableSigningIdentity {
+    party: PartyId,
+    authorized_epoch: u64,
+    authorized_committee: [u8; 32],
+    signing: SigningKey,
+}
+
+/// Narrow, non-serializable Ed25519 capability for recovery and handoff fencing.
+///
+/// Unlike [`StableSigningIdentity`], this capability cannot authorize the final handoff. Its
+/// nonzero recovery authority binds it to one host-authenticated committee transition, and the
+/// deposit reducer independently requires the same digest in its durable signing policy.
+pub(crate) struct StableRecoverySigningIdentity {
+    party: PartyId,
+    authorized_epoch: u64,
+    authorized_committee: [u8; 32],
+    signing: SigningKey,
+    recovery_authority: [u8; 32],
+}
+
+/// Protocol authority carried by an envelope signer.
+///
+/// A historical stable key is intentionally incapable of entering allocation, observation, or
+/// consolidation paths. Deposit reducers check this scope before constructing any payload; the
+/// epoch bindings in the stable signing capabilities are an independent second boundary.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EnvelopeSignerScope {
+    Full,
+    RecoveryAndFenceOnly,
+    HandoffOnly,
+}
+
+mod envelope_signer_sealed {
+    pub trait Sealed {}
+}
+
+/// Minimal signing authority consumed by deposit consensus.
+///
+/// Both live transport identities and historical signing-only capabilities implement this trait.
+/// Signature verification remains bound to the exact committee digest, epoch, party and statement
+/// through [`SignedEnvelope`].
+pub trait EnvelopeSigner: envelope_signer_sealed::Sealed + Send + Sync {
+    fn party(&self) -> PartyId;
+    fn signing_public_key(&self) -> [u8; 32];
+    fn scope(&self) -> EnvelopeSignerScope;
+    /// Exact certified-transition authority carried by a recovery-and-fence-only capability.
+    ///
+    /// Full and final-handoff-only signers deliberately return `None`. Reducers compare this
+    /// digest with their durable policy before permitting a restricted signature.
+    fn recovery_authority(&self) -> Option<[u8; 32]>;
+    /// Recover the full live identity only at protocol sinks which must never accept historical
+    /// signing authority (for example raw deposit observation and consolidation signing).
+    fn full_identity(&self) -> Option<&Identity>;
+    fn sign_envelope(
+        &self,
+        committee: &Committee,
+        session: SessionId,
+        to: Option<PartyId>,
+        sequence: u64,
+        payload: Vec<u8>,
+    ) -> Result<SignedEnvelope, IdentityError>;
+}
+
 /// Non-serializable authority to advertise one X25519 key after durable readback.
 ///
 /// Generating an [`EpochEncryptionSecret`] or constructing an [`Identity`] is deliberately
@@ -51,6 +121,29 @@ impl std::fmt::Debug for Identity {
     }
 }
 
+impl std::fmt::Debug for StableSigningIdentity {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("StableSigningIdentity")
+            .field("party", &self.party)
+            .field("authorized_epoch", &self.authorized_epoch)
+            .field("authorized_committee", &self.authorized_committee)
+            .finish_non_exhaustive()
+    }
+}
+
+impl std::fmt::Debug for StableRecoverySigningIdentity {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("StableRecoverySigningIdentity")
+            .field("party", &self.party)
+            .field("authorized_epoch", &self.authorized_epoch)
+            .field("authorized_committee", &self.authorized_committee)
+            .field("recovery_authority", &self.recovery_authority)
+            .finish_non_exhaustive()
+    }
+}
+
 impl std::fmt::Debug for PersistedKeyAdvertisementIdentity {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
@@ -60,6 +153,140 @@ impl std::fmt::Debug for PersistedKeyAdvertisementIdentity {
             .field("public_key", &self.identity.encryption_public_key())
             .field("durable_record_digest", &self.durable_record_digest)
             .finish_non_exhaustive()
+    }
+}
+
+impl StableSigningIdentity {
+    /// Derive one committee-scoped signing capability after authenticating the configured member
+    /// key. No X25519 material is generated, loaded, or retained.
+    pub(crate) fn for_committee(
+        party: PartyId,
+        signing_seed: &[u8; 32],
+        committee: &Committee,
+    ) -> Result<Self, IdentityError> {
+        committee.validate()?;
+        let expected = committee.member(party)?.signing_key;
+        let signing = derive_signing_key(signing_seed)?;
+        if signing.verifying_key().to_bytes() != expected {
+            return Err(IdentityError::WrongSigningPublicKey);
+        }
+        Ok(Self {
+            party,
+            authorized_epoch: committee.epoch,
+            authorized_committee: committee.digest(),
+            signing,
+        })
+    }
+}
+
+impl StableRecoverySigningIdentity {
+    /// Derive one transition-bound recovery capability after authenticating the committee key.
+    ///
+    /// `recovery_authority` must identify the exact certified transition which closed ordinary
+    /// ingress. It is not secret, but zero is reserved so an uninitialized binding cannot confer
+    /// signing authority.
+    pub(crate) fn for_certified_transition(
+        party: PartyId,
+        signing_seed: &[u8; 32],
+        committee: &Committee,
+        recovery_authority: [u8; 32],
+    ) -> Result<Self, IdentityError> {
+        if recovery_authority == [0; 32] {
+            return Err(IdentityError::InvalidRecoveryAuthority);
+        }
+        committee.validate()?;
+        let expected = committee.member(party)?.signing_key;
+        let signing = derive_signing_key(signing_seed)?;
+        if signing.verifying_key().to_bytes() != expected {
+            return Err(IdentityError::WrongSigningPublicKey);
+        }
+        Ok(Self {
+            party,
+            authorized_epoch: committee.epoch,
+            authorized_committee: committee.digest(),
+            signing,
+            recovery_authority,
+        })
+    }
+}
+
+impl envelope_signer_sealed::Sealed for StableSigningIdentity {}
+
+impl EnvelopeSigner for StableSigningIdentity {
+    fn party(&self) -> PartyId {
+        self.party
+    }
+
+    fn signing_public_key(&self) -> [u8; 32] {
+        self.signing.verifying_key().to_bytes()
+    }
+
+    fn scope(&self) -> EnvelopeSignerScope {
+        EnvelopeSignerScope::HandoffOnly
+    }
+
+    fn recovery_authority(&self) -> Option<[u8; 32]> {
+        None
+    }
+
+    fn full_identity(&self) -> Option<&Identity> {
+        None
+    }
+
+    fn sign_envelope(
+        &self,
+        committee: &Committee,
+        session: SessionId,
+        to: Option<PartyId>,
+        sequence: u64,
+        payload: Vec<u8>,
+    ) -> Result<SignedEnvelope, IdentityError> {
+        if committee.epoch != self.authorized_epoch
+            || committee.digest() != self.authorized_committee
+        {
+            return Err(IdentityError::WrongCommittee);
+        }
+        sign_envelope_with_key(self.party, &self.signing, committee, session, to, sequence, payload)
+    }
+}
+
+impl envelope_signer_sealed::Sealed for StableRecoverySigningIdentity {}
+
+impl EnvelopeSigner for StableRecoverySigningIdentity {
+    fn party(&self) -> PartyId {
+        self.party
+    }
+
+    fn signing_public_key(&self) -> [u8; 32] {
+        self.signing.verifying_key().to_bytes()
+    }
+
+    fn scope(&self) -> EnvelopeSignerScope {
+        EnvelopeSignerScope::RecoveryAndFenceOnly
+    }
+
+    fn recovery_authority(&self) -> Option<[u8; 32]> {
+        Some(self.recovery_authority)
+    }
+
+    fn full_identity(&self) -> Option<&Identity> {
+        None
+    }
+
+    fn sign_envelope(
+        &self,
+        committee: &Committee,
+        session: SessionId,
+        to: Option<PartyId>,
+        sequence: u64,
+        payload: Vec<u8>,
+    ) -> Result<SignedEnvelope, IdentityError> {
+        if committee.epoch != self.authorized_epoch
+            || committee.digest() != self.authorized_committee
+        {
+            return Err(IdentityError::WrongCommittee);
+        }
+        sign_envelope_with_key(self.party, &self.signing, committee, session, to, sequence, payload)
     }
 }
 
@@ -234,6 +461,8 @@ pub enum IdentityError {
     InvalidGeneratedEncryptionKey,
     #[error("durable X25519 readback binding must be nonzero")]
     InvalidPersistenceBinding,
+    #[error("recovery signing authority must be nonzero")]
+    InvalidRecoveryAuthority,
 }
 
 impl Identity {
@@ -387,39 +616,7 @@ impl Identity {
         sequence: u64,
         payload: Vec<u8>,
     ) -> Result<SignedEnvelope, IdentityError> {
-        committee.validate()?;
-        if payload.len() > MAX_SIGNED_ENVELOPE_PAYLOAD_BYTES {
-            return Err(IdentityError::PayloadTooLarge);
-        }
-        if committee.member(self.party)?.signing_key != self.signing_public_key() {
-            return Err(IdentityError::WrongSender);
-        }
-        if let Some(recipient) = to {
-            committee.member(recipient)?;
-        }
-        let unsigned = UnsignedEnvelope {
-            version: ENVELOPE_VERSION,
-            committee: committee.digest(),
-            epoch: committee.epoch,
-            session,
-            from: self.party,
-            to,
-            sequence,
-            payload: &payload,
-        };
-        let bytes = postcard::to_allocvec(&unsigned).map_err(|_| IdentityError::Serialization)?;
-        let signature = self.signing.sign(&bytes).to_bytes();
-        Ok(SignedEnvelope {
-            version: ENVELOPE_VERSION,
-            committee: committee.digest(),
-            epoch: committee.epoch,
-            session,
-            from: self.party,
-            to,
-            sequence,
-            payload,
-            signature,
-        })
+        sign_envelope_with_key(self.party, &self.signing, committee, session, to, sequence, payload)
     }
 
     pub fn verify_envelope(
@@ -553,6 +750,86 @@ impl Identity {
             )
             .map_err(|_| IdentityError::Decryption)
     }
+}
+
+impl envelope_signer_sealed::Sealed for Identity {}
+
+impl EnvelopeSigner for Identity {
+    fn party(&self) -> PartyId {
+        self.party()
+    }
+
+    fn signing_public_key(&self) -> [u8; 32] {
+        self.signing_public_key()
+    }
+
+    fn scope(&self) -> EnvelopeSignerScope {
+        EnvelopeSignerScope::Full
+    }
+
+    fn recovery_authority(&self) -> Option<[u8; 32]> {
+        None
+    }
+
+    fn full_identity(&self) -> Option<&Identity> {
+        Some(self)
+    }
+
+    fn sign_envelope(
+        &self,
+        committee: &Committee,
+        session: SessionId,
+        to: Option<PartyId>,
+        sequence: u64,
+        payload: Vec<u8>,
+    ) -> Result<SignedEnvelope, IdentityError> {
+        Identity::sign_envelope(self, committee, session, to, sequence, payload)
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn sign_envelope_with_key(
+    party: PartyId,
+    signing: &SigningKey,
+    committee: &Committee,
+    session: SessionId,
+    to: Option<PartyId>,
+    sequence: u64,
+    payload: Vec<u8>,
+) -> Result<SignedEnvelope, IdentityError> {
+    committee.validate()?;
+    if payload.len() > MAX_SIGNED_ENVELOPE_PAYLOAD_BYTES {
+        return Err(IdentityError::PayloadTooLarge);
+    }
+    if committee.member(party)?.signing_key != signing.verifying_key().to_bytes() {
+        return Err(IdentityError::WrongSender);
+    }
+    if let Some(recipient) = to {
+        committee.member(recipient)?;
+    }
+    let unsigned = UnsignedEnvelope {
+        version: ENVELOPE_VERSION,
+        committee: committee.digest(),
+        epoch: committee.epoch,
+        session,
+        from: party,
+        to,
+        sequence,
+        payload: &payload,
+    };
+    let bytes = postcard::to_allocvec(&unsigned).map_err(|_| IdentityError::Serialization)?;
+    let signature = signing.sign(&bytes).to_bytes();
+    Ok(SignedEnvelope {
+        version: ENVELOPE_VERSION,
+        committee: committee.digest(),
+        epoch: committee.epoch,
+        session,
+        from: party,
+        to,
+        sequence,
+        payload,
+        signature,
+    })
 }
 
 impl PersistedKeyAdvertisementIdentity {
@@ -802,6 +1079,18 @@ mod tests {
         (committee, one, two)
     }
 
+    fn alternate_same_epoch_committee(committee: &Committee) -> Committee {
+        let replacement = explicit_identity(PartyId(2), committee.epoch, &[0x32; 32], [0xB2; 32]);
+        let mut alternate = committee.clone();
+        let member = alternate.members.iter_mut().find(|member| member.id == PartyId(2)).unwrap();
+        member.signing_key = replacement.signing_public_key();
+        member.encryption_key = replacement.encryption_public_key();
+        alternate.validate().unwrap();
+        assert_eq!(alternate.epoch, committee.epoch);
+        assert_ne!(alternate.digest(), committee.digest());
+        alternate
+    }
+
     #[test]
     fn signatures_bind_every_field() {
         let (committee, one, _) = fixtures();
@@ -816,6 +1105,75 @@ mod tests {
         assert_eq!(
             Identity::verify_envelope(&committee, PartyId(2), &tampered),
             Err(IdentityError::InvalidSignature)
+        );
+    }
+
+    #[test]
+    fn stable_handoff_signer_binds_exact_committee() {
+        let (committee, _, _) = fixtures();
+        let stable =
+            StableSigningIdentity::for_committee(PartyId(1), &[1; 32], &committee).unwrap();
+        assert_eq!(stable.scope(), EnvelopeSignerScope::HandoffOnly);
+        assert_eq!(stable.recovery_authority(), None);
+
+        let envelope = stable
+            .sign_envelope(&committee, SessionId([8; 32]), None, 6, b"handoff".to_vec())
+            .unwrap();
+        Identity::verify_envelope(&committee, PartyId(1), &envelope).unwrap();
+
+        let alternate = alternate_same_epoch_committee(&committee);
+        assert_eq!(
+            stable.sign_envelope(&alternate, SessionId([8; 32]), None, 6, b"handoff".to_vec(),),
+            Err(IdentityError::WrongCommittee)
+        );
+        let mut successor = committee;
+        successor.epoch += 1;
+        assert_eq!(
+            stable.sign_envelope(&successor, SessionId([8; 32]), None, 6, b"handoff".to_vec(),),
+            Err(IdentityError::WrongCommittee)
+        );
+    }
+
+    #[test]
+    fn stable_recovery_signer_binds_transition_scope_and_exact_committee() {
+        let (committee, _, _) = fixtures();
+        let authority = [0xA7; 32];
+        let recovery = StableRecoverySigningIdentity::for_certified_transition(
+            PartyId(1),
+            &[1; 32],
+            &committee,
+            authority,
+        )
+        .unwrap();
+        assert_eq!(recovery.scope(), EnvelopeSignerScope::RecoveryAndFenceOnly);
+        assert_eq!(recovery.recovery_authority(), Some(authority));
+        assert!(recovery.full_identity().is_none());
+
+        let envelope = recovery
+            .sign_envelope(&committee, SessionId([9; 32]), None, 7, b"recovery".to_vec())
+            .unwrap();
+        Identity::verify_envelope(&committee, PartyId(1), &envelope).unwrap();
+
+        let alternate = alternate_same_epoch_committee(&committee);
+        assert_eq!(
+            recovery.sign_envelope(&alternate, SessionId([9; 32]), None, 7, b"recovery".to_vec(),),
+            Err(IdentityError::WrongCommittee)
+        );
+        let mut successor = committee.clone();
+        successor.epoch += 1;
+        assert_eq!(
+            recovery.sign_envelope(&successor, SessionId([9; 32]), None, 7, b"recovery".to_vec(),),
+            Err(IdentityError::WrongCommittee)
+        );
+        assert_eq!(
+            StableRecoverySigningIdentity::for_certified_transition(
+                PartyId(1),
+                &[1; 32],
+                &committee,
+                [0; 32],
+            )
+            .unwrap_err(),
+            IdentityError::InvalidRecoveryAuthority
         );
     }
 

@@ -186,8 +186,8 @@ impl Timelock {
     let raw = <u64 as VarInt>::read(r)?;
     Ok(if raw == 0 {
       Timelock::None
-    } else if raw <
-      u64::try_from(TIMELOCK_BLOCK_THRESHOLD)
+    } else if raw
+      < u64::try_from(TIMELOCK_BLOCK_THRESHOLD)
         .expect("TIMELOCK_BLOCK_THRESHOLD didn't fit in a u64")
     {
       Timelock::Block(usize::try_from(raw).expect(
@@ -705,8 +705,8 @@ impl Transaction<NotPruned> {
     if !(bp || bp_plus) {
       blob_size
     } else {
-      blob_size +
-        Bulletproof::calculate_clawback(
+      blob_size
+        + Bulletproof::calculate_clawback(
           bp_plus,
           match self {
             Transaction::V1 { .. } => panic!("v1 transaction was BP(+)"),

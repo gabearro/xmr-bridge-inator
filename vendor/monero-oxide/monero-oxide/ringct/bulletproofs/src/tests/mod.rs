@@ -12,8 +12,8 @@ macro_rules! bulletproofs_tests {
     fn $name() {
       // Create Bulletproofs for all possible output quantities
       let mut verifier = BatchVerifier::new();
-      for i in 1 ..= 16 {
-        let commitments = (1 ..= i)
+      for i in 1..=16 {
+        let commitments = (1..=i)
           .map(|_| Commitment::new(Scalar::random(&mut OsRng), OsRng.next_u64()))
           .collect::<Vec<_>>();
 
@@ -38,7 +38,7 @@ macro_rules! bulletproofs_tests {
     fn $max() {
       // Check Bulletproofs errors if we try to prove for too many outputs
       let mut commitments = vec![];
-      for _ in 0 .. 17 {
+      for _ in 0..17 {
         commitments.push(Commitment::new(Scalar::ZERO, 0));
       }
       assert_eq!(

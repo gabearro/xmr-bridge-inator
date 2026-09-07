@@ -65,7 +65,7 @@ const INDEX_UPDATE_VERSION: u16 = 2;
 const PRIMARY_HAMT_DEPTH: u8 = 64;
 // A second, domain-separated 256-bit route is used only after a complete primary hash collision.
 // This keeps collision handling canonical without permitting an oversized collision leaf.
-const MAX_HAMT_DEPTH: u8 = 128;
+pub const MAX_HAMT_DEPTH: u8 = 128;
 pub const MAX_DEPOSIT_INDEX_LEAF_ENTRIES: usize = 32;
 /// One sequence value may retain a complete canonical signed Monero transaction.
 pub const MAX_DEPOSIT_INDEX_OBJECT_BYTES: usize = 4 * 1024 * 1024;
@@ -499,6 +499,27 @@ impl PortableDepositOutputRecord {
         };
         record.validate()?;
         Ok(record)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_acceptance_test(output: WalletOutputId) -> Self {
+        let record = Self {
+            version: INDEX_OBJECT_VERSION,
+            wallet: DepositWalletId([0xA1; 32]),
+            allocation_sequence: 1,
+            allocation_statement: [0xA2; 32],
+            index: DepositSubaddressIndex::new(0, 1).expect("fixed test index is valid"),
+            output,
+            output_key: [0xA3; 32],
+            index_on_blockchain: 1,
+            amount_atomic_units: 1,
+            observed_block: ChainPoint::new(1, [0xA4; 32])
+                .expect("fixed test chain point is valid"),
+            block_timestamp: 1,
+            observation: [0xA5; 32],
+        };
+        record.validate().expect("fixed acceptance output record is valid");
+        record
     }
 
     #[must_use]
@@ -2097,6 +2118,115 @@ impl VerifiedPortableIndexObject {
     }
 }
 
+/// Exact semantic position of one object in a portable-index traversal.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+pub enum PortableIndexTraversalTarget {
+    Node { id: DepositIndexObjectId, depth: u8, expected_entries: Option<u64> },
+    Value { id: DepositIndexObjectId },
+}
+
+impl PortableIndexTraversalTarget {
+    #[must_use]
+    pub const fn id(self) -> DepositIndexObjectId {
+        match self {
+            Self::Node { id, .. } | Self::Value { id } => id,
+        }
+    }
+}
+
+/// Authenticate one portable-index object at an exact semantic position and derive only its exact
+/// successor positions.
+pub fn verify_portable_index_traversal_object(
+    wallet: DepositWalletId,
+    target: PortableIndexTraversalTarget,
+    bytes: &[u8],
+) -> Result<Vec<PortableIndexTraversalTarget>, DepositIndexError> {
+    let id = target.id();
+    if wallet.0 == [0; 32] || id.wallet_id() != wallet {
+        return Err(DepositIndexError::InvalidObjectId);
+    }
+    let object = decode_object(id, bytes)?;
+    match (target, object) {
+        (
+            PortableIndexTraversalTarget::Node { depth, expected_entries, .. },
+            StoredIndexObject::Node(node),
+        ) => {
+            if node.namespace != (DepositIndexNamespace::Portable { wallet })
+                || node.depth != depth
+                || depth > MAX_HAMT_DEPTH
+                || expected_entries.is_some_and(|entries| entries != node.entries)
+            {
+                return Err(DepositIndexError::InvalidNode);
+            }
+            match node.body {
+                HamtNodeBody::Branch { children, .. } => {
+                    if depth == MAX_HAMT_DEPTH {
+                        return Err(DepositIndexError::InvalidNode);
+                    }
+                    let child_depth = depth.checked_add(1).ok_or(DepositIndexError::InvalidNode)?;
+                    Ok(children
+                        .into_iter()
+                        .map(|id| PortableIndexTraversalTarget::Node {
+                            id,
+                            depth: child_depth,
+                            expected_entries: None,
+                        })
+                        .collect())
+                }
+                HamtNodeBody::Leaf { entries } => {
+                    // Several authenticated aliases intentionally name the same immutable value.
+                    // The leaf bytes retain every alias, while graph traversal needs exactly one
+                    // semantic edge (and therefore one source capability) per distinct value.
+                    // Preserve the canonical first occurrence so every replica derives the same
+                    // ordered child list without weakening duplicate-capability rejection.
+                    let mut values = BTreeSet::new();
+                    Ok(entries
+                        .into_iter()
+                        .filter_map(|entry| {
+                            values
+                                .insert(entry.value)
+                                .then_some(PortableIndexTraversalTarget::Value { id: entry.value })
+                        })
+                        .collect())
+                }
+            }
+        }
+        (
+            PortableIndexTraversalTarget::Value { .. },
+            StoredIndexObject::PortableAllocation(record),
+        ) if record.wallet_id() == wallet => Ok(Vec::new()),
+        (
+            PortableIndexTraversalTarget::Value { .. },
+            StoredIndexObject::PortableLedgerStatement(record),
+        ) if record.wallet_id() == wallet => Ok(Vec::new()),
+        (
+            PortableIndexTraversalTarget::Value { .. },
+            StoredIndexObject::PortableFirstUse(record),
+        ) if record.wallet_id() == wallet => Ok(Vec::new()),
+        (
+            PortableIndexTraversalTarget::Value { .. },
+            StoredIndexObject::PortableDepositOutput(record),
+        ) if record.wallet_id() == wallet => Ok(Vec::new()),
+        (
+            PortableIndexTraversalTarget::Value { .. },
+            StoredIndexObject::PortableTerminal(record),
+        ) if record.wallet == wallet => Ok(Vec::new()),
+        (
+            PortableIndexTraversalTarget::Value { .. },
+            StoredIndexObject::PortableOutputClaim(record),
+        ) if record.wallet == wallet => Ok(Vec::new()),
+        (
+            PortableIndexTraversalTarget::Value { .. },
+            StoredIndexObject::PortableSigningSession(record),
+        ) if record.wallet == wallet => Ok(Vec::new()),
+        (
+            PortableIndexTraversalTarget::Value { .. },
+            StoredIndexObject::PortableSweepHighWater(record),
+        ) if record.wallet == wallet => Ok(Vec::new()),
+        _ => Err(DepositIndexError::InvalidHead),
+    }
+}
+
 /// Authenticate and canonically decode one exact portable-index object and expose only its
 /// bounded child edges. A local-safety node or value fails closed even though it uses the same
 /// encrypted artifact kind.
@@ -2430,7 +2560,7 @@ fn load_object<R: DepositIndexReader + ?Sized>(
     reader: &R,
     id: DepositIndexObjectId,
 ) -> Result<(StoredIndexObject, Vec<u8>), DepositIndexError> {
-    let bytes = reader.load_index_object(id)?.ok_or(DepositIndexError::MissingObject)?;
+    let bytes = reader.load_index_object(id)?.ok_or(DepositIndexError::MissingObject(id))?;
     let object = decode_object(id, &bytes)?;
     Ok((object, bytes))
 }
@@ -3615,6 +3745,78 @@ fn collect_verification_objects<R: DepositIndexReader + ?Sized>(
     Ok(objects)
 }
 
+/// Extend the changed-key set with every authenticated read which semantic replay or touched-path
+/// validation performs only because of a mutation's cross-record invariant.
+///
+/// These keys deliberately do not enter `DepositIndexUpdate::touched`: they are read dependencies,
+/// not records changed by this update. Persisting both old- and new-head proofs for them makes a
+/// journal independently replayable after a cold restart instead of relying on incidental cache
+/// warmth from the original builder.
+fn mutation_verification_keys(
+    namespace: DepositIndexNamespace,
+    touched: &BTreeSet<CanonicalIndexKey>,
+    operations: &[IndexMutation],
+) -> Result<BTreeSet<CanonicalIndexKey>, DepositIndexError> {
+    let mut keys = touched.clone();
+    for operation in operations {
+        let (wallet, party) = match namespace {
+            DepositIndexNamespace::LocalSafety { wallet, party } => (wallet, party),
+            DepositIndexNamespace::Portable { .. } => {
+                if matches!(
+                    operation,
+                    IndexMutation::RecordSignedDepositObservation(_)
+                        | IndexMutation::ReserveAllocationProposal { .. }
+                        | IndexMutation::MarkFirstUsed { .. }
+                        | IndexMutation::BindOutput { .. }
+                        | IndexMutation::RecordSigningSession { .. }
+                        | IndexMutation::AdvanceNextSweepSequence { .. }
+                        | IndexMutation::RecordSignedLedgerSlot { .. }
+                        | IndexMutation::RecordSignedIndexCheckpointSlot(_)
+                        | IndexMutation::RecordCertifiedEntryLocator(_)
+                ) {
+                    return Err(DepositIndexError::InvalidHead);
+                }
+                continue;
+            }
+        };
+        match operation {
+            IndexMutation::RecordSignedDepositObservation(statement) => {
+                keys.insert(output_alias(wallet, party, statement.output()));
+                keys.insert(one_time_output_key_alias(wallet, party, statement.output_key()));
+            }
+            IndexMutation::RecordSigningSession { sweep, session, .. } => {
+                keys.insert(local_signing_session_alias(wallet, party, *session));
+                keys.insert(local_attempt_high_water_alias(wallet, party, *sweep));
+            }
+            IndexMutation::RecordSignedLedgerSlot { sequence, .. } => {
+                keys.insert(local_certified_entry_locator_alias(wallet, party, *sequence));
+            }
+            IndexMutation::RecordSignedIndexCheckpointSlot(slot) => {
+                keys.insert(local_certified_checkpoint_locator_alias(
+                    wallet,
+                    party,
+                    slot.checkpoint_sequence,
+                ));
+            }
+            IndexMutation::RecordCertifiedEntryLocator(locator) => {
+                keys.insert(local_signed_ledger_slot_alias(wallet, party, locator.ledger_sequence));
+                keys.insert(local_signed_index_checkpoint_slot_alias(
+                    wallet,
+                    party,
+                    locator.checkpoint_sequence,
+                ));
+            }
+            IndexMutation::ApplyLedgerStatement(_)
+            | IndexMutation::ApplyDepositObservation(_)
+            | IndexMutation::ReserveAllocationProposal { .. }
+            | IndexMutation::MarkFirstUsed { .. }
+            | IndexMutation::BindOutput { .. }
+            | IndexMutation::AdvanceNextSweepSequence { .. } => {}
+        }
+    }
+    Ok(keys)
+}
+
 struct OverlayReader<'a, R: DepositIndexReader + ?Sized> {
     base: &'a R,
     staged: &'a BTreeMap<DepositIndexObjectId, Vec<u8>>,
@@ -4489,10 +4691,9 @@ impl<'a, R: DepositIndexReader + ?Sized> DepositIndexBuilder<'a, R> {
             Some(_) => return Err(DepositIndexError::PortableObservationConflict),
         }
         if changed {
-            // Semantic replay reloads the allocation which authorizes this observation. Retain
-            // that read dependency in the bounded verification set so a cold/restarted store can
-            // authenticate the update without relying on a warm builder cache.
-            self.touched.insert(allocation_key);
+            // Replay reloads the authorizing allocation and validates all five aliases. Retain
+            // every alias proof so a cold journal verifier needs no incidental cache warmth.
+            self.touched.extend(portable_record_aliases(&allocation_record)?);
             self.changed = true;
             self.operations.push(IndexMutation::ApplyDepositObservation(statement));
         }
@@ -5319,10 +5520,12 @@ impl<'a, R: DepositIndexReader + ?Sized> DepositIndexBuilder<'a, R> {
         self.next.validate_shape()?;
         validate_root_shape(&self.overlay(), &self.next)?;
         validate_touched_paths(&self.overlay(), &self.next, &self.touched)?;
+        let verification_keys =
+            mutation_verification_keys(self.next.namespace, &self.touched, &self.operations)?;
         let expected_verification =
-            collect_verification_objects(self.base, &self.expected, &self.touched)?;
+            collect_verification_objects(self.base, &self.expected, &verification_keys)?;
         let next_verification =
-            collect_verification_objects(&self.overlay(), &self.next, &self.touched)?;
+            collect_verification_objects(&self.overlay(), &self.next, &verification_keys)?;
         let update = DepositIndexUpdate {
             version: INDEX_UPDATE_VERSION,
             expected: self.expected,
@@ -5488,6 +5691,7 @@ pub struct VerifiedPortableScannerTransition {
     resulting_head: [u8; 32],
     through_sequence: u64,
     allocation_anchors: Vec<ChainPoint>,
+    observed_outputs: Vec<WalletOutputId>,
 }
 
 /// Authenticated complete portable view used when a fresh join has no transition journals.
@@ -5502,6 +5706,9 @@ pub struct VerifiedPortableScannerSnapshot {
     head: [u8; 32],
     through_sequence: u64,
     allocation_anchors: Vec<ChainPoint>,
+    observed_outputs: Vec<WalletOutputId>,
+    output_claims: Vec<(WalletOutputId, SweepId)>,
+    next_sweep_sequence: u64,
 }
 
 /// Exact observation-only portable transition authorized for independent checkpointing.
@@ -5554,6 +5761,12 @@ impl VerifiedPortableScannerTransition {
     pub fn allocation_anchors(&self) -> &[ChainPoint] {
         &self.allocation_anchors
     }
+
+    /// Outputs whose exact certified observations became portable in this transition.
+    #[must_use]
+    pub fn observed_outputs(&self) -> &[WalletOutputId] {
+        &self.observed_outputs
+    }
 }
 
 impl VerifiedPortableScannerSnapshot {
@@ -5575,6 +5788,24 @@ impl VerifiedPortableScannerSnapshot {
     #[must_use]
     pub fn allocation_anchors(&self) -> &[ChainPoint] {
         &self.allocation_anchors
+    }
+
+    /// Every output whose exact certified observation is present in this authenticated snapshot.
+    #[must_use]
+    pub fn observed_outputs(&self) -> &[WalletOutputId] {
+        &self.observed_outputs
+    }
+
+    /// Every input and exact sweep owner permanently bound by an authenticated portable terminal.
+    #[must_use]
+    pub fn output_claims(&self) -> &[(WalletOutputId, SweepId)] {
+        &self.output_claims
+    }
+
+    /// Authenticated floor for the next locally assigned consolidation sequence.
+    #[must_use]
+    pub const fn next_sweep_sequence(&self) -> u64 {
+        self.next_sweep_sequence
     }
 }
 
@@ -5603,17 +5834,48 @@ pub fn verify_portable_scanner_snapshot<R: DepositIndexReader + ?Sized>(
     }
     let validation = validate_index_head(reader, head)?;
     let mut allocation_anchors = Vec::new();
+    let mut observed_outputs = Vec::new();
+    let mut output_claims = BTreeMap::<WalletOutputId, SweepId>::new();
+    let mut next_sweep_sequence = 0_u64;
     for id in validation.values.keys().copied() {
         let (object, _) = load_object(reader, id)?;
-        if let StoredIndexObject::PortableAllocation(record) = object {
-            if record.wallet_id() != wallet {
-                return Err(DepositIndexError::InvalidPortableRecord);
+        match object {
+            StoredIndexObject::PortableAllocation(record) => {
+                if record.wallet_id() != wallet {
+                    return Err(DepositIndexError::InvalidPortableRecord);
+                }
+                allocation_anchors.push(record.allocation().recognition_anchor);
             }
-            allocation_anchors.push(record.allocation().recognition_anchor);
+            StoredIndexObject::PortableDepositOutput(record) => {
+                if record.wallet_id() != wallet {
+                    return Err(DepositIndexError::InvalidPortableRecord);
+                }
+                observed_outputs.push(record.output());
+            }
+            StoredIndexObject::PortableOutputClaim(record) => {
+                if record.wallet_id() != wallet {
+                    return Err(DepositIndexError::InvalidPortableRecord);
+                }
+                if output_claims.insert(record.output(), record.sweep_id()).is_some() {
+                    return Err(DepositIndexError::InvalidPortableTerminal);
+                }
+            }
+            StoredIndexObject::PortableSweepHighWater(record) => {
+                if record.wallet != wallet
+                    || (next_sweep_sequence != 0
+                        && next_sweep_sequence != record.next_sweep_sequence())
+                {
+                    return Err(DepositIndexError::InvalidPortableTerminal);
+                }
+                next_sweep_sequence = record.next_sweep_sequence();
+            }
+            _ => {}
         }
     }
     allocation_anchors.sort_unstable();
     allocation_anchors.dedup();
+    observed_outputs.sort_unstable();
+    observed_outputs.dedup();
     let through_sequence =
         head.portable_anchor.ok_or(DepositIndexError::InvalidVerifiedTransition)?.through_sequence;
     Ok(VerifiedPortableScannerSnapshot {
@@ -5621,6 +5883,9 @@ pub fn verify_portable_scanner_snapshot<R: DepositIndexReader + ?Sized>(
         head: head.digest(),
         through_sequence,
         allocation_anchors,
+        observed_outputs,
+        output_claims: output_claims.into_iter().collect(),
+        next_sweep_sequence,
     })
 }
 
@@ -5769,6 +6034,7 @@ impl DepositIndexUpdate {
             return Err(DepositIndexError::InvalidVerifiedTransition);
         }
         let mut allocation_anchors = Vec::new();
+        let mut observed_outputs = Vec::new();
         for operation in &self.operations {
             match operation {
                 IndexMutation::ApplyLedgerStatement(statement) => {
@@ -5776,12 +6042,16 @@ impl DepositIndexUpdate {
                         allocation_anchors.push(allocation.recognition_anchor);
                     }
                 }
-                IndexMutation::ApplyDepositObservation(_) => {}
+                IndexMutation::ApplyDepositObservation(statement) => {
+                    observed_outputs.push(statement.output());
+                }
                 _ => return Err(DepositIndexError::InvalidVerifiedTransition),
             }
         }
         allocation_anchors.sort_unstable();
         allocation_anchors.dedup();
+        observed_outputs.sort_unstable();
+        observed_outputs.dedup();
         let through_sequence = self
             .next
             .portable_anchor
@@ -5793,6 +6063,7 @@ impl DepositIndexUpdate {
             resulting_head: self.next.digest(),
             through_sequence,
             allocation_anchors,
+            observed_outputs,
         })
     }
 
@@ -5913,7 +6184,8 @@ impl DepositIndexUpdate {
         }
         for (id, bytes) in &self.objects {
             let _created = store.stage_index_object(*id, bytes)?;
-            let readback = store.load_index_object(*id)?.ok_or(DepositIndexError::MissingObject)?;
+            let readback =
+                store.load_index_object(*id)?.ok_or(DepositIndexError::MissingObject(*id))?;
             if &readback != bytes {
                 return Err(DepositIndexError::ObjectAuthentication);
             }
@@ -6075,7 +6347,8 @@ impl StagedDepositIndexUpdate {
     ) -> Result<(), DepositIndexError> {
         self.validate_shape()?;
         for (id, expected) in &self.update.objects {
-            let bytes = store.load_index_object(*id)?.ok_or(DepositIndexError::MissingObject)?;
+            let bytes =
+                store.load_index_object(*id)?.ok_or(DepositIndexError::MissingObject(*id))?;
             if &bytes != expected {
                 return Err(DepositIndexError::ObjectAuthentication);
             }
@@ -6092,7 +6365,8 @@ impl StagedDepositIndexUpdate {
     ) -> Result<(), DepositIndexError> {
         self.validate_shape()?;
         for (id, expected) in &self.update.objects {
-            let bytes = store.load_index_object(*id)?.ok_or(DepositIndexError::MissingObject)?;
+            let bytes =
+                store.load_index_object(*id)?.ok_or(DepositIndexError::MissingObject(*id))?;
             if &bytes != expected {
                 return Err(DepositIndexError::ObjectAuthentication);
             }
@@ -7011,8 +7285,8 @@ pub enum DepositIndexError {
     InvalidNode,
     #[error("the complete 256-bit HAMT path was exhausted")]
     DepthExhausted,
-    #[error("a referenced content-addressed object is missing")]
-    MissingObject,
+    #[error("referenced content-addressed object {0:?} is missing")]
+    MissingObject(DepositIndexObjectId),
     #[error("portable allocation record is malformed")]
     InvalidPortableRecord,
     #[error("portable certified deposit observation is malformed")]
@@ -7131,6 +7405,9 @@ mod tests {
             PortableFamilyKeyImageBinding, PortableKeyImageBindingAttestation,
             PortableKeyImageBindingCertificate,
         },
+        deposit_index_checkpoint::{
+            PortableDepositIndexHead, verified_checkpoint_for_scanner_snapshot_test,
+        },
         deposit_ledger::{ConsolidationCompletionStatement, LateConsolidationSettlementStatement},
         deposit_wallet::{
             ChainPoint, DepositAddressDeriver, SignedSweepTransaction, derive_sweep_signing_session,
@@ -7175,7 +7452,7 @@ mod tests {
             if !reachable.insert(id) {
                 return Ok(());
             }
-            let bytes = self.objects.get(&id).ok_or(DepositIndexError::MissingObject)?;
+            let bytes = self.objects.get(&id).ok_or(DepositIndexError::MissingObject(id))?;
             match decode_object(id, bytes)? {
                 StoredIndexObject::Node(node) => match node.body {
                     HamtNodeBody::Leaf { entries } => {
@@ -7245,7 +7522,7 @@ mod tests {
         ) -> Result<bool, DepositIndexError> {
             self.stage_calls += 1;
             if self.fail_stage_call == Some(self.stage_calls) {
-                return Err(DepositIndexError::MissingObject);
+                return Err(DepositIndexError::MissingObject(id));
             }
             if let Some(existing) = self.objects.get(&id) {
                 if existing != bytes {
@@ -7309,6 +7586,48 @@ mod tests {
         verify_deposit_index_head(store, &head).unwrap();
         store.assert_no_unreachable_objects();
         head
+    }
+
+    fn cold_staged_verification_store(
+        source: &MemoryStore,
+        staged: &StagedDepositIndexUpdate,
+        committed: bool,
+    ) -> MemoryStore {
+        let update = staged.update();
+        let mut required = update
+            .objects
+            .keys()
+            .copied()
+            .chain(update.next_verification_objects())
+            .collect::<BTreeSet<_>>();
+        if !committed {
+            required.extend(update.expected_verification_objects());
+        }
+        let objects = required
+            .into_iter()
+            .map(|id| {
+                (id, source.objects.get(&id).expect("verification object must be durable").clone())
+            })
+            .collect();
+        let head = if committed { update.next_head() } else { update.expected_head() }.clone();
+        MemoryStore {
+            objects,
+            heads: BTreeMap::from([(head.namespace(), head)]),
+            ..MemoryStore::default()
+        }
+    }
+
+    fn assert_staged_verifies_from_cold_cache(
+        source: &MemoryStore,
+        staged: &StagedDepositIndexUpdate,
+    ) {
+        let pending = cold_staged_verification_store(source, staged, false);
+        assert!(missing_staged_verification_objects(&pending, staged, false).unwrap().is_empty());
+        staged.verify_staged(&pending).unwrap();
+
+        let committed = cold_staged_verification_store(source, staged, true);
+        assert!(missing_staged_verification_objects(&committed, staged, true).unwrap().is_empty());
+        staged.verify_committed(&committed).unwrap();
     }
 
     fn wallet() -> DepositWalletId {
@@ -8542,7 +8861,32 @@ mod tests {
         let root = first_head.root().unwrap();
         assert_eq!(root.wallet_id(), first.statement.wallet);
         assert_eq!(root.storage_reference().kind(), DEPOSIT_INDEX_ARTIFACT_KIND);
-        root.storage_reference().verify_contents(first_store.objects.get(&root).unwrap()).unwrap();
+        let root_bytes = first_store.objects.get(&root).unwrap();
+        root.storage_reference().verify_contents(root_bytes).unwrap();
+        let traversal_children = verify_portable_index_traversal_object(
+            first.statement.wallet,
+            PortableIndexTraversalTarget::Node {
+                id: root,
+                depth: 0,
+                expected_entries: Some(first_head.entry_count()),
+            },
+            root_bytes,
+        )
+        .unwrap();
+        assert_eq!(
+            traversal_children
+                .iter()
+                .copied()
+                .map(PortableIndexTraversalTarget::id)
+                .collect::<BTreeSet<_>>()
+                .len(),
+            traversal_children.len(),
+            "portable traversal emitted duplicate capabilities for authenticated aliases"
+        );
+        assert!(
+            traversal_children.len() < usize::try_from(first_head.entry_count()).unwrap(),
+            "allocation aliases did not exercise shared immutable traversal values"
+        );
 
         let mut proof = prove_portable_allocation(&first_store, &first_head, &by_request).unwrap();
         proof.value.as_mut().unwrap().bytes[0] ^= 1;
@@ -8589,30 +8933,28 @@ mod tests {
         let (target, _) = identities(1);
         let target = registry_target(first.statement.wallet, target, 1, [0x81; 32]);
         let previous = allocation_head.portable_anchor().unwrap().ledger_head();
-        let wrong_handoff = LedgerStatement::handoff(
-            &registry,
-            2,
-            previous,
-            allocation_head.digest(),
-            &target,
-            index(3),
+        let source_state = crate::deposit_state_export::DepositHandoffStateBinding::new(
+            Some([0x82; 32]),
+            PortableDepositIndexHead::from_head(&allocation_head).unwrap(),
         )
         .unwrap();
-        let mut wrong = DepositIndexBuilder::new(&store, allocation_head.clone()).unwrap();
         assert!(matches!(
-            wrong.apply_portable_statement(wrong_handoff),
-            Err(DepositIndexError::AllocationIndexMismatch)
+            LedgerStatement::handoff(
+                &registry,
+                2,
+                previous,
+                source_state.clone(),
+                &target,
+                index(3),
+            ),
+            Err(crate::deposit_ledger::LedgerError::CompactRegistry(
+                crate::compact_epoch_registry::CompactRegistryError::InvalidHandoffStatement
+            ))
         ));
 
-        let handoff = LedgerStatement::handoff(
-            &registry,
-            2,
-            previous,
-            allocation_head.digest(),
-            &target,
-            index(2),
-        )
-        .unwrap();
+        let handoff =
+            LedgerStatement::handoff(&registry, 2, previous, source_state, &target, index(2))
+                .unwrap();
         let (source_committee, source_identities) = identities(0);
         assert_eq!(&source_committee, registry.active().committee());
         let handoff_entry = certificate_with_witnesses(
@@ -8706,6 +9048,79 @@ mod tests {
     }
 
     #[test]
+    fn cross_reference_proofs_survive_both_local_journal_crash_windows() {
+        let ledger_sequence = 6;
+        let checkpoint_sequence = 6;
+        let ledger_decision = [0x71; 32];
+        let checkpoint_decision = [0x72; 32];
+        let checkpoint_slot = SignedIndexCheckpointSlot::new(
+            checkpoint_sequence,
+            ledger_decision,
+            [0x73; 32],
+            [0x74; 32],
+            checkpoint_decision,
+            1,
+        )
+        .unwrap();
+        let locator = CertifiedEntryLocator {
+            wallet: wallet(),
+            checkpoint_sequence,
+            checkpoint_decision,
+            checkpoint_certificate_digest: [0x75; 32],
+            ledger_sequence,
+            ledger_statement: ledger_decision,
+            event_artifact: WalletArtifactRef::for_contents(
+                WalletId(wallet().0),
+                DEPOSIT_ARCHIVE_EVENT_ARTIFACT,
+                b"event-six archive record",
+            )
+            .unwrap(),
+            ledger_artifact: WalletArtifactRef::for_contents(
+                WalletId(wallet().0),
+                CERTIFIED_LEDGER_ENTRY_ARTIFACT,
+                b"event-six certified ledger entry",
+            )
+            .unwrap(),
+            checkpoint_artifact: WalletArtifactRef::for_contents(
+                WalletId(wallet().0),
+                DEPOSIT_INDEX_CHECKPOINT_CERTIFICATE_ARTIFACT,
+                b"event-six index checkpoint certificate",
+            )
+            .unwrap(),
+        };
+
+        // The live event-finalization order writes both signing slots first and installs the
+        // certified locator in a later journal. A cold restart must retain proofs for the old
+        // slots even though only the two locator aliases changed.
+        let initial = local_head();
+        let mut locator_store = MemoryStore::with_head(initial.clone());
+        let mut signing_slots = DepositIndexBuilder::new(&locator_store, initial).unwrap();
+        signing_slots.record_signed_ledger_slot(ledger_sequence, ledger_decision).unwrap();
+        signing_slots.record_signed_index_checkpoint_slot(checkpoint_slot).unwrap();
+        let signing_slots_update = signing_slots.finish().unwrap().unwrap();
+        let signed_head = commit_update(&mut locator_store, signing_slots_update);
+        let mut locator_only = DepositIndexBuilder::new(&locator_store, signed_head).unwrap();
+        locator_only.record_certified_entry_locator_fields(locator).unwrap();
+        let locator_staged =
+            locator_only.finish().unwrap().unwrap().stage(&mut locator_store).unwrap();
+        assert_staged_verifies_from_cold_cache(&locator_store, &locator_staged);
+
+        // Exercise the inverse crash window too: if a certified locator was restored first, a
+        // later slot-only journal must carry the locator proofs needed for its conflict checks.
+        let reverse_initial = local_head();
+        let mut slot_store = MemoryStore::with_head(reverse_initial.clone());
+        let mut locator_first = DepositIndexBuilder::new(&slot_store, reverse_initial).unwrap();
+        locator_first.record_certified_entry_locator_fields(locator).unwrap();
+        let locator_first_update = locator_first.finish().unwrap().unwrap();
+        let located_head = commit_update(&mut slot_store, locator_first_update);
+        let mut slots_only = DepositIndexBuilder::new(&slot_store, located_head).unwrap();
+        slots_only.record_signed_ledger_slot(ledger_sequence, ledger_decision).unwrap();
+        slots_only.record_signed_index_checkpoint_slot(checkpoint_slot).unwrap();
+        let slots_staged = slots_only.finish().unwrap().unwrap().stage(&mut slot_store).unwrap();
+        assert_staged_verifies_from_cold_cache(&slot_store, &slots_staged);
+    }
+
+    #[test]
     fn partial_stage_is_replayable_and_losing_cas_cleans_only_unpinned_candidates() {
         let initial = local_head();
         let mut partial_store = MemoryStore::with_head(initial.clone());
@@ -8715,7 +9130,7 @@ mod tests {
         partial_store.fail_stage_call = Some(2);
         assert!(matches!(
             update.clone().stage(&mut partial_store),
-            Err(DepositIndexError::MissingObject)
+            Err(DepositIndexError::MissingObject(_))
         ));
         partial_store.fail_stage_call = None;
         let staged = update.stage(&mut partial_store).unwrap();
@@ -8974,6 +9389,28 @@ mod tests {
             panic!("sweep high-water must remain");
         };
         assert_eq!(high_water.next_sweep_sequence(), completion.plan().sequence + 1);
+
+        let checkpoint = verified_checkpoint_for_scanner_snapshot_test(
+            [0xca; 32],
+            &fixture.registry,
+            &fixture.entry,
+            &settled_head,
+        );
+        let snapshot =
+            verify_portable_scanner_snapshot(&store, &settled_head, &checkpoint).unwrap();
+        assert_eq!(snapshot.wallet_id(), wallet());
+        assert_eq!(snapshot.head_digest(), settled_head.digest());
+        assert_eq!(snapshot.through_sequence(), 6);
+        assert_eq!(snapshot.output_claims().len(), abandoned.inputs().len() + 4);
+        for output in abandoned.inputs() {
+            assert!(
+                snapshot
+                    .output_claims()
+                    .binary_search(&(*output, completion.authorization().sweep_id()))
+                    .is_ok()
+            );
+        }
+        assert_eq!(snapshot.next_sweep_sequence(), completion.plan().sequence + 1);
     }
 
     #[test]
@@ -9000,7 +9437,7 @@ mod tests {
         let mut corrupt = DepositIndexBuilder::new(&store, head).unwrap();
         assert!(matches!(
             corrupt.apply_portable_statement(statement),
-            Err(DepositIndexError::MissingObject)
+            Err(DepositIndexError::MissingObject(_))
         ));
     }
 

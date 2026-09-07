@@ -927,6 +927,40 @@ impl ConsolidationCoordinator {
         self.records.values().find(|record| record.authorization.sweep_id() == sweep)
     }
 
+    /// Require an exact attempt to remain the coordinator's live signing authorization.
+    ///
+    /// Portable ROAST/key-image evidence can outlive the local attempt which produced it. Callers
+    /// must therefore recheck this predicate under their snapshot mutation fence immediately
+    /// before authorizing key images or exposing a signature share.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error unless the record is still `SigningReleased` at the supplied attempt
+    /// high-water and its retained tombstone contains the byte-exact binding with live status.
+    pub fn validate_live_signing_attempt(
+        &self,
+        id: ConsolidationId,
+        attempt: &AttemptBinding,
+    ) -> Result<(), ConsolidationError> {
+        attempt.validate()?;
+        let record = self.records.get(&id).ok_or(ConsolidationError::UnknownConsolidation)?;
+        validate_record(record)?;
+        if record.phase != (ConsolidationPhase::SigningReleased { attempt: attempt.attempt() })
+            || record.attempt_high_water != attempt.attempt()
+        {
+            return Err(ConsolidationError::InvalidPhase);
+        }
+        let tombstone =
+            record.attempts.get(&attempt.attempt()).ok_or(ConsolidationError::InvalidState)?;
+        if tombstone.status != AttemptStatus::SigningReleased {
+            return Err(ConsolidationError::InvalidPhase);
+        }
+        if tombstone.binding != *attempt {
+            return Err(ConsolidationError::AttemptAuthorizationMismatch);
+        }
+        Ok(())
+    }
+
     pub fn reserve_intent(
         &mut self,
         authorization: TransactionAuthorization,
@@ -1081,6 +1115,105 @@ impl ConsolidationCoordinator {
     ) -> Result<Option<ConsolidationPersistEffect>, ConsolidationError> {
         self.transactional(move |candidate| {
             candidate.mark_confirmed_in_place(id, transaction, block)
+        })
+    }
+
+    /// Remove one fully settled completion from the hot coordinator.
+    ///
+    /// This is deliberately not a generic record deletion API. The caller must have independently
+    /// authenticated the portable terminal certificate and consumed the worker's reorganization-
+    /// fenced terminal compaction before invoking it. The exact authorization, winning attempt,
+    /// signed binding, canonical confirmation, and terminal attempt high-water are all matched
+    /// against the retained record. An absent record is an idempotent success, while any present
+    /// non-terminal or mismatched record fails without mutation.
+    pub(crate) fn compact_confirmed_portable_completion(
+        &mut self,
+        authorization: &TransactionAuthorization,
+        winning_attempt: &AttemptBinding,
+        signed: SignedTransactionBinding,
+        confirmation: ChainPoint,
+        closed_through_attempt: u64,
+    ) -> Result<Option<ConsolidationPersistEffect>, ConsolidationError> {
+        let authorization = authorization.clone();
+        let winning_attempt = winning_attempt.clone();
+        self.transactional(move |candidate| {
+            authorization.validate()?;
+            winning_attempt.validate()?;
+            signed.validate()?;
+            validate_chain_point(confirmation)?;
+            if authorization.wallet_id() != candidate.wallet {
+                return Err(ConsolidationError::WrongWallet);
+            }
+            let id = authorization.id();
+            let Some(record) = candidate.records.get(&id) else {
+                return Ok(None);
+            };
+            if record.authorization != authorization
+                || record.phase != ConsolidationPhase::Confirmed
+                || record.confirmation != Some(confirmation)
+                || record.signed != Some(signed)
+                || record.attempt_high_water != closed_through_attempt
+                || record.attempts.get(&winning_attempt.attempt()).is_none_or(|tombstone| {
+                    tombstone.binding != winning_attempt
+                        || tombstone.status != AttemptStatus::Completed
+                })
+                || record
+                    .attempts
+                    .values()
+                    .any(|tombstone| tombstone.status == AttemptStatus::SigningReleased)
+            {
+                return Err(ConsolidationError::InvalidTerminalCompaction);
+            }
+            candidate.records.remove(&id);
+            candidate.finish_mutation(None, None).map(Some)
+        })
+    }
+
+    /// Remove one quorum-abandoned family from the hot coordinator after its exact portable
+    /// abandonment is durable.
+    ///
+    /// The worker and immutable ROAST archive retain the permanent input, key-image, session, and
+    /// attempt-prefix claims needed to authenticate a later canonical old-family transaction.
+    /// This method removes only the duplicate hot coordinator record, and only when every
+    /// terminal field matches. An absent record is an idempotent success.
+    pub(crate) fn compact_certified_portable_abandonment(
+        &mut self,
+        authorization: &TransactionAuthorization,
+        terminal_attempt: &AttemptBinding,
+        ancestor: ChainPoint,
+        closed_through_attempt: u64,
+    ) -> Result<Option<ConsolidationPersistEffect>, ConsolidationError> {
+        let authorization = authorization.clone();
+        let terminal_attempt = terminal_attempt.clone();
+        self.transactional(move |candidate| {
+            authorization.validate()?;
+            terminal_attempt.validate()?;
+            validate_chain_point(ancestor)?;
+            if authorization.wallet_id() != candidate.wallet {
+                return Err(ConsolidationError::WrongWallet);
+            }
+            let id = authorization.id();
+            let Some(record) = candidate.records.get(&id) else {
+                return Ok(None);
+            };
+            if record.authorization != authorization
+                || record.phase != (ConsolidationPhase::AbandonedByInputReorg { ancestor })
+                || record.signed.is_some()
+                || record.confirmation.is_some()
+                || record.attempt_high_water != closed_through_attempt
+                || record.attempts.get(&terminal_attempt.attempt()).is_none_or(|tombstone| {
+                    tombstone.binding != terminal_attempt
+                        || tombstone.status != AttemptStatus::BurnedAfterRestart
+                })
+                || record
+                    .attempts
+                    .values()
+                    .any(|tombstone| tombstone.status != AttemptStatus::BurnedAfterRestart)
+            {
+                return Err(ConsolidationError::InvalidTerminalCompaction);
+            }
+            candidate.records.remove(&id);
+            candidate.finish_mutation(None, None).map(Some)
         })
     }
 
@@ -2365,6 +2498,8 @@ pub enum ConsolidationError {
     SignedTransactionMismatch,
     #[error("canonical chain settlement conflicts with the already confirmed transaction")]
     ConflictingChainSettlement,
+    #[error("portable terminal compaction does not match the confirmed consolidation")]
+    InvalidTerminalCompaction,
     #[error("cannot abort after signing release")]
     CannotAbortAfterSigningRelease,
     #[error("invalid durable consolidation state")]
@@ -2452,6 +2587,95 @@ mod tests {
 
     fn persisted_round_trip(state: &ConsolidationCoordinator) -> ConsolidationCoordinator {
         ConsolidationCoordinator::decode(&state.encode().unwrap()).unwrap()
+    }
+
+    fn released_state(
+        seed: u8,
+    ) -> (TransactionAuthorization, AttemptBinding, ConsolidationCoordinator) {
+        let auth = authorization(seed);
+        let binding = attempt(1, seed.wrapping_add(20), auth.root_group_key());
+        let mut state = ConsolidationCoordinator::new(auth.wallet_id()).unwrap();
+        state.reserve_intent(auth.clone()).unwrap().unwrap();
+        state.release_signing(auth.id(), binding.clone()).unwrap();
+        (auth, binding, state)
+    }
+
+    #[test]
+    fn signing_exposure_requires_the_exact_live_coordinator_attempt() {
+        let (auth, binding, state) = released_state(181);
+        assert!(state.validate_live_signing_attempt(auth.id(), &binding).is_ok());
+
+        let mismatched_binding = attempt(1, 202, auth.root_group_key());
+        assert_eq!(
+            state.validate_live_signing_attempt(auth.id(), &mismatched_binding),
+            Err(ConsolidationError::AttemptAuthorizationMismatch)
+        );
+        let future_attempt = attempt(2, 203, auth.root_group_key());
+        assert_eq!(
+            state.validate_live_signing_attempt(auth.id(), &future_attempt),
+            Err(ConsolidationError::InvalidPhase)
+        );
+    }
+
+    #[test]
+    fn non_live_coordinator_phases_cannot_authorize_signing_exposure() {
+        let (burned_auth, binding, mut burned) = released_state(182);
+        burned.burn_attempt_after_restart(burned_auth.id()).unwrap();
+        assert_eq!(
+            burned.validate_live_signing_attempt(burned_auth.id(), &binding),
+            Err(ConsolidationError::InvalidPhase)
+        );
+
+        let aborted_authorization = authorization(183);
+        let aborted_attempt = attempt(1, 204, aborted_authorization.root_group_key());
+        let mut aborted = ConsolidationCoordinator::new(aborted_authorization.wallet_id()).unwrap();
+        aborted.reserve_intent(aborted_authorization.clone()).unwrap().unwrap();
+        aborted.abort_before_nonce(aborted_authorization.id()).unwrap();
+        assert_eq!(
+            aborted.validate_live_signing_attempt(aborted_authorization.id(), &aborted_attempt),
+            Err(ConsolidationError::InvalidPhase)
+        );
+
+        let (quarantined_auth, binding, mut quarantined) = released_state(184);
+        let ancestor = ChainPoint::new(90, [0x90; 32]).unwrap();
+        quarantined.handle_input_reorg(quarantined_auth.id(), ancestor).unwrap();
+        assert_eq!(
+            quarantined.validate_live_signing_attempt(quarantined_auth.id(), &binding),
+            Err(ConsolidationError::InvalidPhase)
+        );
+        quarantined
+            .record_certified_abandonment(quarantined_auth.id(), &binding, ancestor)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            quarantined.validate_live_signing_attempt(quarantined_auth.id(), &binding),
+            Err(ConsolidationError::InvalidPhase)
+        );
+
+        let (completed_auth, binding, mut completed) = released_state(185);
+        let signed = signed(&completed_auth, &binding);
+        completed.record_signed(completed_auth.id(), signed).unwrap().unwrap();
+        assert_eq!(
+            completed.record(completed_auth.id()).unwrap().attempts[&binding.attempt()].status,
+            AttemptStatus::Completed
+        );
+        assert_eq!(
+            completed.validate_live_signing_attempt(completed_auth.id(), &binding),
+            Err(ConsolidationError::InvalidPhase)
+        );
+        completed.mark_broadcast(completed_auth.id(), [41; 32]).unwrap().unwrap();
+        assert_eq!(
+            completed.validate_live_signing_attempt(completed_auth.id(), &binding),
+            Err(ConsolidationError::InvalidPhase)
+        );
+        completed
+            .mark_confirmed(completed_auth.id(), [41; 32], ChainPoint::new(91, [0x91; 32]).unwrap())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            completed.validate_live_signing_attempt(completed_auth.id(), &binding),
+            Err(ConsolidationError::InvalidPhase)
+        );
     }
 
     #[test]
@@ -2999,6 +3223,115 @@ mod tests {
             Err(ConsolidationError::NoMutation)
         );
         persisted_round_trip(&state);
+    }
+
+    #[test]
+    fn portable_completion_compaction_is_exact_terminal_and_idempotent() {
+        let auth = authorization(37);
+        let id = auth.id();
+        let binding = attempt(1, 62, auth.root_group_key());
+        let signed = signed(&auth, &binding);
+        let confirmation = ChainPoint { height: 120, hash: [63; 32] };
+        let mut state = ConsolidationCoordinator::new(auth.wallet_id()).unwrap();
+        state.reserve_intent(auth.clone()).unwrap().unwrap();
+        state.release_signing(id, binding.clone()).unwrap();
+        state.record_signed(id, signed).unwrap().unwrap();
+        state.mark_broadcast(id, signed.transaction()).unwrap().unwrap();
+
+        let before_confirmation = state.encode().unwrap();
+        assert_eq!(
+            state.compact_confirmed_portable_completion(&auth, &binding, signed, confirmation, 1,),
+            Err(ConsolidationError::InvalidTerminalCompaction)
+        );
+        assert_eq!(state.encode().unwrap(), before_confirmation);
+
+        state.mark_confirmed(id, signed.transaction(), confirmation).unwrap().unwrap();
+        let confirmed = state.encode().unwrap();
+        assert_eq!(
+            state.compact_confirmed_portable_completion(&auth, &binding, signed, confirmation, 2,),
+            Err(ConsolidationError::InvalidTerminalCompaction)
+        );
+        assert_eq!(state.encode().unwrap(), confirmed);
+
+        let revision = state.revision();
+        let effect = state
+            .compact_confirmed_portable_completion(&auth, &binding, signed, confirmation, 1)
+            .unwrap()
+            .unwrap();
+        assert_eq!(effect.revision(), revision + 1);
+        assert!(state.record(id).is_none());
+        let mut restarted = persisted_round_trip(&state);
+        let encoded = restarted.encode().unwrap();
+        assert_eq!(
+            restarted
+                .compact_confirmed_portable_completion(&auth, &binding, signed, confirmation, 1,)
+                .unwrap(),
+            None
+        );
+        assert_eq!(restarted.encode().unwrap(), encoded);
+    }
+
+    #[test]
+    fn portable_abandonment_compaction_is_exact_terminal_and_idempotent() {
+        let auth = authorization(38);
+        let id = auth.id();
+        let binding = attempt(1, 64, auth.root_group_key());
+        let ancestor = ChainPoint { height: 80, hash: [65; 32] };
+        let mut state = ConsolidationCoordinator::new(auth.wallet_id()).unwrap();
+        state.reserve_intent(auth.clone()).unwrap().unwrap();
+        state.release_signing(id, binding.clone()).unwrap();
+        state.handle_input_reorg(id, ancestor).unwrap();
+
+        let before_certificate = state.encode().unwrap();
+        assert_eq!(
+            state.compact_certified_portable_abandonment(&auth, &binding, ancestor, 1,),
+            Err(ConsolidationError::InvalidTerminalCompaction)
+        );
+        assert_eq!(state.encode().unwrap(), before_certificate);
+
+        state.record_certified_abandonment(id, &binding, ancestor).unwrap().unwrap();
+        let certified = state.encode().unwrap();
+        assert_eq!(
+            state.compact_certified_portable_abandonment(&auth, &binding, ancestor, 2,),
+            Err(ConsolidationError::InvalidTerminalCompaction)
+        );
+        assert_eq!(state.encode().unwrap(), certified);
+
+        state
+            .compact_certified_portable_abandonment(&auth, &binding, ancestor, 1)
+            .unwrap()
+            .unwrap();
+        assert!(state.record(id).is_none());
+        let mut restarted = persisted_round_trip(&state);
+        let encoded = restarted.encode().unwrap();
+        assert_eq!(
+            restarted.compact_certified_portable_abandonment(&auth, &binding, ancestor, 1).unwrap(),
+            None
+        );
+        assert_eq!(restarted.encode().unwrap(), encoded);
+
+        // A later canonical old-family transaction rehydrates only the public abandonment
+        // tombstone. It cannot remint a nonce, but it can still settle through the exact archived
+        // attempt binding.
+        restarted
+            .record_certified_public_abandonment(auth.clone(), binding.clone(), ancestor)
+            .unwrap()
+            .unwrap();
+        assert!(restarted.restart_actions().is_empty());
+        let late_signed = signed(&auth, &binding);
+        let inclusion = ChainPoint { height: 140, hash: [66; 32] };
+        restarted
+            .record_chain_authoritative_settlement(
+                id,
+                &binding,
+                late_signed,
+                late_signed.transaction(),
+                inclusion,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(restarted.record(id).unwrap().phase, ConsolidationPhase::Confirmed);
+        assert_eq!(restarted.record(id).unwrap().confirmation, Some(inclusion));
     }
 
     #[test]

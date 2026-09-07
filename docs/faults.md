@@ -7,9 +7,12 @@ Byzantine correctness. Always run it from images built from the exact source und
 ## Safety
 
 `docker/run-resilience-campaign.sh` uses dedicated project names beginning with
-`threshold-monero-resilience-`. Before each Compose case it removes only that case's disposable
-volumes, then records evidence under `artifacts/`. Do not rename a project to match a valuable
-deployment and do not point the harness at production volumes.
+`threshold-monero-resilience-`. By default, before each Compose case it removes only that case's
+disposable volumes, then records evidence under `artifacts/`. To retain a canonical case for
+forensics, set `TM_CAMPAIGN_PROJECT_SUFFIX` to one through four lowercase ASCII letters or digits.
+The runner requires that exact suffixed project to have no Compose-labeled containers, volumes, or
+networks and will not delete a collided project's volumes. Do not rename a project to match a
+valuable deployment and do not point the harness at production volumes.
 
 The current binary requires empty volumes for a new build. Preserve older state offline for
 forensics; do not use it as campaign input.
@@ -19,35 +22,45 @@ forensics; do not use it as campaign input.
 | Mode | Injected condition | Required outcome |
 | --- | --- | --- |
 | `rust` | No Compose fault; serial all-target Rust suite | Unit/integration suites exit zero under the runner's bounded contract. |
-| `clean` | Fresh seven-party stack | Full deposit allocation, observation, permanence, BFT QUIC/ROAST consolidation, scheduled refresh, grow/shrink, dynamic refresh, and private-chain Monero acceptance complete. |
-| `observer-byzantine` | Keep p1 live while monerod-p1 follows an isolated fork, stalls, then stops | Remaining n-f observation domains complete the full deposit, consolidation, and refresh lifecycle; p1 core readiness stays independent of chain RPC. |
+| `clean` | Fresh eight-party/eight-observer stack | Full deposit allocation, observation, permanence, BFT QUIC/ROAST consolidation, scheduled refresh, grow/shrink, dynamic refresh, and private-chain Monero acceptance complete. |
+| `observer-byzantine` | From an exactly equal producer/observer tip, keep p1 live while monerod-p1 follows an isolated fork, remains stalled across two configured polling intervals, then stops | Remaining n-f observation domains complete the full deposit, consolidation, and refresh lifecycle; p1 core readiness stays independent of chain RPC. |
 | `avss-crash` | Abrupt p3 restart at the authenticated canonical `DealerStarted` hold | The exact held dealer outbox survives restart; only an authenticated release resumes replay and the full lifecycle. |
 | `deposit-restart` | Abrupt p2 restart after deposit mining and before maturity | Scanner and deposit state recover; the same deposit becomes permanent and consolidates once eligible. |
-| `consolidation-silent` | One selected signer omits during consolidation | A bounded ROAST view change selects a safe subset; one exact transaction is accepted and the peer later catches up. |
+| `deposit-ttl` | Acceptance-only shared clock advances through six exact logical generations | An unused allocation is Active at expiry minus one, hidden as Expired at expiry, and never reused; a separately funded allocation remains Permanent and retrievable at its expiry. Consolidation is intentionally disabled. |
+| `consolidation-silent` | One selected signer omits during consolidation | A bounded ROAST view change selects a safe subset; one exact transaction settles, then an authenticated durable transaction-bound latch prevents progress until the peer is reattached to QUIC. |
 | `consolidation-bootstrap-silent` | The slot-zero intent proposer stops before bootstrap agreement | Consensus rotates to another proposer before nonce release; restart catches up to the same certified result. |
 | `silent` | p1 HTTP stays healthy but p1 QUIC is unreachable | Protocol-only QUAL advances views and the remaining configured lifecycle completes within `f`. |
 | `deposit-silent` | Same p1 QUIC omission with deposit allocation enabled | Address allocation, funding, observation, and permanence complete; consolidation is intentionally outside this case. |
-| `leader-down` | p1 is stopped after initial healthy startup | Allocation plus later resharing/refresh epochs complete while one whole party is absent; consolidation is intentionally outside this case. |
-| `rotation-silent` | p2 loses peer QUIC after the final configured epoch | At least `n-f` fresh receiver keys are certified and an autonomous dynamic refresh activates without p2. |
-| `proactive-deadline` | Abrupt p2 SIGKILL/restart from its durable volume inside the exact finite 15-second refresh deadline | The held refresh schedule survives restart and the successor epoch activates only at or after the durable due time. |
+| `leader-down` | p1 is stopped after initial healthy startup, leaving exactly seven responsive candidates for the epoch-1/2 4-of-7 boundary | Allocation and full signing remain live; epoch 2 preserves the exact epoch-1 stable member IDs, key ID, and group key, installs fresh receiver and verification shares, authenticates the zero-constant `Refresh` transition rather than `Reshare`, and signs a real Regtest transaction. |
+| `rotation-silent` | One actual certificate-selected epoch-4 member, named by the held latch, loses peer QUIC after the final configured epoch | An exact 3-of-5 committee made solely from fresh advertisements selected from the seven responsive eligible identities is certified, and the autonomous dynamic successor activates without the omitted member. |
+| `network-restart` | All eight parties stop on their existing volumes before the epoch-5 refresh deadline and restart only after every persisted deadline is overdue | The restored network certifies one common epoch-5 successor at `n-f`, then allocates, funds, threshold-signs, broadcasts, mines, and confirms a fresh post-restart consolidation. |
+| `proactive-deadline` | One actual certified source member, named by the held latch, is abruptly SIGKILLed/restarted from its durable volume inside the exact finite 15-second refresh deadline | The held latch survives restart without a start event; a durable authenticated write-ahead event is then recorded at or after the exact due time and before successor activation. |
 | `qual-crash-silent` | p1 omission plus p3 crash/restart at authenticated undecided QUAL round zero | The exact held reducer/outbox survives restart; authenticated release resumes and completes within the configured fault bound. |
 | `all` | Every mode above in runner order | Every independent clean-state case and its evidence contract succeeds. |
 
 The historical mode name `leader-down` refers to stopping party p1 for a broad availability test.
-Consolidation itself uses rotating consensus and ROAST views; no distinguished long-lived party is
-required to drive it.
+The case includes full consolidation/signing through rotating consensus and ROAST views; no
+distinguished long-lived party is required to drive it. Its fixed seven-candidate boundary also
+turns the first 4-of-7 successor into the campaign's deterministic exact same-committee proactive
+refresh witness.
 
 ## Run campaigns
 
 Build the exact local images first; the runner intentionally never builds:
 
 ```sh
+(cd vendor/monero-oxide && ./verify-threshold-monero-sources.sh)
 cargo fmt --check
 cargo check --locked --all-targets
 cargo test --locked --all-targets
 cargo clippy --locked --all-targets
+cargo build --locked --release
 docker compose build
 ```
+
+The campaign's `rust` mode repeats the pinned-source verifier and runs the all-target test suite
+serially. It does not replace the separate formatting, compile-check, Clippy, or release-build gates
+above. The runner intentionally reuses prebuilt images for every Compose case.
 
 Run focused cases while developing:
 
@@ -55,6 +68,7 @@ Run focused cases while developing:
 ./docker/run-resilience-campaign.sh clean
 ./docker/run-resilience-campaign.sh observer-byzantine
 ./docker/run-resilience-campaign.sh avss-crash
+./docker/run-resilience-campaign.sh deposit-ttl
 ./docker/run-resilience-campaign.sh consolidation-silent
 ./docker/run-resilience-campaign.sh consolidation-bootstrap-silent
 ./docker/run-resilience-campaign.sh rotation-silent
@@ -66,7 +80,8 @@ Run the complete matrix before treating the source as green:
 ./docker/run-resilience-campaign.sh all
 ```
 
-Default total case timeout is bounded. A slow host can request up to 1800 seconds:
+The total case timeout defaults to 900 seconds. A slow host can request 60–3600 seconds;
+this changes only the outer acceptance-harness cap, not protocol deadlines or assertions:
 
 ```sh
 TM_CAMPAIGN_TIMEOUT_SECONDS=1800 ./docker/run-resilience-campaign.sh all
@@ -106,7 +121,7 @@ rendered topology and environment contract.
 
 ## Consolidation gates
 
-The two consolidation fault modes add acceptance-only gates to all seven parties:
+The two consolidation fault modes add acceptance-only gates to all eight parties:
 
 - `compose.acceptance-consolidation-gate.yaml` pauses a deterministic contribution point so the
   runner can make one selected signer unavailable and observe safe ROAST rotation.
@@ -162,6 +177,6 @@ message schedules, corruption at every atomic write boundary, disk-full and perm
 long partitions, clock skew, deeper reorgs, independent-daemon disagreement, contribution
 equivocation across many ROAST views, and multi-day refresh/retention runs.
 
-No current fault artifact demonstrates public-testnet or mainnet acceptance, external rollback
-resistance, secure erasure, independent-host operation, reserve auditing, or privacy of the common
-view key.
+The remaining coverage gaps are external rollback resistance, secure erasure, independent-host
+operation, reserve auditing, and privacy of the common view key. Public testnet/mainnet evidence is
+intentionally excluded: private Regtest is the sole release-acceptance target.

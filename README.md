@@ -8,25 +8,26 @@ distributed key generation, quorum-certified epoch activation, persistent key ro
 deposit ledger, and monero-oxide's FROSTLASS construction. Party-to-party protocols use mutually
 authenticated QUIC. HTTP is limited to health, operator control, and deposit-client queries.
 
-> **Security status:** research software; unaudited and unsuitable for valuable funds. Current
-> public-testnet and mainnet acceptance has not been demonstrated. Mainnet party mode remains
-> disabled. Private-Regtest results are interoperability evidence only; they do not establish
-> Byzantine security, production privacy, rollback resistance, or operational readiness.
+> **Security status:** research software; unaudited and unsuitable for valuable funds. Private
+> Regtest is the sole release and interoperability acceptance target. Public testnet/mainnet
+> deployment and evidence are intentionally outside this repository's scope, and mainnet party
+> mode remains disabled. A Regtest pass does not establish Byzantine security, production privacy,
+> rollback resistance, or operational readiness.
 
 ## Implemented components
 
 | Area | Current implementation | Important boundary |
 | --- | --- | --- |
 | AVSS and DKG | Per-dealer bivariate Feldman commitments with signed, recipient-encrypted sends, echoes, and ready messages; common QUAL selects one dealer set under explicit `(n, k, f)` bounds | This is a CKLS-inspired specialization, not a proof of the whole service. Private evaluations must never be logged or published. |
-| Proactive refresh | Fresh target-degree polynomials preserve the public spend key while changing every nonconstant coefficient; configured growth/shrink and dynamic same-committee refresh are supported | Mobile-adversary security still requires a non-rollbackable epoch fence and verifiable destruction of retired shares and encryption keys. |
-| Receiver-key rotation | Target-committee members persist fresh X25519 secrets before advertising them; the source committee certifies a deterministic selection with target `n-f` advertisements and carries at most target `f` omission baselines forward | A certified rotation does not replace external key custody, host isolation, or secure erasure. |
+| Proactive refresh | Fresh target-degree polynomials preserve the public spend key while changing every nonconstant coefficient; configured and dynamic fixed-size/fixed-threshold successors permit eligible-member substitution and therefore use refresh or reshare as appropriate | Mobile-adversary security still requires a non-rollbackable epoch fence and verifiable destruction of retired shares and encryption keys. |
+| Receiver-key rotation | An eligible roster of at least `desired_n + f` stable identities persists fresh X25519 secrets before advertising them; the source committee certifies any exact `desired_n` subset made solely from those advertisements | Historical and bootstrap receiver keys are cumulatively forbidden. An omitted candidate is erased and receives no successor share. |
 | Epoch activation | New shares are staged and activated only after an `n-f` certificate; exact transition indexes, cutover leases, and successor-bound retirement markers survive restart | Competing deployment roots and whole-volume rollback remain external governance concerns. |
 | Persistent state machine | AVSS, QUAL, activation, key rotation, allocation, handoff, consolidation, scanner, and outbox state are durably checkpointed and retried while the process is live | Lifetime storage, garbage collection, WORM anchoring, and multi-host operations remain deployment work. |
 | Transport | Canonical bounded Postcard frames over exact-leaf-pinned mTLS QUIC, bound to network, sender, recipient, operation, and request ID | Demo certificates are public fixtures. Enrollment, revocation, rate policy, and independent operators are not supplied. |
 | Monero signing | Transaction-specific FROSTLASS/CLSAG with persistent one-use nonce tombstones, certified signing intent, all-to-all ROAST contributions, rotating views, and exact candidate validation | This is not ordinary message FROST. Once a signature share may have escaped, the attempt cannot be safely abandoned without the protocol's certified exposure rules. |
-| Deposit service | Tenant-bound 30-day allocations, portable `n-f` first-use observation certificates, independent `n-f` index checkpoints, compact cross-epoch state, Monero scanning, and BFT consolidation to the primary wallet | The common view key and combined signer/observer fault domain remain boundaries. |
+| Deposit service | Tenant-bound 30-day allocations, portable `n-f` first-use observation certificates, independent `n-f` index checkpoints, compact cross-epoch state, Monero scanning, and BFT consolidation to the primary wallet | The common view key and combined signer/observer fault domain remain boundaries. ROAST late-settlement continuity currently requires at least one retained old-committee member; authenticated ROAST transfer to a fully disjoint successor remains [TODO](TODO.md). |
 | Local archive | Encrypted content-addressed ledger and registry artifacts behind compact authenticated heads | Complete-volume rollback still requires an external monotonic anchor. |
-| Docker harness | Seven persistent parties, seven isolated official Monero observers, a separate private-Regtest producer, and fault campaigns | The producer is a test-only common mode; fresh current-source evidence is still required. |
+| Docker harness | Eight persistent parties, eight isolated official Monero observers, a separate private-Regtest producer, and fault campaigns | The producer is a test-only common mode; fresh current-source evidence is still required. |
 
 The detailed protocol is in [docs/protocol.md](docs/protocol.md). See
 [docs/security-model.md](docs/security-model.md) for trust boundaries,
@@ -52,7 +53,8 @@ not provide an in-place conversion procedure.
 
 ## Quick start
 
-Prerequisites are Rust 1.89 or newer and Docker Engine or Docker Desktop with Compose v2.
+Prerequisites are Rust 1.89 or newer and Docker Engine or Docker Desktop with Compose 2.24.4 or
+newer.
 
 Run the Rust checks:
 
@@ -64,6 +66,12 @@ cargo test --locked --all-targets
 cargo clippy --locked --all-targets
 cargo build --locked --release
 ```
+
+The signer Docker build, the campaign's `rust` mode, and every image-backed campaign mode run the
+same pinned vendored Monero source verifier as a mandatory gate; a hash/provenance or fail-closed
+signing-API mismatch stops the build or campaign before it can produce release evidence. The
+standalone static `preflight` mode validates Compose and fixture topology without compiling or
+verifying Rust sources.
 
 Run the private-Regtest harness from empty volumes:
 
@@ -92,15 +100,15 @@ The intended current lifecycle is:
 3-of-5 DKG
   -> certify, fund, and observe a deposit subaddress
   -> BFT consolidation to the primary wallet over QUIC
-  -> BFT X25519 rotation and grow to 4-of-7
+  -> BFT X25519 rotation and grow to 4-of-7 selected from eight eligible identities
   -> timer-driven BFT X25519 rotation and proactive refresh
-  -> BFT X25519 rotation and shrink to 2-of-4 with f=1
-  -> continuing timer-driven rotation and proactive refresh
+  -> BFT X25519 rotation and shrink to 3-of-5 selected from six eligible identities with f=1
+  -> continuing 3-of-5 timer-driven rotation and refresh-or-reshare from all eight identities
   -> threshold-sign and mine private-Regtest transactions
 ```
 
 Under the full deposit/consolidation contract, the client allocates and funds a distinct deposit
-after each activated successor epoch (grow, both same-committee refreshes, shrink, and the first
+after each activated successor epoch (grow, both fixed-size refreshes or reshares, shrink, and the first
 dynamic refresh). Each successor's fresh shares must independently produce a byte-exact
 FROSTLASS/CLSAG consolidation which the daemon accepts, mines, and confirms. The client also models
 the adjacent sharings as independently randomized Shamir polynomials with one common constant. It
@@ -114,14 +122,29 @@ isolated.
 The acceptance overlay durably holds each next refresh until the preceding epoch's signing check
 is complete. An authenticated, source-epoch-bound release then restores the ordinary fixed
 interval; production/default deployments never expose that control route and remain autonomous.
+The acceptance client is likewise observer-only for ordinary epoch-zero startup: it waits on
+authenticated status and records zero calls to `/v1/avss/start`. That route is used only by the two
+explicit manual DKG crash-boundary campaigns.
+
+The full `leader-down` Regtest case is the deterministic exact-refresh proof. With p1 stopped,
+exactly seven responsive candidates remain for both adjacent 4-of-7 selections, so epoch 2 must
+retain epoch 1's stable member IDs. Acceptance then verifies the authenticated history digest is
+the zero-constant `Refresh` transition—not the `Reshare` digest—while `key_id` and group spend key
+remain fixed, receiver and verification shares change, and those epoch-2 shares sign a real
+daemon-accepted Regtest transaction.
 
 This lifecycle is not claimed green until a fresh current-source run exits successfully and its
-unique ordered terminal markers and exact daemon-returned transaction bytes are retained. The
-resilience runner stores those bytes as both `signed-transaction.hex` and decoded
-`signed-transaction.bin`, with a SHA-256 over the binary, and records exactly one complete
-transaction marker for each successor epoch 1 through 5. Existing artifact directories were
-produced by earlier source revisions and are historical diagnostics only. No transaction from
-the current source has been accepted on public Monero testnet or mainnet.
+unique ordered terminal markers and exact daemon-returned transaction bytes are retained. Full
+acceptance requires the initial production consolidation to consume exactly two distinct outputs
+created in one mined deposit transaction so they mature simultaneously; the verifier checks a bijection from those certified
+outputs to the transaction's two input rings. Epochs 1 through 5 then each retain a fresh
+single-input successor transaction. For all six transactions, the resilience runner stores
+canonical `.hex` and `.bin` files, the marker txid, an independently derived Monero txid, a
+verifier transcript, and an ancillary SHA-256 over the binary. The verifier reads a file (or stdin)
+instead of passing transaction hex through the process argument vector. Existing artifact
+directories were produced by earlier source revisions and are historical diagnostics only.
+Public-network transaction evidence is not a release requirement and is intentionally not
+collected by this repository.
 
 To stop without deleting state:
 
@@ -155,17 +178,20 @@ cargo run --locked --release -- party \
   --scenario ./scenario.json
 ```
 
-The signing seed and bootstrap X25519 secret are independent 32-byte values, each encoded as 64
+For a genesis member, the signing seed and bootstrap X25519 secret are independent 32-byte values, each encoded as 64
 hexadecimal characters. The signing seed derives only the stable Ed25519 identity; it never derives
 an AVSS receiver key. The bootstrap X25519 secret must match the scenario's public bootstrap key
-and is used only where the certified current lifecycle names that baseline, including epoch-zero
-DKG and a party's first configured join. Later receiver secrets are generated only when their
+and is supplied only to epoch-zero DKG members; later joiners receive no bootstrap secret. Every successor receiver secret is generated when that
 rotation ceremony begins, persisted and read back before advertisement, and erased after certified
-cutover. Because there is only one bootstrap key per party, configuration rejects a party that
-leaves a committee and later rejoins; re-admission requires a new party identity/bootstrap
-provisioning. QUIC private keys are PKCS#8 DER. The scenario pins stable identities, public bootstrap
-keys, QUIC routes, TLS names and leaves, committee policy, network, and wallet birth checkpoint.
-Testnet requires explicit non-demo policy and secrets; Mainnet is disabled.
+cutover. A successor is formed solely from an exact `desired_n` set of fresh advertisements drawn
+from its `eligible_members` roster; an omitted identity receives no share. An eligible party that
+was omitted or left an earlier committee may be selected again under the same stable identity only
+after generating, persisting, and advertising another fresh receiver key. No bootstrap or prior
+epoch receiver key is carried forward. QUIC private keys are PKCS#8 DER. The scenario pins stable
+identities, public genesis bootstrap keys, QUIC routes, TLS names and leaves, committee policy,
+network, and wallet birth checkpoint. The maintained acceptance target is private Regtest only.
+Public-network deployment policy, secrets, and operational key custody are supplied externally by
+a deployment owner and are not implemented or tested here. Mainnet party mode is disabled.
 
 ## Network surfaces
 
@@ -228,7 +254,7 @@ tracking incoming activity. Threshold scanning and view-key rotation are not imp
 Auditable reserves remain TODO. A future least-privilege auditor flow should use viewing material
 to discover incoming outputs and verify balances without exposing the spend key, while documenting
 spent-output/key-image visibility, authenticating the reported chain height, and adding private
-Regtest plus public-testnet evidence. No reserve proof exists today.
+Regtest evidence. No reserve proof exists today.
 
 ## What a private-Regtest pass would prove
 

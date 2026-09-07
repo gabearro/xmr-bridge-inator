@@ -108,7 +108,7 @@ impl SharedKeyDerivations {
 
     let mut payment_id_xor = [0; 8];
     payment_id_xor
-      .copy_from_slice(&keccak256([output_derivation.as_slice(), &[0x8d]].concat())[.. 8]);
+      .copy_from_slice(&keccak256([output_derivation.as_slice(), &[0x8d]].concat())[..8]);
     payment_id_xor
   }
 
@@ -126,7 +126,7 @@ impl SharedKeyDerivations {
     let mut amount_mask = keccak256(&amount_mask);
 
     let mut amount_mask_8 = [0; 8];
-    amount_mask_8.copy_from_slice(&amount_mask[.. 8]);
+    amount_mask_8.copy_from_slice(&amount_mask[..8]);
     amount_mask.zeroize();
 
     (amount ^ u64::from_le_bytes(amount_mask_8)).to_le_bytes()
@@ -143,13 +143,13 @@ impl SharedKeyDerivations {
         let mask =
           curve25519_dalek::Scalar::from_bytes_mod_order(*mask) - (*mask_shared_sec_scalar).into();
         let amount_scalar = Zeroizing::new(
-          curve25519_dalek::Scalar::from_bytes_mod_order(*amount) -
-            (*amount_shared_sec_scalar).into(),
+          curve25519_dalek::Scalar::from_bytes_mod_order(*amount)
+            - (*amount_shared_sec_scalar).into(),
         );
 
         // d2b from rctTypes.cpp
         let amount = u64::from_le_bytes(
-          Zeroizing::new(amount_scalar.to_bytes()).deref()[.. 8]
+          Zeroizing::new(amount_scalar.to_bytes()).deref()[..8]
             .try_into()
             .expect("32-byte array couldn't have an 8-byte slice taken"),
         );

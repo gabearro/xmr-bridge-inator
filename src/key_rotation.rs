@@ -11,6 +11,8 @@
 //! consensus state and outbox, and destroys retired X25519 key handles only after the returned
 //! [`KeyRotationCertificate`] is durably activated.
 
+#[cfg(test)]
+use std::cell::Cell;
 use std::{
     collections::{BTreeMap, BTreeSet},
     fmt,
@@ -35,22 +37,35 @@ use crate::{
     deposit_wallet::{DepositAddressDeriver, DepositWalletId},
     identity::{Identity, IdentityError, PersistedKeyAdvertisementIdentity, SignedEnvelope},
     keys::{EpochPublic, KeyError},
+    receiver_key_accumulator::{
+        MAX_RECEIVER_KEY_BATCH_UPDATE_PROOF_BYTES, ReceiverKeyAccumulatorCommitment,
+        ReceiverKeyAccumulatorError, ReceiverKeyAccumulatorStore, ReceiverKeyBatchUpdateProof,
+    },
 };
 
-const KEY_ROTATION_VERSION: u16 = 3;
-const KEY_ROTATION_TARGET_POLICY_VERSION: u16 = 2;
-const KEY_ADVERTISEMENT_VERSION: u16 = 3;
-const KEY_ROTATION_CERTIFICATE_VERSION: u16 = 3;
+const KEY_ROTATION_VERSION: u16 = 7;
+const KEY_ROTATION_TARGET_POLICY_VERSION: u16 = 7;
+const KEY_ADVERTISEMENT_VERSION: u16 = 7;
+const KEY_ROTATION_FALLBACK_VOTE_VERSION: u16 = 7;
+const KEY_ROTATION_CERTIFICATE_VERSION: u16 = 7;
 const KEY_ADVERTISEMENT_SEQUENCE: u64 = 0;
-const KEY_ROTATION_APPLICATION: &[u8] = b"x25519-key-rotation/v3";
-const KEY_ROTATION_TARGET_POLICY_DOMAIN: &str = "threshold-monero/key-rotation-target-policy/v2";
-const KEY_ROTATION_CONTEXT_DOMAIN: &str = "threshold-monero/key-rotation-context/v3";
-const KEY_ROTATION_BINDING_DOMAIN: &str = "threshold-monero/key-rotation-binding-domain/v3";
-const KEY_ROTATION_REGISTRY_DOMAIN: &str = "threshold-monero/key-rotation-registry/v3";
-const KEY_ROTATION_CONSENSUS_SESSION_DOMAIN: &[u8] = b"key-rotation-consensus/v3";
-const KEY_ROTATION_ADVERTISEMENT_SESSION_DOMAIN: &[u8] = b"key-rotation-advertisement/v3";
-const KEY_ROTATION_ROUND_STATE_VERSION: u16 = 3;
-const KEY_ROTATION_WIRE_DIGEST_DOMAIN: &str = "threshold-monero/key-rotation-wire/v3";
+const KEY_ROTATION_FALLBACK_VOTE_SEQUENCE: u64 = 0;
+const KEY_ROTATION_APPLICATION: &[u8] = b"x25519-key-rotation/v7";
+const KEY_ROTATION_TARGET_POLICY_DOMAIN: &str = "threshold-monero/key-rotation-target-policy/v7";
+const KEY_ROTATION_CONTEXT_DOMAIN: &str = "threshold-monero/key-rotation-context/v7";
+const KEY_ROTATION_BINDING_DOMAIN: &str = "threshold-monero/key-rotation-binding-domain/v7";
+const KEY_ROTATION_REGISTRY_DOMAIN: &str = "threshold-monero/key-rotation-registry/v7";
+const KEY_ROTATION_CONSENSUS_SESSION_DOMAIN: &[u8] = b"key-rotation-consensus/v7";
+const KEY_ROTATION_ADVERTISEMENT_SESSION_DOMAIN: &[u8] = b"key-rotation-advertisement/v7";
+const KEY_ROTATION_FALLBACK_SESSION_DOMAIN: &[u8] = b"key-rotation-selection-fallback/v1";
+const KEY_ROTATION_ROUND_STATE_VERSION: u16 = 7;
+const KEY_ROTATION_WIRE_DIGEST_DOMAIN: &str = "threshold-monero/key-rotation-wire/v7";
+const KEY_ROTATION_SEMANTIC_VALUE_DOMAIN: &str = "threshold-monero/key-rotation-semantic-value/v7";
+
+#[cfg(test)]
+thread_local! {
+    static SPARSE_PROOF_VERIFICATIONS: Cell<u64> = const { Cell::new(0) };
+}
 
 /// API capability proving that one compact-registry target came from a fully verified threshold
 /// activation and remains in the configured Monero wallet domain.
@@ -196,8 +211,15 @@ impl VerifiedRegistryHandoffTarget {
 
 /// Hard bound for a canonical signed advertisement body.
 pub const MAX_KEY_ADVERTISEMENT_BYTES: usize = 512;
+/// Hard bound for the fixed fallback-vote body.
+pub const MAX_KEY_ROTATION_FALLBACK_VOTE_BYTES: usize = 256;
 /// Hard bound for one portable rotation certificate, including generic commit witnesses.
-pub const MAX_KEY_ROTATION_CERTIFICATE_BYTES: usize = 256 * 1024;
+///
+/// The sparse proof is bounded by committee size and tree depth, never by the number of prior
+/// epochs. Leave room for the fixed proof, advertisements, and at most one committee of generic
+/// PRECOMMIT witnesses.
+pub const MAX_KEY_ROTATION_CERTIFICATE_BYTES: usize =
+    64 * 1024 + MAX_RECEIVER_KEY_BATCH_UPDATE_PROOF_BYTES;
 /// Maximum canonical size accepted for one durable key-rotation round and its retry outbox.
 pub const MAX_KEY_ROTATION_ROUND_STATE_BYTES: usize = 8 * 1024 * 1024;
 /// A round retains at most one local payload per logical consensus slot. Recipient retry sets are
@@ -205,7 +227,7 @@ pub const MAX_KEY_ROTATION_ROUND_STATE_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_KEY_ROTATION_OUTBOX_ENTRIES: usize = 8;
 const MAX_KEY_ROTATION_OUTBOX_RECIPIENTS: usize = MAX_COMMITTEE_MEMBERS * 8;
 
-/// Wire-compatible committee decoding which enforces the engineering cap before allocation.
+/// Bounded canonical committee decoding which enforces the engineering cap before allocation.
 #[derive(Deserialize)]
 struct BoundedCommittee {
     epoch: u64,
@@ -220,39 +242,55 @@ impl From<BoundedCommittee> for Committee {
     }
 }
 
-/// Configured successor eligibility and exact selected-committee shape.
+/// Configured successor eligibility, the authenticated used-key accumulator, and exact selected
+/// shape.
 ///
 /// `eligible` is an authentication roster, not an activated committee. Its stable party and
 /// Ed25519 identities authorize fresh durable X25519 advertisements. Its X25519 bytes are bound
 /// into the policy domain but are never eligible to enter the successor: a certified value must
-/// contain exactly `desired_n` advertisements and the successor is constructed solely from those
-/// fresh keys.
+/// contain exactly `desired_n` advertisements and the successor is constructed solely from any
+/// certificate-selected exact subset of those fresh advertisers.
 ///
-/// Byzantine liveness requires at least `desired_n + target_fault_bound` eligible identities. If
-/// up to `f` candidates omit their advertisements, a source-committee agreement can still choose
-/// a canonical exact `desired_n` subset. Omitted identities receive no successor share.
+/// Byzantine liveness requires at least `desired_n + target_fault_bound` eligible identities. The
+/// configured `target_fault_bound` is a governance assumption over the **entire eligible roster**,
+/// not merely the subset eventually selected: at most that many eligible stable identities may be
+/// Byzantine. Equivalently, every subset this policy permits must satisfy the target fault bound.
+/// Cryptography cannot infer which governed identity is corrupt. Under that assumption, if up to
+/// `f` candidates omit their advertisements, source agreement can still choose an exact
+/// `desired_n` subset without silently increasing the target's adversarial budget.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct KeyRotationTargetPolicy {
     version: u16,
     eligible: Committee,
+    prior_receiver_keys: ReceiverKeyAccumulatorCommitment,
     desired_n: u16,
     target_fault_bound: u16,
+    primary_source_overlap: u16,
+    minimum_source_overlap: u16,
+    selection_fallback_window_ms: u64,
 }
 
 #[derive(Deserialize)]
 struct UncheckedKeyRotationTargetPolicy {
     version: u16,
     eligible: BoundedCommittee,
+    prior_receiver_keys: ReceiverKeyAccumulatorCommitment,
     desired_n: u16,
     target_fault_bound: u16,
+    primary_source_overlap: u16,
+    minimum_source_overlap: u16,
+    selection_fallback_window_ms: u64,
 }
 
 impl KeyRotationTargetPolicy {
     pub fn new(
         source: &Committee,
+        source_fault_bound: u16,
         mut eligible: Committee,
         desired_n: u16,
         target_fault_bound: u16,
+        prior_receiver_keys: ReceiverKeyAccumulatorCommitment,
+        selection_fallback_window_ms: u64,
     ) -> Result<Self, KeyRotationError> {
         let source = source.clone().canonicalized()?;
         let expected_target = source
@@ -289,6 +327,11 @@ impl KeyRotationTargetPolicy {
             members: eligible.members.iter().take(usize::from(desired_n)).cloned().collect(),
         };
         selected_shape.validate_async_security_with_faults(target_fault_bound)?;
+        if selection_fallback_window_ms == 0 {
+            return Err(KeyRotationError::InvalidTargetPolicy(
+                "selection fallback window must be positive",
+            ));
+        }
 
         for member in &source.members {
             validate_x25519_key(member.encryption_key)
@@ -314,11 +357,34 @@ impl KeyRotationTargetPolicy {
             }
         }
 
+        prior_receiver_keys.validate()?;
+        if prior_receiver_keys.through_epoch() != source.epoch {
+            return Err(KeyRotationError::WrongReceiverKeyAccumulatorEpoch {
+                expected: source.epoch,
+                actual: prior_receiver_keys.through_epoch(),
+            });
+        }
+
+        source.validate_async_security_with_faults(source_fault_bound)?;
+        let eligible_source =
+            source.members.iter().filter(|member| eligible.member(member.id).is_ok()).count();
+        let primary_source_overlap = usize::from(desired_n).min(eligible_source);
+        let tolerated_missing = usize::from(source_fault_bound.min(target_fault_bound));
+        let minimum_source_overlap =
+            usize::from(desired_n).min(eligible_source.saturating_sub(tolerated_missing));
         let policy = Self {
             version: KEY_ROTATION_TARGET_POLICY_VERSION,
             eligible,
+            prior_receiver_keys,
             desired_n,
             target_fault_bound,
+            primary_source_overlap: u16::try_from(primary_source_overlap).map_err(|_| {
+                KeyRotationError::InvalidTargetPolicy("primary source overlap does not fit u16")
+            })?,
+            minimum_source_overlap: u16::try_from(minimum_source_overlap).map_err(|_| {
+                KeyRotationError::InvalidTargetPolicy("minimum source overlap does not fit u16")
+            })?,
+            selection_fallback_window_ms,
         };
         if policy.digest() == [0_u8; 32] {
             return Err(KeyRotationError::InvalidTargetPolicy(
@@ -328,12 +394,23 @@ impl KeyRotationTargetPolicy {
         Ok(policy)
     }
 
-    fn validate_against(&self, source: &Committee) -> Result<(), KeyRotationError> {
+    fn validate_against(
+        &self,
+        source: &Committee,
+        source_fault_bound: u16,
+    ) -> Result<(), KeyRotationError> {
         if self.version != KEY_ROTATION_TARGET_POLICY_VERSION {
             return Err(KeyRotationError::UnsupportedVersion);
         }
-        let rebuilt =
-            Self::new(source, self.eligible.clone(), self.desired_n, self.target_fault_bound)?;
+        let rebuilt = Self::new(
+            source,
+            source_fault_bound,
+            self.eligible.clone(),
+            self.desired_n,
+            self.target_fault_bound,
+            self.prior_receiver_keys,
+            self.selection_fallback_window_ms,
+        )?;
         if rebuilt != *self {
             return Err(KeyRotationError::NonCanonicalTargetCommittee);
         }
@@ -361,6 +438,26 @@ impl KeyRotationTargetPolicy {
     }
 
     #[must_use]
+    pub const fn primary_source_overlap(&self) -> u16 {
+        self.primary_source_overlap
+    }
+
+    #[must_use]
+    pub const fn minimum_source_overlap(&self) -> u16 {
+        self.minimum_source_overlap
+    }
+
+    #[must_use]
+    pub const fn selection_fallback_window_ms(&self) -> u64 {
+        self.selection_fallback_window_ms
+    }
+
+    #[must_use]
+    pub const fn prior_receiver_keys(&self) -> ReceiverKeyAccumulatorCommitment {
+        self.prior_receiver_keys
+    }
+
+    #[must_use]
     pub fn selection_size(&self) -> usize {
         usize::from(self.desired_n)
     }
@@ -370,8 +467,15 @@ impl KeyRotationTargetPolicy {
         let mut hasher = blake3::Hasher::new_derive_key(KEY_ROTATION_TARGET_POLICY_DOMAIN);
         hasher.update(&self.version.to_le_bytes());
         hasher.update(&self.eligible.digest());
+        hasher.update(&self.prior_receiver_keys.network());
+        hasher.update(&self.prior_receiver_keys.through_epoch().to_le_bytes());
+        hasher.update(&self.prior_receiver_keys.leaf_count().to_le_bytes());
+        hasher.update(&self.prior_receiver_keys.root());
         hasher.update(&self.desired_n.to_le_bytes());
         hasher.update(&self.target_fault_bound.to_le_bytes());
+        hasher.update(&self.primary_source_overlap.to_le_bytes());
+        hasher.update(&self.minimum_source_overlap.to_le_bytes());
+        hasher.update(&self.selection_fallback_window_ms.to_le_bytes());
         *hasher.finalize().as_bytes()
     }
 }
@@ -412,9 +516,12 @@ impl<'de> Deserialize<'de> for KeyRotationContext {
         let original_target = target_eligible.clone();
         let target_policy = KeyRotationTargetPolicy::new(
             &source,
+            unchecked.source_fault_bound,
             target_eligible,
             unchecked.target_policy.desired_n,
             unchecked.target_policy.target_fault_bound,
+            unchecked.target_policy.prior_receiver_keys,
+            unchecked.target_policy.selection_fallback_window_ms,
         )
         .map_err(D::Error::custom)?;
         let context = Self::new(
@@ -430,6 +537,13 @@ impl<'de> Deserialize<'de> for KeyRotationContext {
         }
         if context.target_policy.eligible != original_target {
             return Err(D::Error::custom(KeyRotationError::NonCanonicalTargetCommittee));
+        }
+        if context.target_policy.primary_source_overlap
+            != unchecked.target_policy.primary_source_overlap
+            || context.target_policy.minimum_source_overlap
+                != unchecked.target_policy.minimum_source_overlap
+        {
+            return Err(D::Error::custom(KeyRotationError::NonCanonicalContext));
         }
         Ok(context)
     }
@@ -454,7 +568,10 @@ impl KeyRotationContext {
             validate_x25519_key(member.encryption_key)
                 .map_err(|_| KeyRotationError::InvalidSourceKey(member.id))?;
         }
-        target_policy.validate_against(&source)?;
+        target_policy.validate_against(&source, source_fault_bound)?;
+        if target_policy.prior_receiver_keys().network() != network {
+            return Err(KeyRotationError::WrongReceiverKeyAccumulatorNetwork);
+        }
         let context = Self {
             version: KEY_ROTATION_VERSION,
             network,
@@ -533,6 +650,22 @@ impl KeyRotationContext {
         self.target_policy.selection_size()
     }
 
+    /// Maximum source membership an honest primary candidate can retain.
+    #[must_use]
+    pub fn primary_source_overlap(&self) -> usize {
+        usize::from(self.target_policy.primary_source_overlap())
+    }
+
+    /// Verifier-enforced churn bound for every certified successor.
+    ///
+    /// At most the smaller source/target Byzantine budget may force replacement of an otherwise
+    /// eligible source member. This is an application-value invariant, not an honest-proposer
+    /// preference, so a Byzantine consensus leader cannot replace healthy members with spares.
+    #[must_use]
+    pub fn minimum_source_overlap(&self) -> usize {
+        usize::from(self.target_policy.minimum_source_overlap())
+    }
+
     #[must_use]
     pub fn participants(&self) -> BTreeSet<PartyId> {
         self.source
@@ -566,6 +699,15 @@ impl KeyRotationContext {
     #[must_use]
     pub fn advertisement_session(&self) -> SessionId {
         SessionId::derive(KEY_ROTATION_ADVERTISEMENT_SESSION_DOMAIN, &self.digest())
+    }
+
+    /// View-independent session for the source committee's one fallback-authorization vote.
+    #[must_use]
+    pub fn selection_fallback_session(&self) -> SessionId {
+        let mut binding = [0_u8; 64];
+        binding[..32].copy_from_slice(&self.digest());
+        binding[32..].copy_from_slice(&self.target_policy.digest());
+        SessionId::derive(KEY_ROTATION_FALLBACK_SESSION_DOMAIN, &binding)
     }
 
     /// Generic consensus context for agreeing on one canonical [`KeyRotationValue`].
@@ -721,6 +863,156 @@ pub fn verify_key_advertisement(
     })
 }
 
+/// Fixed, view-independent source statement authorizing bounded membership fallback.
+///
+/// A vote does not choose a successor and is never sufficient by itself. Exactly `n_source-f_source`
+/// such statements allow a consensus value to retain between R and P-1 eligible source members
+/// after the policy-bound primary window has elapsed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+struct KeyRotationFallbackVoteBody {
+    version: u16,
+    context_digest: [u8; 32],
+    source_epoch: u64,
+    source_activation: [u8; 32],
+    target_epoch: u64,
+    selection_policy_digest: [u8; 32],
+}
+
+/// Canonical source-quorum authorization embedded in every fallback rotation value.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct FallbackAuthorization {
+    #[serde(deserialize_with = "deserialize_fallback_votes")]
+    votes: Vec<SignedEnvelope>,
+}
+
+impl FallbackAuthorization {
+    pub fn new(
+        context: &KeyRotationContext,
+        mut votes: Vec<SignedEnvelope>,
+    ) -> Result<Self, KeyRotationError> {
+        votes.sort_unstable_by_key(|vote| vote.from);
+        let authorization = Self { votes };
+        authorization.verify(context)?;
+        Ok(authorization)
+    }
+
+    #[must_use]
+    pub fn votes(&self) -> &[SignedEnvelope] {
+        &self.votes
+    }
+
+    pub fn verify(&self, context: &KeyRotationContext) -> Result<(), KeyRotationError> {
+        context.validate()?;
+        let expected = context.source_quorum();
+        if self.votes.len() != expected {
+            return Err(KeyRotationError::InvalidFallbackAuthorizationCount {
+                actual: self.votes.len(),
+                expected,
+            });
+        }
+        let mut previous = None;
+        for vote in &self.votes {
+            if previous.is_some_and(|party| party >= vote.from) {
+                return Err(KeyRotationError::NonCanonicalFallbackAuthorization);
+            }
+            previous = Some(vote.from);
+            verify_selection_fallback_vote(context, vote)?;
+        }
+        Ok(())
+    }
+}
+
+/// Sign this source member's sole fallback statement for the exact rotation context.
+///
+/// The state machine intentionally exposes no timestamp here. The persistent scheduler is the only
+/// production caller and invokes it only after its authenticated immutable fallback deadline.
+pub fn sign_selection_fallback_vote(
+    context: &KeyRotationContext,
+    source_identity: &Identity,
+) -> Result<SignedEnvelope, KeyRotationError> {
+    context.validate()?;
+    let source_member = context.source().member(source_identity.party())?;
+    if source_identity.signing_public_key() != source_member.signing_key {
+        return Err(KeyRotationError::WrongLocalRotationIdentity);
+    }
+    let body = KeyRotationFallbackVoteBody {
+        version: KEY_ROTATION_FALLBACK_VOTE_VERSION,
+        context_digest: context.digest(),
+        source_epoch: context.source().epoch,
+        source_activation: context.source_activation(),
+        target_epoch: context.target_epoch(),
+        selection_policy_digest: context.target_policy().digest(),
+    };
+    let payload = postcard::to_allocvec(&body).map_err(|_| KeyRotationError::Serialization)?;
+    if payload.len() > MAX_KEY_ROTATION_FALLBACK_VOTE_BYTES {
+        return Err(KeyRotationError::FallbackVoteTooLarge {
+            actual: payload.len(),
+            maximum: MAX_KEY_ROTATION_FALLBACK_VOTE_BYTES,
+        });
+    }
+    source_identity
+        .sign_envelope(
+            context.source(),
+            context.selection_fallback_session(),
+            None,
+            KEY_ROTATION_FALLBACK_VOTE_SEQUENCE,
+            payload,
+        )
+        .map_err(KeyRotationError::Identity)
+}
+
+/// Authenticate one fixed source fallback statement without consulting local clock state.
+pub fn verify_selection_fallback_vote(
+    context: &KeyRotationContext,
+    envelope: &SignedEnvelope,
+) -> Result<PartyId, KeyRotationError> {
+    context.validate()?;
+    if envelope.payload.len() > MAX_KEY_ROTATION_FALLBACK_VOTE_BYTES {
+        return Err(KeyRotationError::FallbackVoteTooLarge {
+            actual: envelope.payload.len(),
+            maximum: MAX_KEY_ROTATION_FALLBACK_VOTE_BYTES,
+        });
+    }
+    let verifier = context
+        .source()
+        .members
+        .first()
+        .ok_or(KeyRotationError::InvalidContext("source committee is empty"))?
+        .id;
+    Identity::verify_envelope(context.source(), verifier, envelope)?;
+    if envelope.to.is_some() {
+        return Err(KeyRotationError::NonPortableFallbackVote);
+    }
+    if envelope.session != context.selection_fallback_session()
+        || envelope.sequence != KEY_ROTATION_FALLBACK_VOTE_SEQUENCE
+    {
+        return Err(KeyRotationError::WrongFallbackVoteSlot);
+    }
+    let (body, trailing) =
+        postcard::take_from_bytes::<KeyRotationFallbackVoteBody>(&envelope.payload)
+            .map_err(|_| KeyRotationError::Serialization)?;
+    if !trailing.is_empty() {
+        return Err(KeyRotationError::TrailingFallbackVoteBytes);
+    }
+    let canonical = postcard::to_allocvec(&body).map_err(|_| KeyRotationError::Serialization)?;
+    if canonical != envelope.payload {
+        return Err(KeyRotationError::NonCanonicalFallbackVote);
+    }
+    if body.version != KEY_ROTATION_FALLBACK_VOTE_VERSION {
+        return Err(KeyRotationError::UnsupportedVersion);
+    }
+    if body.context_digest != context.digest()
+        || body.source_epoch != context.source().epoch
+        || body.source_activation != context.source_activation()
+        || body.target_epoch != context.target_epoch()
+        || body.selection_policy_digest != context.target_policy().digest()
+        || context.source().member(envelope.from).is_err()
+    {
+        return Err(KeyRotationError::WrongFallbackVoteContext);
+    }
+    Ok(envelope.from)
+}
+
 /// Complete, canonical application value proposed to the generic consensus reducer.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct KeyRotationValue {
@@ -728,17 +1020,87 @@ pub struct KeyRotationValue {
     context: [u8; 32],
     #[serde(deserialize_with = "deserialize_advertisements")]
     advertisements: Vec<SignedEnvelope>,
+    history_update: ReceiverKeyBatchUpdateProof,
+    selection_authorization: Option<FallbackAuthorization>,
+}
+
+/// Exact application result authenticated by one rotation value/certificate.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VerifiedKeyRotation {
+    pub target: Committee,
+    pub receiver_keys: ReceiverKeyAccumulatorCommitment,
+}
+
+/// Exact application result and witness-independent digest authenticated by one certificate.
+///
+/// Keeping the digest beside the verified target lets persistence/registration code bind all
+/// downstream effects without replaying the bounded sparse proof.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VerifiedKeyRotationCertificate {
+    pub target: Committee,
+    pub receiver_keys: ReceiverKeyAccumulatorCommitment,
+    context_digest: [u8; 32],
+    semantic_digest: [u8; 32],
+    certificate_wire_digest: [u8; 32],
+    value: KeyRotationValue,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct VerifiedKeyRotationCertificateParts {
+    target: Committee,
+    receiver_keys: ReceiverKeyAccumulatorCommitment,
+    semantic_digest: [u8; 32],
+    value: KeyRotationValue,
+}
+
+impl VerifiedKeyRotationCertificate {
+    #[must_use]
+    pub const fn semantic_digest(&self) -> [u8; 32] {
+        self.semantic_digest
+    }
+
+    #[must_use]
+    pub const fn history_update(&self) -> &ReceiverKeyBatchUpdateProof {
+        self.value.history_update()
+    }
+
+    fn authenticate_exact_certificate(
+        &self,
+        context: &KeyRotationContext,
+        certificate: &KeyRotationCertificate,
+    ) -> Result<(), KeyRotationError> {
+        let digest = key_rotation_wire_digest(&KeyRotationWire::Certificate(certificate.clone()))?;
+        if self.context_digest != context.digest() || self.certificate_wire_digest != digest {
+            return Err(KeyRotationError::WrongVerifiedCertificate);
+        }
+        Ok(())
+    }
 }
 
 impl KeyRotationValue {
     pub fn new(
         context: &KeyRotationContext,
+        advertisements: Vec<SignedEnvelope>,
+        history_update: ReceiverKeyBatchUpdateProof,
+    ) -> Result<Self, KeyRotationError> {
+        Self::new_with_authorization(context, advertisements, history_update, None)
+    }
+
+    pub fn new_with_authorization(
+        context: &KeyRotationContext,
         mut advertisements: Vec<SignedEnvelope>,
+        history_update: ReceiverKeyBatchUpdateProof,
+        selection_authorization: Option<FallbackAuthorization>,
     ) -> Result<Self, KeyRotationError> {
         advertisements.sort_unstable_by_key(|advertisement| advertisement.from);
-        let value =
-            Self { version: KEY_ROTATION_VERSION, context: context.digest(), advertisements };
-        drop(value.target_committee(context)?);
+        let value = Self {
+            version: KEY_ROTATION_VERSION,
+            context: context.digest(),
+            advertisements,
+            history_update,
+            selection_authorization,
+        };
+        drop(value.verify(context)?);
         Ok(value)
     }
 
@@ -747,11 +1109,22 @@ impl KeyRotationValue {
         &self.advertisements
     }
 
-    /// Verify every embedded witness and deterministically reconstruct the successor committee.
-    pub fn target_committee(
+    #[must_use]
+    pub const fn history_update(&self) -> &ReceiverKeyBatchUpdateProof {
+        &self.history_update
+    }
+
+    #[must_use]
+    pub const fn selection_authorization(&self) -> Option<&FallbackAuthorization> {
+        self.selection_authorization.as_ref()
+    }
+
+    /// Verify every embedded witness, prove every selected receiver key absent from the
+    /// authenticated predecessor set, and deterministically reconstruct the successor.
+    pub fn verify(
         &self,
         context: &KeyRotationContext,
-    ) -> Result<Committee, KeyRotationError> {
+    ) -> Result<VerifiedKeyRotation, KeyRotationError> {
         context.validate()?;
         if self.version != KEY_ROTATION_VERSION {
             return Err(KeyRotationError::UnsupportedVersion);
@@ -786,6 +1159,34 @@ impl KeyRotationValue {
                 return Err(KeyRotationError::DuplicateNextKey);
             }
         }
+        let retained_source =
+            next_by_party.keys().filter(|party| context.source.member(**party).is_ok()).count();
+        let primary_source = context.primary_source_overlap();
+        let minimum_source = context.minimum_source_overlap();
+        match &self.selection_authorization {
+            None if retained_source < primary_source => {
+                return Err(KeyRotationError::MissingFallbackAuthorization {
+                    actual: retained_source,
+                    primary: primary_source,
+                });
+            }
+            Some(_) if retained_source >= primary_source => {
+                return Err(KeyRotationError::GratuitousFallbackAuthorization {
+                    actual: retained_source,
+                    primary: primary_source,
+                });
+            }
+            Some(authorization) => {
+                if retained_source < minimum_source {
+                    return Err(KeyRotationError::InsufficientSourceRetention {
+                        actual: retained_source,
+                        minimum: minimum_source,
+                    });
+                }
+                authorization.verify(context)?;
+            }
+            None => {}
+        }
 
         let members = next_by_party
             .iter()
@@ -805,14 +1206,41 @@ impl KeyRotationValue {
         }
         .canonicalized()?;
         target.validate_async_security_with_faults(context.target_fault_bound())?;
-        Ok(target)
+        let selected = target
+            .members
+            .iter()
+            .map(|member| (member.id, member.encryption_key))
+            .collect::<Vec<_>>();
+        #[cfg(test)]
+        SPARSE_PROOF_VERIFICATIONS
+            .with(|verifications| verifications.set(verifications.get().saturating_add(1)));
+        let receiver_keys = self.history_update.verify(
+            &context.target_policy.prior_receiver_keys(),
+            context.target_epoch(),
+            &selected,
+        )?;
+        Ok(VerifiedKeyRotation { target, receiver_keys })
+    }
+
+    pub fn target_committee(
+        &self,
+        context: &KeyRotationContext,
+    ) -> Result<Committee, KeyRotationError> {
+        self.verify(context).map(|verified| verified.target)
+    }
+
+    pub fn resulting_receiver_keys(
+        &self,
+        context: &KeyRotationContext,
+    ) -> Result<ReceiverKeyAccumulatorCommitment, KeyRotationError> {
+        self.verify(context).map(|verified| verified.receiver_keys)
     }
 
     pub fn to_consensus_value(
         &self,
         context: &KeyRotationContext,
     ) -> Result<ConsensusValue, KeyRotationError> {
-        drop(self.target_committee(context)?);
+        drop(self.verify(context)?);
         let encoded = postcard::to_allocvec(self).map_err(|_| KeyRotationError::Serialization)?;
         if encoded.len() > MAX_CONSENSUS_VALUE_BYTES {
             return Err(KeyRotationError::ValueTooLarge {
@@ -827,11 +1255,25 @@ impl KeyRotationValue {
         context: &KeyRotationContext,
         value: &ConsensusValue,
     ) -> Result<Self, KeyRotationError> {
+        Self::from_consensus_value_verified(context, value).map(|(value, _)| value)
+    }
+
+    fn from_consensus_value_verified(
+        context: &KeyRotationContext,
+        value: &ConsensusValue,
+    ) -> Result<(Self, VerifiedKeyRotation), KeyRotationError> {
         value.validate()?;
-        Self::decode(context, value.as_bytes())
+        Self::decode_verified(context, value.as_bytes())
     }
 
     pub fn decode(context: &KeyRotationContext, bytes: &[u8]) -> Result<Self, KeyRotationError> {
+        Self::decode_verified(context, bytes).map(|(value, _)| value)
+    }
+
+    fn decode_verified(
+        context: &KeyRotationContext,
+        bytes: &[u8],
+    ) -> Result<(Self, VerifiedKeyRotation), KeyRotationError> {
         if bytes.len() > MAX_CONSENSUS_VALUE_BYTES {
             return Err(KeyRotationError::ValueTooLarge {
                 actual: bytes.len(),
@@ -848,8 +1290,8 @@ impl KeyRotationValue {
         if canonical != bytes {
             return Err(KeyRotationError::NonCanonicalValue);
         }
-        drop(value.target_committee(context)?);
-        Ok(value)
+        let verified = value.verify(context)?;
+        Ok((value, verified))
     }
 }
 
@@ -858,7 +1300,8 @@ impl KeyRotationValue {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct KeyRotationCertificate {
     version: u16,
-    context: [u8; 32],
+    context_digest: [u8; 32],
+    context: KeyRotationContext,
     commit: CommitCertificate,
 }
 
@@ -867,25 +1310,72 @@ impl KeyRotationCertificate {
         context: &KeyRotationContext,
         commit: CommitCertificate,
     ) -> Result<Self, KeyRotationError> {
-        let certificate =
-            Self { version: KEY_ROTATION_CERTIFICATE_VERSION, context: context.digest(), commit };
+        let certificate = Self {
+            version: KEY_ROTATION_CERTIFICATE_VERSION,
+            context_digest: context.digest(),
+            context: context.clone(),
+            commit,
+        };
         drop(certificate.verify(context)?);
         Ok(certificate)
     }
 
     /// Verify the generic consensus certificate and reconstruct its exact target committee.
     pub fn verify(&self, context: &KeyRotationContext) -> Result<Committee, KeyRotationError> {
+        self.verify_rotation(context).map(|verified| verified.target)
+    }
+
+    /// Verify the generic decision plus the bounded used-key accumulator transition.
+    pub fn verify_rotation(
+        &self,
+        context: &KeyRotationContext,
+    ) -> Result<VerifiedKeyRotation, KeyRotationError> {
+        self.verify_certificate_parts(context).map(|parts| VerifiedKeyRotation {
+            target: parts.target,
+            receiver_keys: parts.receiver_keys,
+        })
+    }
+
+    /// Verify the certificate once and return every value needed by durable registration.
+    pub fn verify_rotation_certificate(
+        &self,
+        context: &KeyRotationContext,
+    ) -> Result<VerifiedKeyRotationCertificate, KeyRotationError> {
+        let parts = self.verify_certificate_parts(context)?;
+        let certificate_wire_digest =
+            key_rotation_wire_digest(&KeyRotationWire::Certificate(self.clone()))?;
+        Ok(VerifiedKeyRotationCertificate {
+            target: parts.target,
+            receiver_keys: parts.receiver_keys,
+            context_digest: context.digest(),
+            semantic_digest: parts.semantic_digest,
+            certificate_wire_digest,
+            value: parts.value,
+        })
+    }
+
+    fn verify_certificate_parts(
+        &self,
+        context: &KeyRotationContext,
+    ) -> Result<VerifiedKeyRotationCertificateParts, KeyRotationError> {
         context.validate()?;
         if self.version != KEY_ROTATION_CERTIFICATE_VERSION {
             return Err(KeyRotationError::UnsupportedVersion);
         }
-        if self.context != context.digest() {
+        if self.context_digest != context.digest() || self.context != *context {
             return Err(KeyRotationError::WrongCertificateContext);
         }
         let consensus_context = context.consensus_context()?;
         self.commit.verify(&consensus_context)?;
-        KeyRotationValue::from_consensus_value(context, self.commit.value())?
-            .target_committee(context)
+        let (value, verified) =
+            KeyRotationValue::from_consensus_value_verified(context, self.commit.value())?;
+        let semantic_digest = key_rotation_semantic_digest(context, self.commit.value().as_bytes());
+        Ok(VerifiedKeyRotationCertificateParts {
+            target: verified.target,
+            receiver_keys: verified.receiver_keys,
+            semantic_digest,
+            value,
+        })
     }
 
     pub fn target_committee(
@@ -893,6 +1383,13 @@ impl KeyRotationCertificate {
         context: &KeyRotationContext,
     ) -> Result<Committee, KeyRotationError> {
         self.verify(context)
+    }
+
+    pub fn resulting_receiver_keys(
+        &self,
+        context: &KeyRotationContext,
+    ) -> Result<ReceiverKeyAccumulatorCommitment, KeyRotationError> {
+        self.verify_rotation(context).map(|verified| verified.receiver_keys)
     }
 
     /// Witness-independent commitment used by epoch-history continuity.
@@ -903,12 +1400,20 @@ impl KeyRotationCertificate {
         &self,
         context: &KeyRotationContext,
     ) -> Result<[u8; 32], KeyRotationError> {
-        drop(self.verify(context)?);
-        let mut hasher =
-            blake3::Hasher::new_derive_key("threshold-monero/key-rotation-semantic-value/v2");
-        hasher.update(&context.digest());
-        hasher.update(self.commit.value().as_bytes());
-        Ok(*hasher.finalize().as_bytes())
+        self.verify_certificate_parts(context).map(|parts| parts.semantic_digest)
+    }
+
+    /// Return whether two independently assembled quorum certificates prove the same decision.
+    ///
+    /// Honest collectors can retain different exact `n-f` PRECOMMIT witness subsets (and can
+    /// learn the decision in different views). Those byte-distinct certificates are equivalent
+    /// when they bind the same trusted context and canonical rotation value.
+    pub fn proves_same_decision(
+        &self,
+        other: &Self,
+        context: &KeyRotationContext,
+    ) -> Result<bool, KeyRotationError> {
+        Ok(self.semantic_digest(context)? == other.semantic_digest(context)?)
     }
 
     pub fn encode(&self, context: &KeyRotationContext) -> Result<Vec<u8>, KeyRotationError> {
@@ -924,6 +1429,17 @@ impl KeyRotationCertificate {
     }
 
     pub fn decode(context: &KeyRotationContext, bytes: &[u8]) -> Result<Self, KeyRotationError> {
+        let certificate = Self::decode_embedded(bytes)?;
+        drop(certificate.verify(context)?);
+        Ok(certificate)
+    }
+
+    /// Canonically decode the current certificate wrapper used by authenticated epoch history.
+    ///
+    /// This deliberately does not establish trust by verifying against its own embedded context.
+    /// The caller must reconstruct the expected context from the authenticated predecessor link
+    /// and call [`Self::verify`].
+    pub fn decode_embedded(bytes: &[u8]) -> Result<Self, KeyRotationError> {
         if bytes.len() > MAX_KEY_ROTATION_CERTIFICATE_BYTES {
             return Err(KeyRotationError::CertificateTooLarge {
                 actual: bytes.len(),
@@ -940,16 +1456,25 @@ impl KeyRotationCertificate {
         if canonical != bytes {
             return Err(KeyRotationError::NonCanonicalCertificate);
         }
-        drop(certificate.verify(context)?);
+        certificate.context.validate()?;
+        if certificate.version != KEY_ROTATION_CERTIFICATE_VERSION
+            || certificate.context_digest != certificate.context.digest()
+        {
+            return Err(KeyRotationError::WrongCertificateContext);
+        }
         Ok(certificate)
+    }
+
+    #[must_use]
+    pub const fn embedded_context(&self) -> &KeyRotationContext {
+        &self.context
     }
 
     pub fn value(
         &self,
         context: &KeyRotationContext,
     ) -> Result<KeyRotationValue, KeyRotationError> {
-        drop(self.verify(context)?);
-        KeyRotationValue::from_consensus_value(context, self.commit.value())
+        self.verify_certificate_parts(context).map(|parts| parts.value)
     }
 
     #[must_use]
@@ -974,6 +1499,13 @@ impl KeyRotationCertificate {
     }
 }
 
+fn key_rotation_semantic_digest(context: &KeyRotationContext, value: &[u8]) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new_derive_key(KEY_ROTATION_SEMANTIC_VALUE_DOMAIN);
+    hasher.update(&context.digest());
+    hasher.update(value);
+    *hasher.finalize().as_bytes()
+}
+
 /// Stateless predicate suitable for [`crate::deposit_consensus::DepositConsensus::handle_with_value_validator`].
 #[must_use]
 pub fn valid_key_rotation_consensus_value(
@@ -991,6 +1523,7 @@ pub fn valid_key_rotation_consensus_value(
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum KeyRotationWire {
     Advertisement(SignedEnvelope),
+    FallbackVote(SignedEnvelope),
     Consensus(SignedEnvelope),
     ViewCertificate(ViewChangeCertificate),
     Certificate(KeyRotationCertificate),
@@ -1003,6 +1536,7 @@ pub enum KeyRotationWire {
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 pub enum KeyRotationDeliveryKind {
     Advertisement,
+    FallbackVote,
     Proposal { view: u64 },
     Prevote { view: u64 },
     Precommit { view: u64 },
@@ -1014,7 +1548,7 @@ pub enum KeyRotationDeliveryKind {
 impl KeyRotationDeliveryKind {
     const fn view(self) -> Option<u64> {
         match self {
-            Self::Advertisement | Self::Certificate => None,
+            Self::Advertisement | Self::FallbackVote | Self::Certificate => None,
             Self::Proposal { view } | Self::Prevote { view } | Self::Precommit { view } => {
                 Some(view)
             }
@@ -1024,19 +1558,32 @@ impl KeyRotationDeliveryKind {
         }
     }
 
-    /// Causal order for one recipient within this rotation context. In particular, the signed
-    /// view-change and its portable certificate must precede a proposal for that target view.
+    /// Causal order for one recipient within this rotation context.
+    ///
+    /// A higher-view proposal embeds its verified view-change certificate and can initialize an
+    /// otherwise absent reducer. It therefore precedes the standalone view-change traffic for the
+    /// same target view; reducer validation remains the authority for whether it is admissible.
     #[must_use]
     pub const fn relay_order(self) -> (u64, u8) {
         match self {
             Self::Advertisement => (0, 0),
-            Self::ViewChange { target_view } => (target_view, 1),
-            Self::ViewCertificate { target_view } => (target_view, 2),
-            Self::Proposal { view } => (view, 3),
-            Self::Prevote { view } => (view, 4),
-            Self::Precommit { view } => (view, 5),
+            Self::FallbackVote => (0, 1),
+            Self::Proposal { view } => (view, 2),
+            Self::ViewChange { target_view } => (target_view, 3),
+            Self::ViewCertificate { target_view } => (target_view, 4),
+            Self::Prevote { view } => (view, 5),
+            Self::Precommit { view } => (view, 6),
             // Committing clears every nonterminal outbox slot before this is inserted.
-            Self::Certificate => (u64::MAX, 6),
+            Self::Certificate => (u64::MAX, 7),
+        }
+    }
+
+    const fn recipient_relay_order(self, proposal_pending: bool) -> (u8, u64, u8) {
+        let (view, phase) = self.relay_order();
+        if proposal_pending && matches!(self, Self::Proposal { .. }) {
+            (0, view, phase)
+        } else {
+            (1, view, phase)
         }
     }
 }
@@ -1103,18 +1650,35 @@ pub fn pending_key_rotation_certificate(
     certificate: &KeyRotationCertificate,
     recipient: PartyId,
 ) -> Result<PendingKeyRotationMessage, KeyRotationError> {
+    let verified = certificate.verify_rotation_certificate(context)?;
+    pending_verified_key_rotation_certificate(context, certificate, &verified, recipient)
+}
+
+/// Build one retry item from the exact certificate represented by a prior verified result.
+///
+/// The wire digest binds the complete witness representation, so a caller cannot pair a verified
+/// result with an unverified or byte-distinct certificate while avoiding certificate validation.
+pub fn pending_verified_key_rotation_certificate(
+    context: &KeyRotationContext,
+    certificate: &KeyRotationCertificate,
+    verified: &VerifiedKeyRotationCertificate,
+    recipient: PartyId,
+) -> Result<PendingKeyRotationMessage, KeyRotationError> {
     if !context.is_participant(recipient) {
         return Err(CommitteeError::UnknownParty(recipient).into());
     }
-    drop(certificate.verify(context)?);
     let wire = KeyRotationWire::Certificate(certificate.clone());
+    let digest = key_rotation_wire_digest(&wire)?;
+    if context.digest() != verified.context_digest || digest != verified.certificate_wire_digest {
+        return Err(KeyRotationError::WrongVerifiedCertificate);
+    }
     Ok(PendingKeyRotationMessage {
         target_epoch: context.target_epoch(),
         id: KeyRotationMessageId {
             context: context.digest(),
             recipient,
             kind: KeyRotationDeliveryKind::Certificate,
-            digest: key_rotation_wire_digest(&wire)?,
+            digest,
         },
         wire,
     })
@@ -1149,6 +1713,7 @@ pub struct KeyRotationRound {
     context: KeyRotationContext,
     local_party: PartyId,
     advertisements: BTreeMap<PartyId, SignedEnvelope>,
+    fallback_votes: BTreeMap<PartyId, SignedEnvelope>,
     consensus: Option<DepositConsensus>,
     outbox: BTreeMap<KeyRotationDeliveryKind, KeyRotationOutboxEntry>,
 }
@@ -1159,6 +1724,7 @@ struct UncheckedKeyRotationRound {
     context: KeyRotationContext,
     local_party: PartyId,
     advertisements: BTreeMap<PartyId, SignedEnvelope>,
+    fallback_votes: BTreeMap<PartyId, SignedEnvelope>,
     consensus: Option<DepositConsensus>,
     outbox: BTreeMap<KeyRotationDeliveryKind, KeyRotationOutboxEntry>,
 }
@@ -1171,6 +1737,7 @@ impl<'de> Deserialize<'de> for KeyRotationRound {
             context: unchecked.context,
             local_party: unchecked.local_party,
             advertisements: unchecked.advertisements,
+            fallback_votes: unchecked.fallback_votes,
             consensus: unchecked.consensus,
             outbox: unchecked.outbox,
         };
@@ -1191,6 +1758,7 @@ impl KeyRotationRound {
             context,
             local_party,
             advertisements: BTreeMap::new(),
+            fallback_votes: BTreeMap::new(),
             consensus: None,
             outbox: BTreeMap::new(),
         })
@@ -1216,6 +1784,11 @@ impl KeyRotationRound {
         self.advertisements.len()
     }
 
+    #[must_use]
+    pub fn fallback_vote_count(&self) -> usize {
+        self.fallback_votes.len()
+    }
+
     /// Return the exact public key authenticated by one retained advertisement. Runtime restore
     /// uses this to bind the encrypted target-epoch secret to the reducer snapshot before the
     /// identity is allowed to sign another vote or decrypt AVSS traffic.
@@ -1238,6 +1811,7 @@ impl KeyRotationRound {
     pub fn advertise(
         &mut self,
         target_capability: &PersistedKeyAdvertisementIdentity,
+        receiver_keys: &ReceiverKeyAccumulatorStore,
     ) -> Result<KeyRotationRoundStep, KeyRotationError> {
         let target_identity = target_capability.identity();
         if target_identity.party() != self.local_party {
@@ -1250,7 +1824,35 @@ impl KeyRotationRound {
             if inserted {
                 self.enqueue_for_peers(KeyRotationWire::Advertisement(advertisement))?;
             }
-            let mut step = self.maybe_start_consensus(target_identity)?;
+            let mut step = self.maybe_start_consensus(target_identity, receiver_keys)?;
+            step.changed |= inserted;
+            step.duplicate |= !inserted;
+            Ok(step)
+        })();
+        if result.is_err() {
+            *self = before;
+        }
+        result
+    }
+
+    /// Persist this source party's sole fallback vote and retry it to every other source member.
+    ///
+    /// Production calls this only from the local persistent pacemaker after the schedule-owned
+    /// fallback deadline. Receiving a remote vote never invokes this method.
+    pub fn authorize_fallback(
+        &mut self,
+        source_identity: &Identity,
+        receiver_keys: &ReceiverKeyAccumulatorStore,
+    ) -> Result<KeyRotationRoundStep, KeyRotationError> {
+        self.ensure_local_identity(source_identity)?;
+        let before = self.clone();
+        let result = (|| {
+            let vote = sign_selection_fallback_vote(&self.context, source_identity)?;
+            let inserted = self.insert_fallback_vote(vote.clone())?;
+            if inserted {
+                self.enqueue_for_peers(KeyRotationWire::FallbackVote(vote))?;
+            }
+            let mut step = self.maybe_start_consensus(source_identity, receiver_keys)?;
             step.changed |= inserted;
             step.duplicate |= !inserted;
             Ok(step)
@@ -1267,10 +1869,52 @@ impl KeyRotationRound {
         authenticated_party: PartyId,
         wire: KeyRotationWire,
         local_identity: &Identity,
+        receiver_keys: &ReceiverKeyAccumulatorStore,
     ) -> Result<KeyRotationRoundStep, KeyRotationError> {
         self.ensure_local_identity(local_identity)?;
         let before = self.clone();
-        let result = self.handle_wire_inner(authenticated_party, wire, local_identity);
+        let result =
+            self.handle_wire_inner(authenticated_party, wire, local_identity, receiver_keys);
+        if result.is_err() {
+            *self = before;
+        }
+        result
+    }
+
+    /// Reduce an exact certificate which was fully verified before crossing a blocking boundary.
+    ///
+    /// The capability is bound to the complete certificate wire representation. The generic
+    /// reducer still authenticates the quorum signatures and state transition, but its value
+    /// callback need not replay the receiver-key sparse proof.
+    pub fn handle_verified_certificate(
+        &mut self,
+        authenticated_party: PartyId,
+        certificate: KeyRotationCertificate,
+        verified: &VerifiedKeyRotationCertificate,
+        local_identity: &Identity,
+    ) -> Result<KeyRotationRoundStep, KeyRotationError> {
+        self.ensure_local_identity(local_identity)?;
+        verified.authenticate_exact_certificate(&self.context, &certificate)?;
+        let before = self.clone();
+        let result = (|| {
+            if !self.context.is_participant(authenticated_party) {
+                return Err(CommitteeError::UnknownParty(authenticated_party).into());
+            }
+            let consensus_context = self.context.consensus_context()?;
+            let consensus = match self.consensus.as_mut() {
+                Some(consensus) => consensus,
+                None => self
+                    .consensus
+                    .insert(DepositConsensus::new(consensus_context, self.local_party)?),
+            };
+            // `verified` already authenticated this exact certificate's canonical value and
+            // accumulator update. The generic core continues to verify its quorum signatures.
+            let generic = consensus.handle_commit_certificate_with_validator(
+                certificate.commit_certificate().clone(),
+                |_| true,
+            )?;
+            self.apply_consensus_step_inner(generic, Some(&certificate))
+        })();
         if result.is_err() {
             *self = before;
         }
@@ -1282,6 +1926,7 @@ impl KeyRotationRound {
         authenticated_party: PartyId,
         wire: KeyRotationWire,
         local_identity: &Identity,
+        receiver_keys: &ReceiverKeyAccumulatorStore,
     ) -> Result<KeyRotationRoundStep, KeyRotationError> {
         match wire {
             KeyRotationWire::Advertisement(envelope) => {
@@ -1290,7 +1935,21 @@ impl KeyRotationRound {
                     return Err(KeyRotationError::WrongAuthenticatedParty);
                 }
                 let inserted = self.insert_advertisement(envelope)?;
-                let mut step = self.maybe_start_consensus(local_identity)?;
+                let mut step = self.maybe_start_consensus(local_identity, receiver_keys)?;
+                step.changed |= inserted;
+                step.duplicate |= !inserted;
+                Ok(step)
+            }
+            KeyRotationWire::FallbackVote(envelope) => {
+                self.context.source().member(authenticated_party)?;
+                if envelope.from != authenticated_party {
+                    return Err(KeyRotationError::WrongAuthenticatedParty);
+                }
+                let inserted = self.insert_fallback_vote(envelope)?;
+                // A remote vote is only authenticated, stored, and reduced. It never causes this
+                // party to sign its own fallback statement; that authority belongs exclusively to
+                // the deadline-gated local scheduler.
+                let mut step = self.maybe_start_consensus(local_identity, receiver_keys)?;
                 step.changed |= inserted;
                 step.duplicate |= !inserted;
                 Ok(step)
@@ -1300,16 +1959,35 @@ impl KeyRotationRound {
                 if envelope.from != authenticated_party {
                     return Err(KeyRotationError::WrongAuthenticatedParty);
                 }
-                let consensus =
-                    self.consensus.as_mut().ok_or(KeyRotationError::ConsensusNotReady)?;
+                // Bind and authenticate the envelope before reporting local readiness. Besides
+                // producing an accurate stale/foreign-context error, this lets a lagging source
+                // initialize directly from a leader proposal: the proposal carries the complete
+                // signed advertisement set and accumulator update, so a separate local ad cache is
+                // not a safety prerequisite.
+                let consensus_context = self.context.consensus_context()?;
+                let decoded = decode_consensus_message(&consensus_context, &envelope)?;
+                if self.consensus.is_none() {
+                    if !matches!(decoded.body, ConsensusMessageBody::Proposal(_)) {
+                        return Err(KeyRotationError::ConsensusNotReady);
+                    }
+                    self.consensus =
+                        Some(DepositConsensus::new(consensus_context, self.local_party)?);
+                }
+                let consensus = self.consensus.as_mut().expect("initialized above");
                 if consensus.commit().is_some() {
-                    drop(decode_consensus_message(&self.context.consensus_context()?, &envelope)?);
                     return Ok(KeyRotationRoundStep { duplicate: true, ..Default::default() });
                 }
-                let generic =
+                let generic = if consensus.started() {
                     consensus.handle_with_value_validator(local_identity, envelope, |value| {
                         valid_key_rotation_consensus_value(&self.context, value)
-                    });
+                    })
+                } else {
+                    consensus.handle_initial_proposal_with_value_validator(
+                        local_identity,
+                        envelope,
+                        |value| valid_key_rotation_consensus_value(&self.context, value),
+                    )
+                };
                 match generic {
                     Ok(step) => self.apply_consensus_step(step),
                     Err(ConsensusError::StaleView { .. }) => {
@@ -1373,8 +2051,17 @@ impl KeyRotationRound {
             if consensus.commit().is_some() {
                 return Ok(KeyRotationRoundStep { duplicate: true, ..Default::default() });
             }
+            let requested_view =
+                consensus.view().checked_add(1).ok_or(ConsensusError::ViewExhausted)?;
             let step = consensus.request_view_change(local_identity)?;
-            self.apply_consensus_step(step)
+            let mut result = self.apply_consensus_step(step)?;
+            // Requesting a view change is an irrevocable local decision not to vote again in the
+            // abandoned view. Remove its phase traffic even when this call repaired a restored
+            // duplicate request and the reducer has not yet collected a quorum to enter the new
+            // view. Advertisement and view-change/certificate slots remain independently
+            // retryable.
+            result.changed |= self.prune_abandoned_consensus_phases(requested_view);
+            Ok(result)
         })();
         if result.is_err() {
             *self = before;
@@ -1393,6 +2080,10 @@ impl KeyRotationRound {
 
     /// Snapshot pending deliveries without removing them. The first pass chooses one message per
     /// recipient, preventing one recipient's multiple slots from monopolizing an ordinary batch.
+    /// While a self-contained proposal remains pending for a recipient, its redundant standalone
+    /// advertisement is withheld from this multi-peer batch so a downstream earliest-message
+    /// reducer cannot select the advertisement over the proposal. The advertisement remains
+    /// durable and becomes eligible immediately after that recipient acknowledges the proposal.
     #[must_use]
     pub fn pending_messages(&self, limit: usize) -> Vec<PendingKeyRotationMessage> {
         // `MAX_KEY_ROTATION_OUTBOX_ENTRIES` bounds distinct payload slots, not point-to-point
@@ -1408,11 +2099,12 @@ impl KeyRotationRound {
             if recipient == self.local_party {
                 continue;
             }
+            let proposal_pending = self.has_pending_proposal(recipient);
             if let Some((kind, entry)) = self
                 .outbox
                 .iter()
                 .filter(|(_, entry)| entry.recipients.contains(&recipient))
-                .min_by_key(|(kind, _)| kind.relay_order())
+                .min_by_key(|(kind, _)| kind.recipient_relay_order(proposal_pending))
             {
                 selected.insert((recipient, *kind));
                 result.push(self.pending_message(recipient, *kind, entry));
@@ -1423,6 +2115,11 @@ impl KeyRotationRound {
         }
         for (kind, entry) in &self.outbox {
             for recipient in &entry.recipients {
+                if *kind == KeyRotationDeliveryKind::Advertisement
+                    && self.has_pending_proposal(*recipient)
+                {
+                    continue;
+                }
                 if !selected.insert((*recipient, *kind)) {
                     continue;
                 }
@@ -1443,17 +2140,25 @@ impl KeyRotationRound {
         recipient: PartyId,
         limit: usize,
     ) -> Vec<PendingKeyRotationMessage> {
+        let proposal_pending = self.has_pending_proposal(recipient);
         let mut pending = self
             .outbox
             .iter()
             .filter(|(_, entry)| entry.recipients.contains(&recipient))
             .collect::<Vec<_>>();
-        pending.sort_by_key(|(kind, _)| kind.relay_order());
+        pending.sort_by_key(|(kind, _)| kind.recipient_relay_order(proposal_pending));
         pending
             .into_iter()
             .take(limit.min(MAX_KEY_ROTATION_OUTBOX_ENTRIES))
             .map(|(kind, entry)| self.pending_message(recipient, *kind, entry))
             .collect()
+    }
+
+    fn has_pending_proposal(&self, recipient: PartyId) -> bool {
+        self.outbox.iter().any(|(kind, entry)| {
+            matches!(kind, KeyRotationDeliveryKind::Proposal { .. })
+                && entry.recipients.contains(&recipient)
+        })
     }
 
     /// Remove exact, durably accepted deliveries. Stale or foreign digests are harmless no-ops;
@@ -1553,15 +2258,91 @@ impl KeyRotationRound {
         Ok(true)
     }
 
-    fn candidate_value(&self) -> Result<Option<KeyRotationValue>, KeyRotationError> {
+    fn insert_fallback_vote(&mut self, vote: SignedEnvelope) -> Result<bool, KeyRotationError> {
+        let party = verify_selection_fallback_vote(&self.context, &vote)?;
+        if let Some(existing) = self.fallback_votes.get(&party) {
+            if existing == &vote {
+                return Ok(false);
+            }
+            return Err(KeyRotationError::ConflictingFallbackVote(party));
+        }
+        if self.fallback_votes.len() == usize::from(self.context.source().n()) {
+            return Err(KeyRotationError::TooManyFallbackVotes);
+        }
+        self.fallback_votes.insert(party, vote);
+        Ok(true)
+    }
+
+    fn fallback_authorization(&self) -> Result<Option<FallbackAuthorization>, KeyRotationError> {
+        let quorum = self.context.source_quorum();
+        if self.fallback_votes.len() < quorum {
+            return Ok(None);
+        }
+        FallbackAuthorization::new(
+            &self.context,
+            self.fallback_votes.values().take(quorum).cloned().collect(),
+        )
+        .map(Some)
+    }
+
+    fn candidate_value(
+        &self,
+        receiver_keys: &ReceiverKeyAccumulatorStore,
+    ) -> Result<Option<KeyRotationValue>, KeyRotationError> {
+        if receiver_keys.commitment() != self.context.target_policy().prior_receiver_keys() {
+            return Err(KeyRotationError::WrongReceiverKeyAccumulator);
+        }
         let mut next_keys = BTreeSet::new();
         let mut advertisements = Vec::with_capacity(self.context.selection_size());
-        for advertisement in self.advertisements.values() {
+        let mut selected = Vec::with_capacity(self.context.selection_size());
+        // Preserve healthy membership independently of PartyId ordering. Source advertisers are
+        // canonical within their class and always precede eligible-only spares; a spare is chosen
+        // only when the exact desired size cannot be filled by fresh source advertisements.
+        let source = self.context.source();
+        let ordered = self
+            .advertisements
+            .values()
+            .filter(|advertisement| source.member(advertisement.from).is_ok())
+            .chain(
+                self.advertisements
+                    .values()
+                    .filter(|advertisement| source.member(advertisement.from).is_err()),
+            );
+        for advertisement in ordered {
             let verified = verify_key_advertisement(&self.context, advertisement)?;
+            // A stale Byzantine advertisement is validly signed but cannot become part of a
+            // freshness-certified value. Skip it so one low-numbered stale advertiser cannot
+            // block an otherwise live exact-size subset.
+            if receiver_keys.try_contains_key(verified.next_key)? {
+                continue;
+            }
             if next_keys.insert(verified.next_key) {
                 advertisements.push(advertisement.clone());
+                selected.push((verified.party, verified.next_key));
                 if advertisements.len() == self.context.selection_size() {
-                    return Ok(Some(KeyRotationValue::new(&self.context, advertisements)?));
+                    // Source-first selection is a liveness policy, not the accumulator's wire
+                    // order. An eligible-only spare may have a lower PartyId than every retained
+                    // source member, so canonicalize the exact chosen set before proving its
+                    // append-only receiver-key update.
+                    selected.sort_unstable_by_key(|(party, _)| *party);
+                    let (history_update, _) =
+                        receiver_keys.preview(self.context.target_epoch(), &selected)?;
+                    let retained_source =
+                        selected.iter().filter(|(party, _)| source.member(*party).is_ok()).count();
+                    let authorization = if retained_source < self.context.primary_source_overlap() {
+                        let Some(authorization) = self.fallback_authorization()? else {
+                            return Ok(None);
+                        };
+                        Some(authorization)
+                    } else {
+                        None
+                    };
+                    return Ok(Some(KeyRotationValue::new_with_authorization(
+                        &self.context,
+                        advertisements,
+                        history_update,
+                        authorization,
+                    )?));
                 }
             }
         }
@@ -1571,11 +2352,12 @@ impl KeyRotationRound {
     fn maybe_start_consensus(
         &mut self,
         local_identity: &Identity,
+        receiver_keys: &ReceiverKeyAccumulatorStore,
     ) -> Result<KeyRotationRoundStep, KeyRotationError> {
         if self.consensus.is_some() {
             return Ok(KeyRotationRoundStep::default());
         }
-        let Some(candidate) = self.candidate_value()? else {
+        let Some(candidate) = self.candidate_value(receiver_keys)? else {
             return Ok(KeyRotationRoundStep::default());
         };
         let mut consensus =
@@ -1589,14 +2371,38 @@ impl KeyRotationRound {
         &mut self,
         step: ConsensusStep,
     ) -> Result<KeyRotationRoundStep, KeyRotationError> {
+        self.apply_consensus_step_inner(step, None)
+    }
+
+    fn apply_consensus_step_inner(
+        &mut self,
+        step: ConsensusStep,
+        verified_certificate: Option<&KeyRotationCertificate>,
+    ) -> Result<KeyRotationRoundStep, KeyRotationError> {
         let committed = step
             .commit
-            .clone()
-            .map(|commit| KeyRotationCertificate::from_commit(&self.context, commit))
+            .as_ref()
+            .map(|commit| {
+                if let Some(certificate) = verified_certificate {
+                    if certificate.commit_certificate() != commit {
+                        return Err(KeyRotationError::WrongVerifiedCertificate);
+                    }
+                    Ok(certificate.clone())
+                } else {
+                    KeyRotationCertificate::from_commit(&self.context, commit.clone())
+                }
+            })
             .transpose()?;
         if let Some(certificate) = &committed {
             self.outbox.clear();
-            self.enqueue_for_peers(KeyRotationWire::Certificate(certificate.clone()))?;
+            if verified_certificate.is_some() {
+                self.enqueue_for_peers_with_kind(
+                    KeyRotationWire::Certificate(certificate.clone()),
+                    KeyRotationDeliveryKind::Certificate,
+                )?;
+            } else {
+                self.enqueue_for_peers(KeyRotationWire::Certificate(certificate.clone()))?;
+            }
         } else {
             let current_view = self.view();
             self.prune_obsolete_views(current_view);
@@ -1607,9 +2413,23 @@ impl KeyRotationRound {
                 self.enqueue_for_peers(KeyRotationWire::ViewCertificate(certificate))?;
             }
             if let Some(commit) = step.relay_commit_certificate {
-                let certificate = KeyRotationCertificate::from_commit(&self.context, commit)?;
+                let certificate = if let Some(certificate) = verified_certificate {
+                    if certificate.commit_certificate() != &commit {
+                        return Err(KeyRotationError::WrongVerifiedCertificate);
+                    }
+                    certificate.clone()
+                } else {
+                    KeyRotationCertificate::from_commit(&self.context, commit)?
+                };
                 self.outbox.clear();
-                self.enqueue_for_peers(KeyRotationWire::Certificate(certificate))?;
+                if verified_certificate.is_some() {
+                    self.enqueue_for_peers_with_kind(
+                        KeyRotationWire::Certificate(certificate),
+                        KeyRotationDeliveryKind::Certificate,
+                    )?;
+                } else {
+                    self.enqueue_for_peers(KeyRotationWire::Certificate(certificate))?;
+                }
             }
         }
         Ok(KeyRotationRoundStep {
@@ -1622,6 +2442,14 @@ impl KeyRotationRound {
 
     fn enqueue_for_peers(&mut self, wire: KeyRotationWire) -> Result<(), KeyRotationError> {
         let kind = key_rotation_delivery_kind(&self.context, &wire)?;
+        self.enqueue_for_peers_with_kind(wire, kind)
+    }
+
+    fn enqueue_for_peers_with_kind(
+        &mut self,
+        wire: KeyRotationWire,
+        kind: KeyRotationDeliveryKind,
+    ) -> Result<(), KeyRotationError> {
         let digest = key_rotation_wire_digest(&wire)?;
         let recipients = if kind == KeyRotationDeliveryKind::Certificate {
             self.context.participants()
@@ -1647,8 +2475,23 @@ impl KeyRotationRound {
     fn prune_obsolete_views(&mut self, current_view: u64) {
         self.outbox.retain(|kind, _| {
             *kind == KeyRotationDeliveryKind::Advertisement
+                || *kind == KeyRotationDeliveryKind::FallbackVote
                 || kind.view().is_some_and(|view| view >= current_view)
         });
+    }
+
+    fn prune_abandoned_consensus_phases(&mut self, requested_view: u64) -> bool {
+        let before = self.outbox.len();
+        self.outbox.retain(|kind, _| {
+            !matches!(
+                kind,
+                KeyRotationDeliveryKind::Proposal { view }
+                    | KeyRotationDeliveryKind::Prevote { view }
+                    | KeyRotationDeliveryKind::Precommit { view }
+                if *view < requested_view
+            )
+        });
+        self.outbox.len() != before
     }
 
     fn pending_message(
@@ -1681,6 +2524,7 @@ impl KeyRotationRound {
             .try_fold(0_usize, |count, entry| count.checked_add(entry.recipients.len()))
             .ok_or(KeyRotationError::InvalidRoundState("resource bound exceeded"))?;
         if self.advertisements.len() > usize::from(self.context.target_policy().eligible().n())
+            || self.fallback_votes.len() > usize::from(self.context.source().n())
             || self.outbox.len() > MAX_KEY_ROTATION_OUTBOX_ENTRIES
             || outbox_recipients > MAX_KEY_ROTATION_OUTBOX_RECIPIENTS
         {
@@ -1690,6 +2534,11 @@ impl KeyRotationRound {
             let verified = verify_key_advertisement(&self.context, advertisement)?;
             if verified.party != *party {
                 return Err(KeyRotationError::InvalidRoundState("advertisement map key mismatch"));
+            }
+        }
+        for (party, vote) in &self.fallback_votes {
+            if verify_selection_fallback_vote(&self.context, vote)? != *party {
+                return Err(KeyRotationError::InvalidRoundState("fallback-vote map key mismatch"));
             }
         }
 
@@ -1726,6 +2575,15 @@ impl KeyRotationRound {
                     {
                         return Err(KeyRotationError::InvalidRoundState(
                             "outbound advertisement differs from local state",
+                        ));
+                    }
+                }
+                KeyRotationWire::FallbackVote(vote) => {
+                    if vote.from != self.local_party
+                        || self.fallback_votes.get(&self.local_party) != Some(vote)
+                    {
+                        return Err(KeyRotationError::InvalidRoundState(
+                            "outbound fallback vote differs from local state",
                         ));
                     }
                 }
@@ -1776,6 +2634,10 @@ fn key_rotation_delivery_kind(
         KeyRotationWire::Advertisement(advertisement) => {
             let _ = verify_key_advertisement(context, advertisement)?;
             KeyRotationDeliveryKind::Advertisement
+        }
+        KeyRotationWire::FallbackVote(vote) => {
+            let _ = verify_selection_fallback_vote(context, vote)?;
+            KeyRotationDeliveryKind::FallbackVote
         }
         KeyRotationWire::Consensus(envelope) => {
             let message = decode_consensus_message(&context.consensus_context()?, envelope)?;
@@ -1836,6 +2698,12 @@ fn deserialize_advertisements<'de, D: Deserializer<'de>>(
     deserialize_bounded_vec(deserializer, MAX_COMMITTEE_MEMBERS, "key advertisements")
 }
 
+fn deserialize_fallback_votes<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Vec<SignedEnvelope>, D::Error> {
+    deserialize_bounded_vec(deserializer, MAX_COMMITTEE_MEMBERS, "selection fallback votes")
+}
+
 fn deserialize_bounded_vec<'de, D, T>(
     deserializer: D,
     maximum: usize,
@@ -1889,6 +2757,8 @@ pub enum KeyRotationError {
     Identity(#[from] IdentityError),
     #[error("consensus error: {0}")]
     Consensus(#[from] ConsensusError),
+    #[error("receiver-key accumulator error: {0}")]
+    ReceiverKeyAccumulator(#[from] ReceiverKeyAccumulatorError),
     #[error("unsupported key-rotation version")]
     UnsupportedVersion,
     #[error("invalid key-rotation context: {0}")]
@@ -1903,6 +2773,14 @@ pub enum KeyRotationError {
     NonCanonicalSourceCommittee,
     #[error("target committee is not canonically ordered")]
     NonCanonicalTargetCommittee,
+    #[error("receiver-key accumulator belongs to another network")]
+    WrongReceiverKeyAccumulatorNetwork,
+    #[error("receiver-key accumulator store differs from the authenticated source commitment")]
+    WrongReceiverKeyAccumulator,
+    #[error(
+        "receiver-key accumulator is through epoch {actual}, expected authenticated source epoch {expected}"
+    )]
+    WrongReceiverKeyAccumulatorEpoch { expected: u64, actual: u64 },
     #[error("source member {0} has a noncontributory X25519 key")]
     InvalidSourceKey(PartyId),
     #[error("joining target member {0} reuses a source Ed25519 signing key")]
@@ -1931,18 +2809,40 @@ pub enum KeyRotationError {
     NonCanonicalAdvertisement,
     #[error("key advertisement belongs to another rotation context")]
     WrongAdvertisementContext,
+    #[error("key-rotation fallback vote has {actual} bytes; maximum is {maximum}")]
+    FallbackVoteTooLarge { actual: usize, maximum: usize },
+    #[error("key-rotation fallback votes must be portable broadcasts")]
+    NonPortableFallbackVote,
+    #[error("key-rotation fallback vote uses the wrong session or sequence")]
+    WrongFallbackVoteSlot,
+    #[error("key-rotation fallback vote has trailing bytes")]
+    TrailingFallbackVoteBytes,
+    #[error("key-rotation fallback vote encoding is not canonical")]
+    NonCanonicalFallbackVote,
+    #[error("key-rotation fallback vote belongs to another context or policy")]
+    WrongFallbackVoteContext,
+    #[error("party {0} sent conflicting key-rotation fallback votes")]
+    ConflictingFallbackVote(PartyId),
+    #[error("key-rotation fallback-vote map exceeds the source committee")]
+    TooManyFallbackVotes,
+    #[error("fallback authorization has {actual} source votes; exact source quorum is {expected}")]
+    InvalidFallbackAuthorizationCount { actual: usize, expected: usize },
+    #[error("fallback authorization votes are not strictly ordered by source party")]
+    NonCanonicalFallbackAuthorization,
     #[error("party {0} advertised an all-zero X25519 key")]
     AllZeroNextKey(PartyId),
     #[error("party {0} advertised a low-order or noncontributory X25519 key")]
     NonContributoryNextKey(PartyId),
     #[error("party {0} advertised a non-canonical X25519 encoding")]
     NonCanonicalNextKey(PartyId),
-    #[error("party {0} reused an X25519 key from the source or target policy")]
+    #[error("party {0} reused a historical or policy-reserved X25519 key")]
     ReusedPolicyKey(PartyId),
     #[error("key-rotation value belongs to another context")]
     WrongValueContext,
     #[error("key-rotation certificate belongs to another context")]
     WrongCertificateContext,
+    #[error("key-rotation certificate differs from its verified registration result")]
+    WrongVerifiedCertificate,
     #[error("key-rotation certificate has {actual} bytes; maximum is {maximum}")]
     CertificateTooLarge { actual: usize, maximum: usize },
     #[error("key-rotation certificate has trailing bytes")]
@@ -1961,6 +2861,18 @@ pub enum KeyRotationError {
     TooManyAdvertisements,
     #[error("multiple advertisers selected the same next X25519 key")]
     DuplicateNextKey,
+    #[error(
+        "selected successor retains {actual} eligible source members; policy requires at least {minimum}"
+    )]
+    InsufficientSourceRetention { actual: usize, minimum: usize },
+    #[error(
+        "selected successor retains {actual} eligible source members; primary policy requires {primary} without source fallback authorization"
+    )]
+    MissingFallbackAuthorization { actual: usize, primary: usize },
+    #[error(
+        "fallback authorization is forbidden when source retention {actual} already meets primary requirement {primary}"
+    )]
+    GratuitousFallbackAuthorization { actual: usize, primary: usize },
     #[error("target committee changed party {0}'s stable signing identity")]
     TargetChangedStableIdentity(PartyId),
     #[error("key-rotation value has {actual} bytes; maximum is {maximum}")]
@@ -1969,7 +2881,7 @@ pub enum KeyRotationError {
     TrailingValueBytes,
     #[error("key-rotation value encoding is not canonical")]
     NonCanonicalValue,
-    #[error("key-rotation consensus is waiting for n-f distinct advertisements")]
+    #[error("key-rotation consensus is waiting for the exact desired number of advertisements")]
     ConsensusNotReady,
     #[error("key-rotation retry outbox is full")]
     OutboxFull,
@@ -2009,13 +2921,9 @@ fn validate_new_key(
             return Err(KeyRotationError::NonContributoryNextKey(party));
         }
     }
-    if context.source.members.iter().any(|member| member.encryption_key == next_key)
-        || context
-            .target_policy
-            .eligible
-            .members
-            .iter()
-            .any(|member| member.encryption_key == next_key)
+    // Historical/bootstrap non-membership is proved only by the canonical sparse batch update
+    // embedded in the consensus value. An advertisement alone is not a freshness certificate.
+    if context.target_policy.eligible.members.iter().any(|member| member.encryption_key == next_key)
     {
         return Err(KeyRotationError::ReusedPolicyKey(party));
     }
@@ -2090,11 +2998,19 @@ mod tests {
         config::NetworkKind,
         deposit_consensus::{
             CommitCertificate, ConsensusError, ConsensusMessageBody, DepositConsensus, Proposal,
-            Vote, sign_consensus_message,
+            ViewChange, Vote, sign_consensus_message,
         },
         identity::EpochEncryptionSecret,
         keys::{PointBytes, SecretPolynomial, scalar_for_party},
     };
+
+    fn reset_sparse_proof_verifications() {
+        SPARSE_PROOF_VERIFICATIONS.with(|verifications| verifications.set(0));
+    }
+
+    fn sparse_proof_verifications() -> u64 {
+        SPARSE_PROOF_VERIFICATIONS.with(Cell::get)
+    }
 
     fn seed(party: PartyId) -> [u8; 32] {
         let mut seed = [u8::try_from(party.0).unwrap().wrapping_mul(37); 32];
@@ -2124,6 +3040,26 @@ mod tests {
         .unwrap()
     }
 
+    fn receiver_key_store(
+        network: [u8; 32],
+        source: &Committee,
+        eligible: &Committee,
+    ) -> ReceiverKeyAccumulatorStore {
+        // One source-epoch accumulator leaf exists per stable party. A canonical target policy
+        // replaces overlapping eligibility keys with public reference sentinels, so prefer the
+        // actual source key and add only eligible-only spares.
+        let mut entries = source
+            .members
+            .iter()
+            .map(|member| (member.id, member.encryption_key))
+            .collect::<BTreeMap<_, _>>();
+        for member in &eligible.members {
+            entries.entry(member.id).or_insert(member.encryption_key);
+        }
+        let entries = entries.into_iter().collect::<Vec<_>>();
+        ReceiverKeyAccumulatorStore::from_entries_at_epoch(network, source.epoch, &entries).unwrap()
+    }
+
     fn advertisable_identity(
         party: PartyId,
         epoch: u64,
@@ -2136,6 +3072,7 @@ mod tests {
 
     struct Fixture {
         context: KeyRotationContext,
+        receiver_keys: ReceiverKeyAccumulatorStore,
         source_identities: Vec<Identity>,
         target_identities: Vec<PersistedKeyAdvertisementIdentity>,
     }
@@ -2172,17 +3109,28 @@ mod tests {
                 .collect(),
         };
         let spare = identity(PartyId(5), target_epoch, 0x25);
-        let mut target_baseline = source.clone();
-        target_baseline.epoch = target_epoch;
-        target_baseline.members.push(Member {
+        let mut eligible = source.clone();
+        eligible.epoch = target_epoch;
+        eligible.members.push(Member {
             id: PartyId(5),
             signing_key: spare.signing_public_key(),
             encryption_key: spare.encryption_public_key(),
         });
-        let target_policy = KeyRotationTargetPolicy::new(&source, target_baseline, 4, 1).unwrap();
+        let network = [0x31; 32];
+        let receiver_keys = receiver_key_store(network, &source, &eligible);
+        let target_policy = KeyRotationTargetPolicy::new(
+            &source,
+            1,
+            eligible.clone(),
+            4,
+            1,
+            receiver_keys.commitment(),
+            10_000,
+        )
+        .unwrap();
         let context =
-            KeyRotationContext::new([0x31; 32], source, [0x41; 32], 1, target_policy).unwrap();
-        Fixture { context, source_identities, target_identities }
+            KeyRotationContext::new(network, source, [0x41; 32], 1, target_policy).unwrap();
+        Fixture { context, receiver_keys, source_identities, target_identities }
     }
 
     fn registry_public(epoch: u64, key_id: [u8; 32], constant: Scalar) -> EpochPublic {
@@ -2301,6 +3249,59 @@ mod tests {
         advertisements
     }
 
+    fn rotation_value(
+        context: &KeyRotationContext,
+        receiver_keys: &ReceiverKeyAccumulatorStore,
+        advertisements: Vec<SignedEnvelope>,
+    ) -> Result<KeyRotationValue, KeyRotationError> {
+        let selected = advertisements
+            .iter()
+            .map(|advertisement| {
+                verify_key_advertisement(context, advertisement)
+                    .map(|verified| (verified.party, verified.next_key))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let (history_update, _) = receiver_keys.preview(context.target_epoch(), &selected)?;
+        KeyRotationValue::new(context, advertisements, history_update)
+    }
+
+    fn fallback_authorization(
+        context: &KeyRotationContext,
+        source_identities: &[Identity],
+    ) -> FallbackAuthorization {
+        FallbackAuthorization::new(
+            context,
+            source_identities
+                .iter()
+                .take(context.source_quorum())
+                .map(|identity| sign_selection_fallback_vote(context, identity).unwrap())
+                .collect(),
+        )
+        .unwrap()
+    }
+
+    fn fallback_rotation_value(
+        context: &KeyRotationContext,
+        receiver_keys: &ReceiverKeyAccumulatorStore,
+        source_identities: &[Identity],
+        advertisements: Vec<SignedEnvelope>,
+    ) -> Result<KeyRotationValue, KeyRotationError> {
+        let selected = advertisements
+            .iter()
+            .map(|advertisement| {
+                verify_key_advertisement(context, advertisement)
+                    .map(|verified| (verified.party, verified.next_key))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let (history_update, _) = receiver_keys.preview(context.target_epoch(), &selected)?;
+        KeyRotationValue::new_with_authorization(
+            context,
+            advertisements,
+            history_update,
+            Some(fallback_authorization(context, source_identities)),
+        )
+    }
+
     fn raw_advertisement(
         context: &KeyRotationContext,
         capability: &PersistedKeyAdvertisementIdentity,
@@ -2385,12 +3386,13 @@ mod tests {
         let silent_advertisement =
             sign_key_advertisement(&fixture.context, &fixture.target_identities[3]).unwrap();
         for (index, round) in rounds.iter_mut().enumerate().take(3) {
-            round.advertise(&fixture.target_identities[index]).unwrap();
+            round.advertise(&fixture.target_identities[index], &fixture.receiver_keys).unwrap();
             round
                 .handle_wire(
                     PartyId(4),
                     KeyRotationWire::Advertisement(silent_advertisement.clone()),
                     &fixture.source_identities[index],
+                    &fixture.receiver_keys,
                 )
                 .unwrap();
         }
@@ -2418,6 +3420,7 @@ mod tests {
                         sender,
                         message.wire,
                         fixture.target_identities[recipient_index].identity(),
+                        &fixture.receiver_keys,
                     ) {
                         Ok(_) => {
                             assert_eq!(rounds[sender_index].acknowledge(&[message.id]).unwrap(), 1);
@@ -2433,6 +3436,31 @@ mod tests {
         panic!("durable key-rotation round did not commit");
     }
 
+    fn start_round_with_local_candidate(fixture: &Fixture, local_index: usize) -> KeyRotationRound {
+        let local_party = fixture.source_identities[local_index].party();
+        let mut round = KeyRotationRound::new(fixture.context.clone(), local_party).unwrap();
+        round.advertise(&fixture.target_identities[local_index], &fixture.receiver_keys).unwrap();
+        for (index, capability) in
+            fixture.target_identities.iter().take(fixture.context.selection_size()).enumerate()
+        {
+            if index == local_index {
+                continue;
+            }
+            round
+                .handle_wire(
+                    capability.identity().party(),
+                    KeyRotationWire::Advertisement(
+                        sign_key_advertisement(&fixture.context, capability).unwrap(),
+                    ),
+                    &fixture.source_identities[local_index],
+                    &fixture.receiver_keys,
+                )
+                .unwrap();
+        }
+        assert!(round.consensus.as_ref().is_some_and(DepositConsensus::started));
+        round
+    }
+
     #[test]
     fn exact_value_is_self_contained_and_excludes_the_silent_candidate() {
         let fixture = fixture();
@@ -2444,7 +3472,13 @@ mod tests {
         let silent = PartyId(2);
         let ads =
             vec![all_ads[0].clone(), all_ads[2].clone(), all_ads[3].clone(), all_ads[4].clone()];
-        let value = KeyRotationValue::new(&fixture.context, ads).unwrap();
+        let value = fallback_rotation_value(
+            &fixture.context,
+            &fixture.receiver_keys,
+            &fixture.source_identities,
+            ads,
+        )
+        .unwrap();
         let consensus_value = value.to_consensus_value(&fixture.context).unwrap();
 
         // This receiver has only the proposal bytes and immutable source context; it has no ad
@@ -2478,7 +3512,7 @@ mod tests {
         let mut insufficient = advertisements(&fixture);
         insufficient.truncate(2);
         assert!(matches!(
-            KeyRotationValue::new(&fixture.context, insufficient),
+            rotation_value(&fixture.context, &fixture.receiver_keys, insufficient),
             Err(KeyRotationError::InvalidAdvertisementCount { actual: 2, expected: 4 })
         ));
     }
@@ -2510,9 +3544,20 @@ mod tests {
             signing_key: spare_reference.signing_public_key(),
             encryption_key: spare_reference.encryption_public_key(),
         });
-        let policy = KeyRotationTargetPolicy::new(&source, eligible.clone(), 4, 1).unwrap();
+        let network = [0x61; 32];
+        let receiver_keys = receiver_key_store(network, &source, &eligible);
+        let policy = KeyRotationTargetPolicy::new(
+            &source,
+            1,
+            eligible.clone(),
+            4,
+            1,
+            receiver_keys.commitment(),
+            10_000,
+        )
+        .unwrap();
         let context =
-            KeyRotationContext::new([0x61; 32], source.clone(), [0x62; 32], 1, policy).unwrap();
+            KeyRotationContext::new(network, source.clone(), [0x62; 32], 1, policy).unwrap();
         let target_identities = (1_u16..=5)
             .map(|id| {
                 advertisable_identity(PartyId(id), target_epoch, 0x40 + u8::try_from(id).unwrap())
@@ -2523,7 +3568,12 @@ mod tests {
             .into_iter()
             .map(|index| sign_key_advertisement(&context, &target_identities[index]).unwrap())
             .collect::<Vec<_>>();
-        let value = KeyRotationValue::new(&context, selected).unwrap();
+        assert_eq!(
+            rotation_value(&context, &receiver_keys, selected.clone()).unwrap_err(),
+            KeyRotationError::MissingFallbackAuthorization { actual: 3, primary: 4 }
+        );
+        let value = fallback_rotation_value(&context, &receiver_keys, &source_identities, selected)
+            .unwrap();
         let certificate = KeyRotationCertificate::from_commit(
             &context,
             commit_for(&context, &source_identities, &value, &[0, 1, 2], 0),
@@ -2552,6 +3602,255 @@ mod tests {
     }
 
     #[test]
+    fn honest_candidate_prefers_healthy_sources_and_verifier_bounds_spare_substitution() {
+        let source_epoch = 30;
+        let target_epoch = 31;
+        let source_identities = (2_u16..=5)
+            .map(|id| identity(PartyId(id), source_epoch, 0x10 + u8::try_from(id).unwrap()))
+            .collect::<Vec<_>>();
+        let source = Committee {
+            epoch: source_epoch,
+            threshold: 2,
+            members: source_identities
+                .iter()
+                .map(|identity| Member {
+                    id: identity.party(),
+                    signing_key: identity.signing_public_key(),
+                    encryption_key: identity.encryption_public_key(),
+                })
+                .collect(),
+        };
+        let target_capabilities = (1_u16..=6)
+            .map(|id| {
+                advertisable_identity(PartyId(id), target_epoch, 0x50 + u8::try_from(id).unwrap())
+            })
+            .collect::<Vec<_>>();
+        let mut eligible = source.clone();
+        eligible.epoch = target_epoch;
+        for spare in [PartyId(1), PartyId(6)] {
+            let identity = identity(spare, target_epoch, 0x30_u8 + u8::try_from(spare.0).unwrap());
+            eligible.members.push(Member {
+                id: spare,
+                signing_key: identity.signing_public_key(),
+                encryption_key: identity.encryption_public_key(),
+            });
+        }
+        let network = [0x71; 32];
+        let receiver_keys = receiver_key_store(network, &source, &eligible);
+        let policy = KeyRotationTargetPolicy::new(
+            &source,
+            1,
+            eligible,
+            4,
+            1,
+            receiver_keys.commitment(),
+            10_000,
+        )
+        .unwrap();
+        let context =
+            KeyRotationContext::new(network, source.clone(), [0x72; 32], 1, policy).unwrap();
+        assert_eq!(context.primary_source_overlap(), 4);
+        assert_eq!(context.minimum_source_overlap(), 3);
+
+        let mut healthy = KeyRotationRound::new(context.clone(), source.members[0].id).unwrap();
+        for capability in &target_capabilities {
+            healthy
+                .insert_advertisement(sign_key_advertisement(&context, capability).unwrap())
+                .unwrap();
+        }
+        let healthy_target = healthy
+            .candidate_value(&receiver_keys)
+            .unwrap()
+            .unwrap()
+            .verify(&context)
+            .unwrap()
+            .target;
+        assert_eq!(
+            healthy_target.members.iter().map(|member| member.id).collect::<Vec<_>>(),
+            vec![PartyId(2), PartyId(3), PartyId(4), PartyId(5)],
+            "a lower-ID spare displaced a responsive source member"
+        );
+
+        let mut one_silent = KeyRotationRound::new(context.clone(), source.members[0].id).unwrap();
+        for capability in
+            target_capabilities.iter().filter(|identity| identity.identity().party() != PartyId(5))
+        {
+            one_silent
+                .insert_advertisement(sign_key_advertisement(&context, capability).unwrap())
+                .unwrap();
+        }
+        assert!(
+            one_silent.candidate_value(&receiver_keys).unwrap().is_none(),
+            "spare substitution started before source fallback authorization"
+        );
+        for identity in source_identities.iter().take(context.source_quorum()) {
+            one_silent
+                .insert_fallback_vote(sign_selection_fallback_vote(&context, identity).unwrap())
+                .unwrap();
+        }
+        let substituted = one_silent
+            .candidate_value(&receiver_keys)
+            .unwrap()
+            .unwrap()
+            .verify(&context)
+            .unwrap()
+            .target;
+        assert_eq!(
+            substituted.members.iter().map(|member| member.id).collect::<Vec<_>>(),
+            vec![PartyId(1), PartyId(2), PartyId(3), PartyId(4)]
+        );
+        assert!(
+            one_silent
+                .candidate_value(&receiver_keys)
+                .unwrap()
+                .unwrap()
+                .selection_authorization()
+                .is_some()
+        );
+
+        let byzantine_selection = [PartyId(1), PartyId(2), PartyId(3), PartyId(6)]
+            .into_iter()
+            .map(|party| {
+                let capability = target_capabilities
+                    .iter()
+                    .find(|identity| identity.identity().party() == party)
+                    .unwrap();
+                sign_key_advertisement(&context, capability).unwrap()
+            })
+            .collect();
+        assert_eq!(
+            rotation_value(&context, &receiver_keys, byzantine_selection).unwrap_err(),
+            KeyRotationError::MissingFallbackAuthorization { actual: 2, primary: 4 },
+            "a Byzantine proposer bypassed primary source retention without authorization"
+        );
+        let byzantine_selection = [PartyId(1), PartyId(2), PartyId(3), PartyId(6)]
+            .into_iter()
+            .map(|party| {
+                let capability = target_capabilities
+                    .iter()
+                    .find(|identity| identity.identity().party() == party)
+                    .unwrap();
+                sign_key_advertisement(&context, capability).unwrap()
+            })
+            .collect();
+        assert_eq!(
+            fallback_rotation_value(
+                &context,
+                &receiver_keys,
+                &source_identities,
+                byzantine_selection,
+            )
+            .unwrap_err(),
+            KeyRotationError::InsufficientSourceRetention { actual: 2, minimum: 3 },
+            "a Byzantine proposer bypassed the certified source-retention floor"
+        );
+
+        let healthy_advertisements = [PartyId(2), PartyId(3), PartyId(4), PartyId(5)]
+            .into_iter()
+            .map(|party| {
+                let capability = target_capabilities
+                    .iter()
+                    .find(|identity| identity.identity().party() == party)
+                    .unwrap();
+                sign_key_advertisement(&context, capability).unwrap()
+            })
+            .collect();
+        assert_eq!(
+            fallback_rotation_value(
+                &context,
+                &receiver_keys,
+                &source_identities,
+                healthy_advertisements,
+            )
+            .unwrap_err(),
+            KeyRotationError::GratuitousFallbackAuthorization { actual: 4, primary: 4 }
+        );
+        assert_eq!(
+            FallbackAuthorization::new(
+                &context,
+                vec![sign_selection_fallback_vote(&context, &source_identities[0]).unwrap(),],
+            )
+            .unwrap_err(),
+            KeyRotationError::InvalidFallbackAuthorizationCount {
+                actual: 1,
+                expected: context.source_quorum(),
+            }
+        );
+    }
+
+    #[test]
+    fn fallback_vote_is_context_bound_and_round_restore_preserves_its_retry() {
+        let fixture = fixture();
+        let mut round =
+            KeyRotationRound::new(fixture.context.clone(), fixture.source_identities[0].party())
+                .unwrap();
+        let step = round
+            .authorize_fallback(&fixture.source_identities[0], &fixture.receiver_keys)
+            .unwrap();
+        assert!(step.changed);
+        assert_eq!(round.fallback_vote_count(), 1);
+        let pending = round
+            .pending_messages(usize::MAX)
+            .into_iter()
+            .filter(|message| message.id.kind == KeyRotationDeliveryKind::FallbackVote)
+            .collect::<Vec<_>>();
+        assert_eq!(pending.len(), usize::from(fixture.context.source().n().saturating_sub(1)));
+        let vote = match &pending[0].wire {
+            KeyRotationWire::FallbackVote(vote) => vote.clone(),
+            wire => panic!("unexpected fallback retry: {wire:?}"),
+        };
+        assert_eq!(
+            verify_selection_fallback_vote(&fixture.context, &vote).unwrap(),
+            fixture.source_identities[0].party()
+        );
+
+        let encoded = round.encode().unwrap();
+        let restored = KeyRotationRound::decode(
+            &fixture.context,
+            fixture.source_identities[0].party(),
+            &encoded,
+        )
+        .unwrap();
+        assert_eq!(restored, round);
+        assert_eq!(
+            restored
+                .pending_messages(usize::MAX)
+                .into_iter()
+                .filter(|message| message.id.kind == KeyRotationDeliveryKind::FallbackVote)
+                .count(),
+            pending.len()
+        );
+
+        let foreign_policy = KeyRotationTargetPolicy::new(
+            fixture.context.source(),
+            fixture.context.source_fault_bound(),
+            fixture.context.target_policy().eligible().clone(),
+            fixture.context.target_policy().desired_n(),
+            fixture.context.target_fault_bound(),
+            fixture.context.target_policy().prior_receiver_keys(),
+            fixture.context.target_policy().selection_fallback_window_ms().checked_add(1).unwrap(),
+        )
+        .unwrap();
+        let foreign_context = KeyRotationContext::new(
+            fixture.context.network(),
+            fixture.context.source().clone(),
+            fixture.context.source_activation(),
+            fixture.context.source_fault_bound(),
+            foreign_policy,
+        )
+        .unwrap();
+        assert!(matches!(
+            verify_selection_fallback_vote(&foreign_context, &vote),
+            Err(KeyRotationError::WrongFallbackVoteSlot)
+                | Err(KeyRotationError::WrongFallbackVoteContext)
+        ));
+        assert!(matches!(
+            KeyRotationRound::new(fixture.context, PartyId(5)),
+            Err(KeyRotationError::Committee(CommitteeError::UnknownParty(PartyId(5))))
+        ));
+    }
+
+    #[test]
     fn byzantine_policy_rejects_a_pool_without_an_f_spare() {
         let fixture = fixture();
         // A pool with exactly `desired_n` eligible identities and no Byzantine spare must be
@@ -2559,14 +3858,45 @@ mod tests {
         let mut without_spare = fixture.context.source().clone();
         without_spare.epoch = fixture.context.target_epoch();
         assert_eq!(
-            KeyRotationTargetPolicy::new(fixture.context.source(), without_spare, 4, 1)
-                .unwrap_err(),
+            KeyRotationTargetPolicy::new(
+                fixture.context.source(),
+                fixture.context.source_fault_bound(),
+                without_spare.clone(),
+                4,
+                1,
+                fixture.receiver_keys.commitment(),
+                10_000,
+            )
+            .unwrap_err(),
             KeyRotationError::InsufficientEligibleCandidates {
                 actual: 4,
                 desired: 4,
                 fault_bound: 1,
             }
         );
+    }
+
+    #[test]
+    fn sparse_update_rejects_source_or_bootstrap_reuse_without_blocking_admission() {
+        let fixture = fixture();
+        let source_reuse = advertisable_identity(PartyId(1), fixture.context.target_epoch(), 0x11);
+        let source_reuse = sign_key_advertisement(&fixture.context, &source_reuse).unwrap();
+        let mut source_selection = advertisements(&fixture);
+        source_selection[0] = source_reuse;
+        assert!(matches!(
+            rotation_value(&fixture.context, &fixture.receiver_keys, source_selection),
+            Err(KeyRotationError::ReceiverKeyAccumulator(_))
+        ));
+
+        let bootstrap_reuse =
+            advertisable_identity(PartyId(5), fixture.context.target_epoch(), 0x25);
+        let bootstrap_reuse = sign_key_advertisement(&fixture.context, &bootstrap_reuse).unwrap();
+        let mut bootstrap_selection = advertisements(&fixture);
+        bootstrap_selection[3] = bootstrap_reuse;
+        assert!(matches!(
+            rotation_value(&fixture.context, &fixture.receiver_keys, bootstrap_selection),
+            Err(KeyRotationError::ReceiverKeyAccumulator(_))
+        ));
     }
 
     #[test]
@@ -2588,7 +3918,7 @@ mod tests {
                 .collect(),
         };
         let target_epoch = source_epoch + 1;
-        let target_baseline = Committee {
+        let eligible = Committee {
             epoch: target_epoch,
             threshold: 4,
             members: (1_u16..=7)
@@ -2609,10 +3939,20 @@ mod tests {
                 })
                 .collect(),
         };
-        let grow_policy =
-            KeyRotationTargetPolicy::new(&source, target_baseline.clone(), 6, 1).unwrap();
+        let network = [0x81; 32];
+        let mut grow_receiver_keys = receiver_key_store(network, &source, &eligible);
+        let grow_policy = KeyRotationTargetPolicy::new(
+            &source,
+            1,
+            eligible.clone(),
+            6,
+            1,
+            grow_receiver_keys.commitment(),
+            10_000,
+        )
+        .unwrap();
         let grow_context =
-            KeyRotationContext::new([0x81; 32], source, [0x82; 32], 1, grow_policy).unwrap();
+            KeyRotationContext::new(network, source, [0x82; 32], 1, grow_policy).unwrap();
         assert_eq!(grow_context.source_quorum(), 4);
         assert_eq!(grow_context.selection_size(), 6);
 
@@ -2633,7 +3973,12 @@ mod tests {
         );
         let mut source_round = KeyRotationRound::new(grow_context.clone(), PartyId(1)).unwrap();
         source_round
-            .handle_wire(PartyId(6), joining_fanout[0].wire.clone(), &source_identities[0])
+            .handle_wire(
+                PartyId(6),
+                joining_fanout[0].wire.clone(),
+                &source_identities[0],
+                &grow_receiver_keys,
+            )
             .unwrap();
         assert_eq!(source_round.advertisement_count(), 1);
 
@@ -2641,7 +3986,8 @@ mod tests {
             .iter()
             .map(|capability| sign_key_advertisement(&grow_context, capability).unwrap())
             .collect::<Vec<_>>();
-        let grow_value = KeyRotationValue::new(&grow_context, grow_advertisements).unwrap();
+        let grow_value =
+            rotation_value(&grow_context, &grow_receiver_keys, grow_advertisements).unwrap();
         let grow_target = grow_value.target_committee(&grow_context).unwrap();
         // Exactly `desired_n` advertisements select the successor; the seventh eligible identity is
         // never advertised and therefore never enters the target.
@@ -2650,7 +3996,7 @@ mod tests {
         assert!(grow_target.member(PartyId(7)).is_err());
         assert_ne!(
             grow_target.member(PartyId(6)).unwrap().encryption_key,
-            target_baseline.member(PartyId(6)).unwrap().encryption_key
+            eligible.member(PartyId(6)).unwrap().encryption_key
         );
 
         let grow_certificate = KeyRotationCertificate::from_commit(
@@ -2680,7 +4026,7 @@ mod tests {
         let shrink_epoch = target_epoch + 1;
         // A shrink still certifies an async-secure successor (n >= 3f+1), so the eligible pool
         // carries desired_n + f = 5 members while only desired_n = 4 are advertised.
-        let shrink_baseline = Committee {
+        let shrink_eligible = Committee {
             epoch: shrink_epoch,
             threshold: 2,
             members: [1_u16, 2, 4, 5, 6]
@@ -2688,10 +4034,26 @@ mod tests {
                 .map(|id| grow_target.member(PartyId(id)).unwrap().clone())
                 .collect(),
         };
-        let shrink_policy =
-            KeyRotationTargetPolicy::new(&grow_target, shrink_baseline.clone(), 4, 1).unwrap();
+        let grow_selected = grow_target
+            .members
+            .iter()
+            .map(|member| (member.id, member.encryption_key))
+            .collect::<Vec<_>>();
+        grow_receiver_keys
+            .apply_verified_update(target_epoch, &grow_selected, grow_value.history_update())
+            .unwrap();
+        let shrink_policy = KeyRotationTargetPolicy::new(
+            &grow_target,
+            1,
+            shrink_eligible.clone(),
+            4,
+            1,
+            grow_receiver_keys.commitment(),
+            10_000,
+        )
+        .unwrap();
         let shrink_context =
-            KeyRotationContext::new([0x81; 32], grow_target, [0x83; 32], 1, shrink_policy).unwrap();
+            KeyRotationContext::new(network, grow_target, [0x83; 32], 1, shrink_policy).unwrap();
         assert_eq!(shrink_context.source_quorum(), 5);
         assert_eq!(shrink_context.selection_size(), 4);
         let shrink_capabilities = [2_u16, 4, 5, 6]
@@ -2700,8 +4062,9 @@ mod tests {
                 advertisable_identity(PartyId(id), shrink_epoch, 0x90 + u8::try_from(id).unwrap())
             })
             .collect::<Vec<_>>();
-        let shrink_value = KeyRotationValue::new(
+        let shrink_value = rotation_value(
             &shrink_context,
+            &grow_receiver_keys,
             shrink_capabilities
                 .iter()
                 .map(|capability| sign_key_advertisement(&shrink_context, capability).unwrap())
@@ -2727,7 +4090,7 @@ mod tests {
         // Fresh keys are mandatory: no selected successor member carries its eligible-pool key.
         assert_ne!(
             shrink_target.member(PartyId(2)).unwrap().encryption_key,
-            shrink_baseline.member(PartyId(2)).unwrap().encryption_key
+            shrink_eligible.member(PartyId(2)).unwrap().encryption_key
         );
     }
 
@@ -2802,8 +4165,13 @@ mod tests {
         let mut duplicates = advertisements(&fixture);
         duplicates.truncate(4);
         duplicates[1] = first.clone();
+        let proof =
+            rotation_value(&fixture.context, &fixture.receiver_keys, advertisements(&fixture))
+                .unwrap()
+                .history_update()
+                .clone();
         assert!(matches!(
-            KeyRotationValue::new(&fixture.context, duplicates),
+            KeyRotationValue::new(&fixture.context, duplicates, proof.clone()),
             Err(KeyRotationError::DuplicateAdvertiser(PartyId(1)))
         ));
 
@@ -2815,12 +4183,35 @@ mod tests {
         duplicate_keys[1] = duplicate_key;
         duplicate_keys.truncate(4);
         assert!(matches!(
-            KeyRotationValue::new(&fixture.context, duplicate_keys),
+            KeyRotationValue::new(&fixture.context, duplicate_keys, proof),
             Err(KeyRotationError::DuplicateNextKey)
         ));
 
-        let mut other_context = fixture.context.clone();
-        other_context.network[0] ^= 1;
+        let mut foreign_network = fixture.context.network();
+        foreign_network[0] ^= 1;
+        let foreign_receiver_keys = receiver_key_store(
+            foreign_network,
+            fixture.context.source(),
+            fixture.context.target_policy().eligible(),
+        );
+        let foreign_policy = KeyRotationTargetPolicy::new(
+            fixture.context.source(),
+            fixture.context.source_fault_bound(),
+            fixture.context.target_policy().eligible().clone(),
+            fixture.context.target_policy().desired_n(),
+            fixture.context.target_fault_bound(),
+            foreign_receiver_keys.commitment(),
+            fixture.context.target_policy().selection_fallback_window_ms(),
+        )
+        .unwrap();
+        let other_context = KeyRotationContext::new(
+            foreign_network,
+            fixture.context.source().clone(),
+            fixture.context.source_activation(),
+            fixture.context.source_fault_bound(),
+            foreign_policy,
+        )
+        .unwrap();
         let foreign = sign_key_advertisement(&other_context, identity).unwrap();
         assert!(matches!(
             verify_key_advertisement(&fixture.context, &foreign),
@@ -2900,6 +4291,15 @@ mod tests {
             version: KEY_ROTATION_VERSION,
             context: fixture.context.digest(),
             advertisements: vec![one; MAX_COMMITTEE_MEMBERS + 1],
+            history_update: rotation_value(
+                &fixture.context,
+                &fixture.receiver_keys,
+                advertisements(&fixture),
+            )
+            .unwrap()
+            .history_update()
+            .clone(),
+            selection_authorization: None,
         };
         let encoded = postcard::to_allocvec(&oversized_value).unwrap();
         assert!(matches!(
@@ -2950,9 +4350,12 @@ mod tests {
             .iter()
             .map(|identity| sign_key_advertisement(&fixture.context, identity).unwrap())
             .collect::<Vec<_>>();
-        let left = KeyRotationValue::new(&fixture.context, ads[..4].to_vec()).unwrap();
-        let right_value = KeyRotationValue::new(
+        let left =
+            rotation_value(&fixture.context, &fixture.receiver_keys, ads[..4].to_vec()).unwrap();
+        let right_value = fallback_rotation_value(
             &fixture.context,
+            &fixture.receiver_keys,
+            &fixture.source_identities,
             vec![ads[0].clone(), ads[1].clone(), ads[2].clone(), ads[4].clone()],
         )
         .unwrap();
@@ -2992,7 +4395,7 @@ mod tests {
         ));
 
         let mut tampered = left.clone();
-        tampered.context[0] ^= 1;
+        tampered.context_digest[0] ^= 1;
         assert!(matches!(
             tampered.verify(&fixture.context),
             Err(KeyRotationError::WrongCertificateContext)
@@ -3013,6 +4416,89 @@ mod tests {
     }
 
     #[test]
+    fn certificate_entry_points_verify_the_sparse_proof_exactly_once() {
+        let fixture = fixture();
+        let value =
+            rotation_value(&fixture.context, &fixture.receiver_keys, advertisements(&fixture))
+                .unwrap();
+        let certificate = KeyRotationCertificate::from_commit(
+            &fixture.context,
+            commit(&fixture, &value, &[0, 1, 2]),
+        )
+        .unwrap();
+        let encoded = certificate.encode(&fixture.context).unwrap();
+        let expected_target = value.target_committee(&fixture.context).unwrap();
+
+        reset_sparse_proof_verifications();
+        assert_eq!(
+            KeyRotationCertificate::decode(&fixture.context, &encoded).unwrap(),
+            certificate
+        );
+        assert_eq!(sparse_proof_verifications(), 1, "certificate decode replayed its proof");
+
+        reset_sparse_proof_verifications();
+        let verified = certificate.verify_rotation(&fixture.context).unwrap();
+        assert_eq!(verified.target, expected_target);
+        assert_eq!(sparse_proof_verifications(), 1, "certificate verification replayed its proof");
+
+        reset_sparse_proof_verifications();
+        let semantic_digest = certificate.semantic_digest(&fixture.context).unwrap();
+        assert_ne!(semantic_digest, [0_u8; 32]);
+        assert_eq!(sparse_proof_verifications(), 1, "semantic digest replayed its proof");
+
+        reset_sparse_proof_verifications();
+        let registered = certificate.verify_rotation_certificate(&fixture.context).unwrap();
+        assert_eq!(registered.semantic_digest(), semantic_digest);
+        assert_eq!(registered.target, verified.target);
+        assert_eq!(registered.receiver_keys, verified.receiver_keys);
+        assert_eq!(
+            sparse_proof_verifications(),
+            1,
+            "combined registration verification replayed its proof"
+        );
+        let retry = pending_verified_key_rotation_certificate(
+            &fixture.context,
+            &certificate,
+            &registered,
+            PartyId(1),
+        )
+        .unwrap();
+        assert_eq!(retry.id.digest, registered.certificate_wire_digest);
+        assert_eq!(
+            sparse_proof_verifications(),
+            1,
+            "verified retry construction replayed its proof"
+        );
+        let mut round = KeyRotationRound::new(fixture.context.clone(), PartyId(1)).unwrap();
+        let step = round
+            .handle_verified_certificate(
+                PartyId(2),
+                certificate.clone(),
+                &registered,
+                &fixture.source_identities[0],
+            )
+            .unwrap();
+        assert!(step.committed.is_some());
+        assert_eq!(
+            sparse_proof_verifications(),
+            1,
+            "verified reducer ingress replayed its sparse proof"
+        );
+
+        reset_sparse_proof_verifications();
+        drop(pending_key_rotation_certificate(&fixture.context, &certificate, PartyId(1)).unwrap());
+        assert_eq!(
+            sparse_proof_verifications(),
+            1,
+            "standalone retry construction replayed its proof"
+        );
+
+        reset_sparse_proof_verifications();
+        assert_eq!(certificate.value(&fixture.context).unwrap(), value);
+        assert_eq!(sparse_proof_verifications(), 1, "certificate value replayed its proof");
+    }
+
+    #[test]
     fn generic_consensus_commits_only_a_universally_valid_rotation_value() {
         let fixture = fixture();
         let mut ads = fixture
@@ -3021,7 +4507,8 @@ mod tests {
             .map(|identity| sign_key_advertisement(&fixture.context, identity).unwrap())
             .collect::<Vec<_>>();
         ads.pop(); // One silent advertiser is within f=1, leaving exactly the selection size.
-        let rotation = KeyRotationValue::new(&fixture.context, ads.clone()).unwrap();
+        let rotation =
+            rotation_value(&fixture.context, &fixture.receiver_keys, ads.clone()).unwrap();
         let candidate = rotation.to_consensus_value(&fixture.context).unwrap();
         let consensus_context = fixture.context.consensus_context().unwrap();
 
@@ -3106,20 +4593,56 @@ mod tests {
             fixture.context.source_fault_bound(),
             KeyRotationTargetPolicy::new(
                 fixture.context.source(),
+                fixture.context.source_fault_bound(),
                 fixture.context.target_policy().eligible().clone(),
                 fixture.context.target_policy().desired_n(),
                 0,
+                fixture.context.target_policy().prior_receiver_keys(),
+                fixture.context.target_policy().selection_fallback_window_ms(),
             )
             .unwrap(),
         )
         .unwrap();
+        let source_fault_changed = KeyRotationContext::new(
+            fixture.context.network(),
+            fixture.context.source().clone(),
+            fixture.context.source_activation(),
+            0,
+            KeyRotationTargetPolicy::new(
+                fixture.context.source(),
+                0,
+                fixture.context.target_policy().eligible().clone(),
+                fixture.context.target_policy().desired_n(),
+                fixture.context.target_fault_bound(),
+                fixture.context.target_policy().prior_receiver_keys(),
+                fixture.context.target_policy().selection_fallback_window_ms(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let foreign_network = [0x32; 32];
+        let foreign_receiver_keys = receiver_key_store(
+            foreign_network,
+            fixture.context.source(),
+            fixture.context.target_policy().eligible(),
+        );
+        let foreign_policy = KeyRotationTargetPolicy::new(
+            fixture.context.source(),
+            fixture.context.source_fault_bound(),
+            fixture.context.target_policy().eligible().clone(),
+            fixture.context.target_policy().desired_n(),
+            fixture.context.target_fault_bound(),
+            foreign_receiver_keys.commitment(),
+            fixture.context.target_policy().selection_fallback_window_ms(),
+        )
+        .unwrap();
         for changed in [
             KeyRotationContext::new(
-                [0x32; 32],
+                foreign_network,
                 fixture.context.source().clone(),
                 fixture.context.source_activation(),
                 fixture.context.source_fault_bound(),
-                fixture.context.target_policy().clone(),
+                foreign_policy,
             )
             .unwrap(),
             KeyRotationContext::new(
@@ -3130,14 +4653,7 @@ mod tests {
                 fixture.context.target_policy().clone(),
             )
             .unwrap(),
-            KeyRotationContext::new(
-                fixture.context.network(),
-                fixture.context.source().clone(),
-                fixture.context.source_activation(),
-                0,
-                fixture.context.target_policy().clone(),
-            )
-            .unwrap(),
+            source_fault_changed,
             target_fault_changed,
         ] {
             assert_ne!(changed.digest(), original);
@@ -3164,9 +4680,12 @@ mod tests {
         assert!(
             KeyRotationTargetPolicy::new(
                 fixture.context.source(),
+                fixture.context.source_fault_bound(),
                 skipped_epoch,
                 fixture.context.target_policy().desired_n(),
                 fixture.context.target_fault_bound(),
+                fixture.context.target_policy().prior_receiver_keys(),
+                fixture.context.target_policy().selection_fallback_window_ms(),
             )
             .is_err()
         );
@@ -3196,7 +4715,7 @@ mod tests {
         }
         assert_eq!(
             expected.target_committee(&fixture.context).unwrap(),
-            KeyRotationValue::new(&fixture.context, advertisements(&fixture))
+            rotation_value(&fixture.context, &fixture.receiver_keys, advertisements(&fixture),)
                 .unwrap()
                 .target_committee(&fixture.context)
                 .unwrap()
@@ -3213,6 +4732,7 @@ mod tests {
                 PartyId(1),
                 KeyRotationWire::Certificate(committed.clone()),
                 fixture.target_identities[3].identity(),
+                &fixture.receiver_keys,
             )
             .unwrap();
         assert_eq!(step.committed, Some(committed.clone()));
@@ -3227,16 +4747,254 @@ mod tests {
     }
 
     #[test]
+    fn local_view_change_prunes_abandoned_phase_retries_even_after_restore() {
+        let fixture = fixture();
+        let mut round = start_round_with_local_candidate(&fixture, 0);
+        let recipient = PartyId(2);
+        let abandoned = round
+            .outbox
+            .iter()
+            .filter(|(kind, _)| {
+                matches!(
+                    kind,
+                    KeyRotationDeliveryKind::Proposal { view: 0 }
+                        | KeyRotationDeliveryKind::Prevote { view: 0 }
+                        | KeyRotationDeliveryKind::Precommit { view: 0 }
+                )
+            })
+            .map(|(kind, entry)| (*kind, entry.clone()))
+            .collect::<Vec<_>>();
+        let before = round
+            .pending_messages_for(recipient, usize::MAX)
+            .into_iter()
+            .map(|message| message.id.kind)
+            .collect::<Vec<_>>();
+        assert!(before.contains(&KeyRotationDeliveryKind::Proposal { view: 0 }));
+        assert!(before.contains(&KeyRotationDeliveryKind::Prevote { view: 0 }));
+
+        let step = round.request_view_change(&fixture.source_identities[0]).unwrap();
+        assert!(step.changed);
+        let after = round
+            .pending_messages_for(recipient, usize::MAX)
+            .into_iter()
+            .map(|message| message.id.kind)
+            .collect::<Vec<_>>();
+        assert!(
+            !after.iter().any(|kind| matches!(
+                kind,
+                KeyRotationDeliveryKind::Proposal { view: 0 }
+                    | KeyRotationDeliveryKind::Prevote { view: 0 }
+                    | KeyRotationDeliveryKind::Precommit { view: 0 }
+            )),
+            "the abandoned view must not delay its replacement: {after:?}"
+        );
+        assert!(after.contains(&KeyRotationDeliveryKind::Advertisement));
+        assert!(after.contains(&KeyRotationDeliveryKind::ViewChange { target_view: 1 }));
+        assert_eq!(
+            after.iter().copied().find(|kind| *kind != KeyRotationDeliveryKind::Advertisement),
+            Some(KeyRotationDeliveryKind::ViewChange { target_view: 1 })
+        );
+
+        // Model a snapshot written by a crash-recovered request path that durably retained its
+        // local view-change but had not yet cleaned the abandoned retry slots.
+        round.outbox.extend(abandoned);
+        let encoded = round.encode().unwrap();
+        let mut restored =
+            KeyRotationRound::decode(&fixture.context, PartyId(1), &encoded).unwrap();
+        let duplicate = restored.request_view_change(&fixture.source_identities[0]).unwrap();
+        assert!(duplicate.duplicate);
+        assert!(duplicate.changed, "restart repair must be persisted");
+        let restored_pending = restored
+            .pending_messages_for(recipient, usize::MAX)
+            .into_iter()
+            .map(|message| message.id.kind)
+            .collect::<Vec<_>>();
+        assert_eq!(restored_pending, after);
+    }
+
+    #[test]
+    fn higher_view_proposal_relays_first_and_initializes_a_lagging_round() {
+        let fixture = fixture();
+        let consensus_context = fixture.context.consensus_context().unwrap();
+        assert_eq!(consensus_context.leader(1), PartyId(2));
+        let mut leader = start_round_with_local_candidate(&fixture, 1);
+        leader.request_view_change(&fixture.source_identities[1]).unwrap();
+        for index in [0_usize, 2] {
+            let identity = &fixture.source_identities[index];
+            let view_change = sign_consensus_message(
+                &consensus_context,
+                identity,
+                ConsensusMessageBody::ViewChange(ViewChange {
+                    from_view: 0,
+                    target_view: 1,
+                    highest_prepared: None,
+                }),
+            )
+            .unwrap();
+            leader
+                .handle_wire(
+                    identity.party(),
+                    KeyRotationWire::Consensus(view_change),
+                    &fixture.source_identities[1],
+                    &fixture.receiver_keys,
+                )
+                .unwrap();
+        }
+        assert_eq!(leader.view(), 1);
+
+        let recipient = PartyId(4);
+        let pending = leader.pending_messages_for(recipient, usize::MAX);
+        assert_eq!(
+            pending.first().map(|message| message.id.kind),
+            Some(KeyRotationDeliveryKind::Proposal { view: 1 }),
+            "the self-contained proposal must initialize the peer before ancillary retries"
+        );
+        let proposal_index = pending
+            .iter()
+            .position(|message| message.id.kind == KeyRotationDeliveryKind::Proposal { view: 1 })
+            .expect("view-one leader did not enqueue a proposal");
+        let advertisement_index = pending
+            .iter()
+            .position(|message| message.id.kind == KeyRotationDeliveryKind::Advertisement)
+            .expect("local advertisement retry was lost");
+        let view_change_index = pending
+            .iter()
+            .position(|message| {
+                message.id.kind == KeyRotationDeliveryKind::ViewChange { target_view: 1 }
+            })
+            .expect("local view-change retry was lost");
+        let certificate_index = pending
+            .iter()
+            .position(|message| {
+                message.id.kind == KeyRotationDeliveryKind::ViewCertificate { target_view: 1 }
+            })
+            .expect("portable view certificate was not enqueued");
+        assert!(proposal_index < advertisement_index);
+        assert!(proposal_index < view_change_index);
+        assert!(proposal_index < certificate_index);
+
+        let relay_batch = leader.pending_messages(usize::MAX);
+        let recipient_batch = relay_batch
+            .iter()
+            .filter(|message| message.id.recipient == recipient)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            recipient_batch.first().map(|message| message.id.kind),
+            Some(KeyRotationDeliveryKind::Proposal { view: 1 })
+        );
+        assert!(
+            recipient_batch
+                .iter()
+                .all(|message| message.id.kind != KeyRotationDeliveryKind::Advertisement),
+            "the standalone advertisement must not overtake a pending self-contained proposal"
+        );
+
+        let proposal = pending[proposal_index].wire.clone();
+        let proposal_id = pending[proposal_index].id;
+        let mut lagging = KeyRotationRound::new(fixture.context.clone(), recipient).unwrap();
+        let step = lagging
+            .handle_wire(
+                PartyId(2),
+                proposal,
+                &fixture.source_identities[3],
+                &fixture.receiver_keys,
+            )
+            .unwrap();
+        assert!(step.changed);
+        assert_eq!(lagging.advertisement_count(), 0);
+        assert_eq!(lagging.view(), 1);
+        assert!(
+            lagging
+                .pending_messages_for(PartyId(1), usize::MAX)
+                .iter()
+                .any(|message| { message.id.kind == KeyRotationDeliveryKind::Prevote { view: 1 } }),
+            "lagging reducer did not vote after verifying the self-contained proposal"
+        );
+
+        assert_eq!(leader.acknowledge(&[proposal_id]).unwrap(), 1);
+        assert!(
+            leader.pending_messages(usize::MAX).iter().any(|message| {
+                message.id.recipient == recipient
+                    && message.id.kind == KeyRotationDeliveryKind::Advertisement
+            }),
+            "the durable advertisement must become eligible after proposal acceptance"
+        );
+    }
+
+    #[test]
+    fn self_contained_proposal_initializes_a_lagging_round_without_advertisements() {
+        let fixture = fixture();
+        let leader_party = PartyId(1);
+        let mut leader = KeyRotationRound::new(fixture.context.clone(), leader_party).unwrap();
+        leader.advertise(&fixture.target_identities[0], &fixture.receiver_keys).unwrap();
+        for capability in fixture
+            .target_identities
+            .iter()
+            .skip(1)
+            .take(fixture.context.selection_size().saturating_sub(1))
+        {
+            leader
+                .handle_wire(
+                    capability.identity().party(),
+                    KeyRotationWire::Advertisement(
+                        sign_key_advertisement(&fixture.context, capability).unwrap(),
+                    ),
+                    &fixture.source_identities[0],
+                    &fixture.receiver_keys,
+                )
+                .unwrap();
+        }
+        let proposal = leader
+            .pending_messages(usize::MAX)
+            .into_iter()
+            .find_map(|message| {
+                if message.id.recipient != PartyId(4) {
+                    return None;
+                }
+                let KeyRotationWire::Consensus(envelope) = message.wire else {
+                    return None;
+                };
+                let decoded = decode_consensus_message(
+                    &fixture.context.consensus_context().unwrap(),
+                    &envelope,
+                )
+                .unwrap();
+                matches!(decoded.body, ConsensusMessageBody::Proposal(_)).then_some(envelope)
+            })
+            .expect("view-zero leader did not enqueue its self-contained proposal");
+
+        let mut lagging = KeyRotationRound::new(fixture.context.clone(), PartyId(4)).unwrap();
+        let step = lagging
+            .handle_wire(
+                leader_party,
+                KeyRotationWire::Consensus(proposal),
+                &fixture.source_identities[3],
+                &fixture.receiver_keys,
+            )
+            .unwrap();
+        assert!(step.changed);
+        assert_eq!(lagging.advertisement_count(), 0);
+        assert_eq!(lagging.view(), 0);
+        assert!(
+            lagging
+                .pending_messages(usize::MAX)
+                .iter()
+                .any(|message| { message.id.kind == KeyRotationDeliveryKind::Prevote { view: 0 } }),
+            "lagging source did not vote for the fully verified proposal"
+        );
+    }
+
+    #[test]
     fn durable_restore_requires_exact_locally_reconstructed_context() {
         let fixture = fixture();
         let mut round = KeyRotationRound::new(fixture.context.clone(), PartyId(1)).unwrap();
-        round.advertise(&fixture.target_identities[0]).unwrap();
+        round.advertise(&fixture.target_identities[0], &fixture.receiver_keys).unwrap();
         let encoded = round.encode().unwrap();
 
         let foreign = KeyRotationContext::new(
-            [0x32; 32],
+            fixture.context.network(),
             fixture.context.source().clone(),
-            fixture.context.source_activation(),
+            [0x42; 32],
             fixture.context.source_fault_bound(),
             fixture.context.target_policy().clone(),
         )
@@ -3268,6 +5026,7 @@ mod tests {
                 PartyId(3),
                 KeyRotationWire::Advertisement(original.clone()),
                 fixture.target_identities[1].identity(),
+                &fixture.receiver_keys,
             ),
             Err(KeyRotationError::WrongAuthenticatedParty)
         ));
@@ -3277,6 +5036,7 @@ mod tests {
                 PartyId(1),
                 KeyRotationWire::Advertisement(original),
                 fixture.target_identities[1].identity(),
+                &fixture.receiver_keys,
             )
             .unwrap();
         let before = round.encode().unwrap();
@@ -3289,6 +5049,7 @@ mod tests {
                 PartyId(1),
                 KeyRotationWire::Advertisement(conflicting),
                 fixture.target_identities[1].identity(),
+                &fixture.receiver_keys,
             ),
             Err(KeyRotationError::ConflictingAdvertisement(PartyId(1)))
         ));
@@ -3297,21 +5058,40 @@ mod tests {
 
     #[test]
     fn certified_target_can_seed_an_unconfigured_successor_rotation() {
-        let fixture = fixture();
+        let mut fixture = fixture();
         let first = drive_durable_round_with_silent_fourth(&fixture)[0].certificate().unwrap();
         let source = first.target_committee(&fixture.context).unwrap();
         let second_epoch = source.epoch + 1;
         // Rotating the certified successor again needs its own eligible pool floor, so extend the
-        // baseline with a fresh joiner spare that is never advertised.
+        // eligible pool with a fresh joiner spare that is never advertised.
         let second_spare = identity(PartyId(5), second_epoch, 0x26);
-        let mut second_baseline = source.clone();
-        second_baseline.epoch = second_epoch;
-        second_baseline.members.push(Member {
+        let mut second_eligible = source.clone();
+        second_eligible.epoch = second_epoch;
+        second_eligible.members.push(Member {
             id: PartyId(5),
             signing_key: second_spare.signing_public_key(),
             encryption_key: second_spare.encryption_public_key(),
         });
-        let second_policy = KeyRotationTargetPolicy::new(&source, second_baseline, 4, 1).unwrap();
+        let first_selected = source
+            .members
+            .iter()
+            .map(|member| (member.id, member.encryption_key))
+            .collect::<Vec<_>>();
+        let first_value = first.value(&fixture.context).unwrap();
+        fixture
+            .receiver_keys
+            .apply_verified_update(source.epoch, &first_selected, first_value.history_update())
+            .unwrap();
+        let second_policy = KeyRotationTargetPolicy::new(
+            &source,
+            1,
+            second_eligible,
+            4,
+            1,
+            fixture.receiver_keys.commitment(),
+            10_000,
+        )
+        .unwrap();
         let second_context = KeyRotationContext::new(
             fixture.context.network(),
             source,
@@ -3330,8 +5110,9 @@ mod tests {
                 )
             })
             .collect::<Vec<_>>();
-        let second_value = KeyRotationValue::new(
+        let second_value = rotation_value(
             &second_context,
+            &fixture.receiver_keys,
             second_identities
                 .iter()
                 .map(|identity| sign_key_advertisement(&second_context, identity).unwrap())

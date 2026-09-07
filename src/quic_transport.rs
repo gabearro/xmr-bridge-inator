@@ -33,24 +33,50 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::time;
 
+#[cfg(test)]
+use crate::deposit_state_transfer_wire::MAX_POST_HANDOFF_EXPORT_CANDIDATE_EVIDENCE_BYTES;
 use crate::{
     committee::PartyId,
     deposit_consensus::MAX_CONSENSUS_MESSAGE_BYTES,
+    deposit_state_transfer_wire::{
+        MAX_DEPOSIT_STATE_EXPORT_HEAD_REQUEST_BYTES,
+        MAX_DEPOSIT_STATE_EXPORT_OBJECTS_REQUEST_BYTES,
+        MAX_DEPOSIT_STATE_EXPORT_RELEASE_REQUEST_BYTES,
+        MAX_DEPOSIT_STATE_IMPORTED_ACK_DELIVERY_BYTES,
+        MAX_DEPOSIT_STATE_IMPORTED_CERTIFICATE_DELIVERY_BYTES,
+        MAX_POST_HANDOFF_EXPORT_SEAL_CERTIFICATE_DELIVERY_BYTES,
+        MAX_POST_HANDOFF_EXPORT_SEAL_REQUEST_BYTES, MAX_POST_HANDOFF_EXPORT_SEAL_VOTE_BYTES,
+    },
+    deposit_sync_support::MAX_DEPOSIT_SYNC_SUPPORT_REQUEST_BYTES,
+    deposit_sync_wire::{
+        MAX_DEPOSIT_SYNC_HEAD_REQUEST_BYTES, MAX_DEPOSIT_SYNC_RELEASE_REQUEST_BYTES,
+    },
     key_rotation::{
         KeyRotationWire, MAX_KEY_ADVERTISEMENT_BYTES, MAX_KEY_ROTATION_CERTIFICATE_BYTES,
-        MAX_KEY_ROTATION_ROUND_STATE_BYTES,
+        MAX_KEY_ROTATION_FALLBACK_VOTE_BYTES, MAX_KEY_ROTATION_ROUND_STATE_BYTES,
     },
 };
 
-const WIRE_VERSION: u16 = 4;
-const ALPN: &[u8] = b"threshold-monero-peer/4";
+const WIRE_VERSION: u16 = 8;
+const ALPN: &[u8] = b"threshold-monero-peer/8";
 const LENGTH_PREFIX_BYTES: usize = 4;
 const HARD_MAX_BODY_BYTES: usize = 8 * 1024 * 1024;
 const HARD_MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
 const HARD_MAX_REJECTION_MESSAGE_BYTES: usize = 4 * 1024;
 const HARD_MAX_CONCURRENT_STREAMS: u32 = 256;
 const HARD_MAX_IN_FLIGHT_FRAME_BYTES: usize = 128 * 1024 * 1024;
+const MAX_REQUEST_PRELUDE_FRAME_BYTES: usize = 512;
+const MAX_REQUEST_ADMISSION_FRAME_BYTES: usize = 8 * 1024;
+// A Byzantine sender can ignore the v8 admission handshake and transmit a body early. Keep the
+// initial QUIC stream credit independent of the 9 MiB application frame cap so such bytes remain
+// transport-bounded until the application explicitly admits and drains the stream.
+const INITIAL_STREAM_RECEIVE_WINDOW_BYTES: usize = 64 * 1024;
 const MAX_CONFIGURED_TIMEOUT: Duration = Duration::from_secs(120);
+// Body transfers must sustain this average rate after one idle-timeout allowance. An independent
+// idle-progress timer catches a completely stalled stream sooner, while the absolute cap below
+// prevents a sender from living forever by releasing one byte just before each idle deadline.
+const MIN_REQUEST_BODY_BYTES_PER_SECOND: usize = 64 * 1024;
+const MAX_REQUEST_BODY_TRANSFER_TIMEOUT: Duration = MAX_CONFIGURED_TIMEOUT;
 // A signed envelope has fixed-size hashes, a session, a signature, and bounded postcard varints.
 // Keeping this conservative allowance explicit avoids coupling the transport to private envelope
 // layout while still rejecting an oversized key-rotation body before protocol verification.
@@ -59,6 +85,9 @@ const MAX_SIGNED_ENVELOPE_WIRE_OVERHEAD_BYTES: usize = 256;
 /// Maximum canonical transport body for one X25519 key advertisement.
 pub const MAX_KEY_ROTATION_ADVERTISEMENT_WIRE_BYTES: usize =
     MAX_KEY_ADVERTISEMENT_BYTES + MAX_SIGNED_ENVELOPE_WIRE_OVERHEAD_BYTES + 1;
+/// Maximum canonical transport body for one source-committee selection-fallback vote.
+pub const MAX_KEY_ROTATION_FALLBACK_VOTE_WIRE_BYTES: usize =
+    MAX_KEY_ROTATION_FALLBACK_VOTE_BYTES + MAX_SIGNED_ENVELOPE_WIRE_OVERHEAD_BYTES + 1;
 /// Maximum canonical transport body for one signed key-rotation consensus message.
 pub const MAX_KEY_ROTATION_CONSENSUS_WIRE_BYTES: usize =
     MAX_CONSENSUS_MESSAGE_BYTES + MAX_SIGNED_ENVELOPE_WIRE_OVERHEAD_BYTES + 1;
@@ -70,6 +99,27 @@ pub const MAX_KEY_ROTATION_CONSENSUS_WIRE_BYTES: usize =
 pub const MAX_KEY_ROTATION_VIEW_CERTIFICATE_WIRE_BYTES: usize = MAX_KEY_ROTATION_ROUND_STATE_BYTES;
 /// Maximum canonical transport body for one terminal key-rotation certificate.
 pub const MAX_KEY_ROTATION_CERTIFICATE_WIRE_BYTES: usize = MAX_KEY_ROTATION_CERTIFICATE_BYTES + 16;
+/// Maximum canonical start request for one ordinary moving-tip prefix-support attempt.
+///
+/// The fixed allowance covers the typed start envelope and optional exact replacement digest;
+/// the embedded terminal checkpoint remains bounded by the support protocol itself.
+pub const MAX_DEPOSIT_PREFIX_SUPPORT_START_WIRE_BYTES: usize =
+    MAX_DEPOSIT_SYNC_SUPPORT_REQUEST_BYTES + 1024;
+/// Maximum canonical continuation request for one already-persisted prefix scan.
+pub const MAX_DEPOSIT_PREFIX_SUPPORT_CONTINUE_WIRE_BYTES: usize = 1024;
+
+// Every specialized v8 request cap is owned by its typed wire decoder. The transport must never
+// admit more bytes for a route than that decoder accepts, and no protocol-specific cap may exceed
+// the endpoint's non-configurable body ceiling.
+const _: () = assert!(MAX_POST_HANDOFF_EXPORT_SEAL_REQUEST_BYTES <= HARD_MAX_BODY_BYTES);
+const _: () = assert!(MAX_POST_HANDOFF_EXPORT_SEAL_VOTE_BYTES <= HARD_MAX_BODY_BYTES);
+const _: () =
+    assert!(MAX_POST_HANDOFF_EXPORT_SEAL_CERTIFICATE_DELIVERY_BYTES <= HARD_MAX_BODY_BYTES);
+const _: () = assert!(MAX_DEPOSIT_STATE_EXPORT_HEAD_REQUEST_BYTES <= HARD_MAX_BODY_BYTES);
+const _: () = assert!(MAX_DEPOSIT_STATE_EXPORT_OBJECTS_REQUEST_BYTES <= HARD_MAX_BODY_BYTES);
+const _: () = assert!(MAX_DEPOSIT_STATE_EXPORT_RELEASE_REQUEST_BYTES <= HARD_MAX_BODY_BYTES);
+const _: () = assert!(MAX_DEPOSIT_STATE_IMPORTED_ACK_DELIVERY_BYTES <= HARD_MAX_BODY_BYTES);
+const _: () = assert!(MAX_DEPOSIT_STATE_IMPORTED_CERTIFICATE_DELIVERY_BYTES <= HARD_MAX_BODY_BYTES);
 
 /// Stable identifier used to correlate one response with one request.
 ///
@@ -78,6 +128,26 @@ pub const MAX_KEY_ROTATION_CERTIFICATE_WIRE_BYTES: usize = MAX_KEY_ROTATION_CERT
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct RequestId([u8; 32]);
+
+struct RequestIdHashFlavor(blake3::Hasher);
+
+impl postcard::ser_flavors::Flavor for RequestIdHashFlavor {
+    type Output = [u8; 32];
+
+    fn try_push(&mut self, byte: u8) -> postcard::Result<()> {
+        self.0.update(&[byte]);
+        Ok(())
+    }
+
+    fn try_extend(&mut self, bytes: &[u8]) -> postcard::Result<()> {
+        self.0.update(bytes);
+        Ok(())
+    }
+
+    fn finalize(self) -> postcard::Result<Self::Output> {
+        Ok(*self.0.finalize().as_bytes())
+    }
+}
 
 impl RequestId {
     #[must_use]
@@ -120,20 +190,38 @@ impl RequestId {
         to: PartyId,
         request: &PeerRequest,
     ) -> Result<Self, QuicTransportError> {
-        let encoded = postcard::to_allocvec(request).map_err(QuicTransportError::Serialization)?;
-        let mut material = Vec::with_capacity(12 + encoded.len());
-        material.extend_from_slice(&from.0.to_le_bytes());
-        material.extend_from_slice(&to.0.to_le_bytes());
-        material.extend_from_slice(
-            &u64::try_from(encoded.len())
-                .map_err(|_| QuicTransportError::FrameTooLarge {
-                    actual: encoded.len(),
-                    maximum: HARD_MAX_FRAME_BYTES,
-                })?
-                .to_le_bytes(),
-        );
-        material.extend_from_slice(&encoded);
-        Ok(Self::derive(network_id, b"canonical-authenticated-peer-request/v4", &material))
+        const DOMAIN: &[u8] = b"canonical-authenticated-peer-request/v8";
+
+        // Preserve `derive(network, domain, from || to || len || postcard(request))` exactly,
+        // while feeding the canonical request bytes directly into BLAKE3. Request bodies may be
+        // eight MiB, so materializing both `encoded` and `material` here would otherwise add two
+        // attacker-sized allocations on every admitted inbound request.
+        let encoded_len = postcard::experimental::serialized_size(request)
+            .map_err(QuicTransportError::Serialization)?;
+        let material_len =
+            12_usize.checked_add(encoded_len).ok_or(QuicTransportError::FrameTooLarge {
+                actual: encoded_len,
+                maximum: HARD_MAX_FRAME_BYTES,
+            })?;
+        let encoded_len = u64::try_from(encoded_len).map_err(|_| {
+            QuicTransportError::FrameTooLarge { actual: encoded_len, maximum: HARD_MAX_FRAME_BYTES }
+        })?;
+        let material_len =
+            u64::try_from(material_len).map_err(|_| QuicTransportError::FrameTooLarge {
+                actual: material_len,
+                maximum: HARD_MAX_FRAME_BYTES,
+            })?;
+        let mut hasher = blake3::Hasher::new_derive_key("threshold-monero/quic-request-id/v1");
+        hasher.update(&network_id);
+        hasher.update(&(DOMAIN.len() as u64).to_le_bytes());
+        hasher.update(DOMAIN);
+        hasher.update(&material_len.to_le_bytes());
+        hasher.update(&from.0.to_le_bytes());
+        hasher.update(&to.0.to_le_bytes());
+        hasher.update(&encoded_len.to_le_bytes());
+        postcard::serialize_with_flavor(request, RequestIdHashFlavor(hasher))
+            .map(Self)
+            .map_err(QuicTransportError::Serialization)
     }
 }
 
@@ -173,6 +261,7 @@ pub enum EpochOperation {
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 pub enum KeyRotationOperation {
     Advertisement,
+    FallbackVote,
     Consensus,
     ViewCertificate,
     Certificate,
@@ -184,9 +273,10 @@ impl KeyRotationOperation {
     pub const fn causal_priority(self) -> u8 {
         match self {
             Self::Advertisement => 0,
-            Self::Consensus => 1,
-            Self::ViewCertificate => 2,
-            Self::Certificate => 3,
+            Self::FallbackVote => 1,
+            Self::Consensus => 2,
+            Self::ViewCertificate => 3,
+            Self::Certificate => 4,
         }
     }
 
@@ -195,6 +285,7 @@ impl KeyRotationOperation {
     pub const fn max_body_bytes(self) -> usize {
         match self {
             Self::Advertisement => MAX_KEY_ROTATION_ADVERTISEMENT_WIRE_BYTES,
+            Self::FallbackVote => MAX_KEY_ROTATION_FALLBACK_VOTE_WIRE_BYTES,
             Self::Consensus => MAX_KEY_ROTATION_CONSENSUS_WIRE_BYTES,
             Self::ViewCertificate => MAX_KEY_ROTATION_VIEW_CERTIFICATE_WIRE_BYTES,
             Self::Certificate => MAX_KEY_ROTATION_CERTIFICATE_WIRE_BYTES,
@@ -206,6 +297,7 @@ impl KeyRotationOperation {
     pub const fn for_wire(wire: &KeyRotationWire) -> Self {
         match wire {
             KeyRotationWire::Advertisement(_) => Self::Advertisement,
+            KeyRotationWire::FallbackVote(_) => Self::FallbackVote,
             KeyRotationWire::Consensus(_) => Self::Consensus,
             KeyRotationWire::ViewCertificate(_) => Self::ViewCertificate,
             KeyRotationWire::Certificate(_) => Self::Certificate,
@@ -262,22 +354,24 @@ impl KeyRotationOperation {
 
 /// Deposit-ledger messages carried only over mutually authenticated QUIC.
 ///
-/// `Allocate`, `Handoff`, and `ConsolidationCompletion` carry portable ledger proposals;
-/// `Attest` contributes one committee signature; `Certificate` disseminates a committed ledger
-/// entry. `DepositObservation`, `DepositObservationAttest`, and
+/// `ConsensusProposal`, `ConsensusMessage`, and `ConsensusCertificate` carry portable
+/// Byzantine-agreement traffic for ledger and checkpoint decisions. `Attest` contributes one
+/// committee signature; `Certificate` disseminates a committed ledger entry.
+/// `DepositObservation`, `DepositObservationAttest`, and
 /// `DepositObservationCertificate` provide the corresponding live proposal, witness, and
 /// certificate routes for confirmed-output observations. `IndexCheckpointAttest` and
 /// `IndexCheckpointCertificate` complete a ledger-bound portable-index checkpoint; the two
 /// `DepositObservationIndexCheckpoint*` routes carry the separately certified observation lane
 /// without inventing a ledger slot. `Consolidation` carries certified-intent consensus, all-to-all
-/// ROAST contributions and candidates. The two `Sync*` operations expose only the fresh compact
-/// catch-up protocol: settled heads and root-connected immutable object pages.
+/// ROAST contributions and candidates. The `Sync*` operations expose only the fresh compact
+/// catch-up protocol: settled heads and root-connected immutable object pages. Prefix-support
+/// start/continue/endorsement routes certify a stable semantic prefix under independently
+/// authenticated local archive anchors. The post-handoff routes are deliberately distinct from
+/// ordinary current-committee sync: they are authorized by certified transition capabilities.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 pub enum DepositOperation {
-    Allocate,
     Attest,
     Certificate,
-    Handoff,
     /// Contribute one committee signature to the deterministic portable-index checkpoint.
     IndexCheckpointAttest,
     /// Disseminate the exact quorum certificate for the portable-index checkpoint.
@@ -296,7 +390,28 @@ pub enum DepositOperation {
     SyncHead,
     /// Fetch one page from a finite, root-connected immutable object manifest.
     SyncObjects,
-    ConsolidationCompletion,
+    /// Release one exact durable historical-root lease after requester-side retirement.
+    SyncRelease,
+    /// Start one ordinary current-committee moving-tip prefix scan with the full bounded witness.
+    PrefixSupportStart,
+    /// Advance one persisted fixed-anchor scan without retransmitting its terminal checkpoint.
+    PrefixSupportContinue,
+    /// Propose one source-specific state-export seal after the registry handoff is certified.
+    PostHandoffExportSealRequest,
+    /// Contribute one predecessor-quorum vote to an exact state-export seal.
+    PostHandoffExportSealVote,
+    /// Disseminate one certified predecessor-quorum state-export seal.
+    PostHandoffExportSealCertificate,
+    /// Fetch a certified predecessor's immutable export head.
+    ExportHead,
+    /// Fetch one page from a certified predecessor export manifest.
+    ExportObjects,
+    /// Release one exact certified predecessor export lease.
+    ExportRelease,
+    /// Deliver one target-member acknowledgement of a completely imported semantic state.
+    StateImportedAck,
+    /// Disseminate the exact target-quorum state-imported certificate.
+    StateImportedCertificate,
     /// Coordinator-free, durable Byzantine consolidation orchestration.
     Consolidation,
     /// Authenticated member gossip for one client allocation request.
@@ -326,7 +441,6 @@ impl DepositOperation {
             // completion it eventually authorizes. The Byzantine body carries its own finer
             // causal phase and exact delivery identifier.
             Self::Consolidation => 5,
-            Self::Allocate | Self::Handoff | Self::ConsolidationCompletion => 6,
             Self::Attest => 7,
             Self::Certificate => 8,
             Self::DepositObservation => 9,
@@ -335,7 +449,17 @@ impl DepositOperation {
             Self::IndexCheckpointAttest | Self::DepositObservationIndexCheckpointAttest => 12,
             Self::IndexCheckpointCertificate
             | Self::DepositObservationIndexCheckpointCertificate => 13,
-            Self::SyncHead | Self::SyncObjects => 14,
+            Self::SyncHead
+            | Self::SyncObjects
+            | Self::SyncRelease
+            | Self::PrefixSupportStart
+            | Self::PrefixSupportContinue => 14,
+            Self::PostHandoffExportSealRequest => 15,
+            Self::PostHandoffExportSealVote => 16,
+            Self::PostHandoffExportSealCertificate => 17,
+            Self::ExportHead | Self::ExportObjects | Self::ExportRelease => 18,
+            Self::StateImportedAck => 19,
+            Self::StateImportedCertificate => 20,
         }
     }
 }
@@ -366,6 +490,136 @@ impl PeerRequest {
             | Self::KeyRotation { body, .. } => body.len(),
         }
     }
+
+    fn route(&self) -> PeerRequestRoute {
+        match self {
+            Self::Avss { operation, .. } => PeerRequestRoute::Avss(*operation),
+            Self::Qual { operation, .. } => PeerRequestRoute::Qual(*operation),
+            Self::Epoch { operation, .. } => PeerRequestRoute::Epoch(*operation),
+            Self::Deposit { operation, .. } => PeerRequestRoute::Deposit(*operation),
+            Self::KeyRotation { operation, .. } => PeerRequestRoute::KeyRotation(*operation),
+        }
+    }
+
+    fn into_body(self) -> Vec<u8> {
+        match self {
+            Self::Avss { body, .. }
+            | Self::Qual { body, .. }
+            | Self::Epoch { body, .. }
+            | Self::Deposit { body, .. }
+            | Self::KeyRotation { body, .. } => body,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+enum PeerRequestRoute {
+    Avss(AvssOperation),
+    Qual(QualOperation),
+    Epoch(EpochOperation),
+    Deposit(DepositOperation),
+    KeyRotation(KeyRotationOperation),
+}
+
+impl PeerRequestRoute {
+    fn with_body(self, body: Vec<u8>) -> PeerRequest {
+        match self {
+            Self::Avss(operation) => PeerRequest::Avss { operation, body },
+            Self::Qual(operation) => PeerRequest::Qual { operation, body },
+            Self::Epoch(operation) => PeerRequest::Epoch { operation, body },
+            Self::Deposit(operation) => PeerRequest::Deposit { operation, body },
+            Self::KeyRotation(operation) => PeerRequest::KeyRotation { operation, body },
+        }
+    }
+
+    fn maximum_body_bytes(self, config: QuicTransportConfig) -> usize {
+        match self {
+            Self::KeyRotation(operation) => config.max_body_bytes.min(operation.max_body_bytes()),
+            Self::Deposit(DepositOperation::PrefixSupportStart) => {
+                config.max_body_bytes.min(MAX_DEPOSIT_PREFIX_SUPPORT_START_WIRE_BYTES)
+            }
+            Self::Deposit(DepositOperation::PrefixSupportContinue) => {
+                config.max_body_bytes.min(MAX_DEPOSIT_PREFIX_SUPPORT_CONTINUE_WIRE_BYTES)
+            }
+            Self::Deposit(DepositOperation::SyncHead) => {
+                config.max_body_bytes.min(MAX_DEPOSIT_SYNC_HEAD_REQUEST_BYTES)
+            }
+            Self::Deposit(DepositOperation::SyncRelease) => {
+                config.max_body_bytes.min(MAX_DEPOSIT_SYNC_RELEASE_REQUEST_BYTES)
+            }
+            Self::Deposit(DepositOperation::PostHandoffExportSealRequest) => {
+                config.max_body_bytes.min(MAX_POST_HANDOFF_EXPORT_SEAL_REQUEST_BYTES)
+            }
+            Self::Deposit(DepositOperation::PostHandoffExportSealVote) => {
+                config.max_body_bytes.min(MAX_POST_HANDOFF_EXPORT_SEAL_VOTE_BYTES)
+            }
+            Self::Deposit(DepositOperation::PostHandoffExportSealCertificate) => {
+                config.max_body_bytes.min(MAX_POST_HANDOFF_EXPORT_SEAL_CERTIFICATE_DELIVERY_BYTES)
+            }
+            Self::Deposit(DepositOperation::ExportHead) => {
+                config.max_body_bytes.min(MAX_DEPOSIT_STATE_EXPORT_HEAD_REQUEST_BYTES)
+            }
+            Self::Deposit(DepositOperation::ExportObjects) => {
+                config.max_body_bytes.min(MAX_DEPOSIT_STATE_EXPORT_OBJECTS_REQUEST_BYTES)
+            }
+            Self::Deposit(DepositOperation::ExportRelease) => {
+                config.max_body_bytes.min(MAX_DEPOSIT_STATE_EXPORT_RELEASE_REQUEST_BYTES)
+            }
+            Self::Deposit(DepositOperation::StateImportedAck) => {
+                config.max_body_bytes.min(MAX_DEPOSIT_STATE_IMPORTED_ACK_DELIVERY_BYTES)
+            }
+            Self::Deposit(DepositOperation::StateImportedCertificate) => {
+                config.max_body_bytes.min(MAX_DEPOSIT_STATE_IMPORTED_CERTIFICATE_DELIVERY_BYTES)
+            }
+            Self::Avss(_) | Self::Qual(_) | Self::Epoch(_) | Self::Deposit(_) => {
+                config.max_body_bytes
+            }
+        }
+    }
+
+    fn is_deposit_sync_objects(self) -> bool {
+        matches!(self, Self::Deposit(DepositOperation::SyncObjects))
+    }
+
+    fn is_deposit_export_objects(self) -> bool {
+        matches!(self, Self::Deposit(DepositOperation::ExportObjects))
+    }
+
+    fn is_deposit_object_read(self) -> bool {
+        self.is_deposit_sync_objects() || self.is_deposit_export_objects()
+    }
+
+    fn is_deposit_prefix_support_scan(self) -> bool {
+        matches!(
+            self,
+            Self::Deposit(
+                DepositOperation::PrefixSupportStart | DepositOperation::PrefixSupportContinue
+            )
+        )
+    }
+
+    fn is_deposit_sync_control(self) -> bool {
+        matches!(self, Self::Deposit(DepositOperation::SyncHead | DepositOperation::SyncRelease))
+    }
+
+    fn is_deposit_sync_state_read(self) -> bool {
+        matches!(
+            self,
+            Self::Deposit(
+                DepositOperation::SyncHead
+                    | DepositOperation::SyncObjects
+                    | DepositOperation::PrefixSupportStart
+                    | DepositOperation::PrefixSupportContinue
+            )
+        )
+    }
+
+    fn deposit_operation(self) -> Option<DepositOperation> {
+        match self {
+            Self::Deposit(operation) => Some(operation),
+            Self::Avss(_) | Self::Qual(_) | Self::Epoch(_) | Self::KeyRotation(_) => None,
+        }
+    }
 }
 
 /// Protocol-independent rejection categories. Detailed protocol errors remain opaque strings.
@@ -386,13 +640,30 @@ pub enum PeerResponse {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-struct RequestFrame {
+struct RequestPrelude {
     version: u16,
     network_id: [u8; 32],
     request_id: RequestId,
     from: PartyId,
     to: PartyId,
-    request: PeerRequest,
+    route: PeerRequestRoute,
+    body_len: u32,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+enum RequestAdmission {
+    Accepted,
+    Rejected(PeerResponse),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+struct RequestAdmissionFrame {
+    version: u16,
+    network_id: [u8; 32],
+    request_id: RequestId,
+    from: PartyId,
+    to: PartyId,
+    admission: RequestAdmission,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -580,10 +851,29 @@ pub enum QuicTransportError {
     WrongRecipient { expected: PartyId, actual: PartyId },
     #[error("request ID differs from the canonical authenticated route and body")]
     WrongRequestId,
+    #[error("a pre-body request admission may contain only Accepted or a rejected response")]
+    InvalidRequestAdmission,
     #[error("rejection message is {actual} bytes; maximum is {maximum}")]
     RejectionMessageTooLarge { actual: usize, maximum: usize },
     #[error("QUIC endpoint is closed")]
     EndpointClosed,
+}
+
+impl QuicTransportError {
+    /// Whether this request failure proves the shared multiplexed QUIC connection was lost.
+    ///
+    /// Stream resets, per-stream timeouts, and authenticated framing errors are local to one
+    /// request. Evicting the cached connection for those failures tears down unrelated healthy
+    /// streams and can turn one slow reducer into a reconnect storm.
+    pub(crate) fn is_connection_lost(&self) -> bool {
+        matches!(
+            self,
+            Self::Connection(_)
+                | Self::Write(quinn::WriteError::ConnectionLost(_))
+                | Self::Read(quinn::ReadExactError::ReadError(quinn::ReadError::ConnectionLost(_)))
+                | Self::ReadToEnd(quinn::ReadToEndError::Read(quinn::ReadError::ConnectionLost(_)))
+        )
+    }
 }
 
 struct PeerTlsConfig {
@@ -808,6 +1098,29 @@ pub struct AuthenticatedPeerConnection {
     config: QuicTransportConfig,
 }
 
+/// Locally observed transport phase which produced one authenticated response.
+///
+/// This is not encoded on the wire and therefore cannot be forged by the peer. A pre-body
+/// rejection proves the current attempt was never dispatched. Once the body was admitted, cache
+/// and reducer responses intentionally share one conservative class: an untrusted peer-controlled
+/// rejection cannot prove that an earlier ambiguous execution did not commit.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum QuicResponseProvenance {
+    RejectedBeforeBody,
+    AfterBody,
+}
+
+pub(crate) struct QuicRequestOutcome {
+    response: PeerResponse,
+    provenance: QuicResponseProvenance,
+}
+
+impl QuicRequestOutcome {
+    pub(crate) fn into_parts(self) -> (PeerResponse, QuicResponseProvenance) {
+        (self.response, self.provenance)
+    }
+}
+
 impl std::fmt::Debug for AuthenticatedPeerConnection {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
@@ -834,6 +1147,31 @@ impl AuthenticatedPeerConnection {
         request_id: RequestId,
         request: PeerRequest,
     ) -> Result<PeerResponse, QuicTransportError> {
+        self.request_with_timeout(request_id, request, self.config.stream_timeout).await
+    }
+
+    /// Send one correlated request with a caller-selected total RPC deadline.
+    ///
+    /// The runtime uses its protocol-class deadline here because the response cannot arrive until
+    /// the remote durable reducer finishes. Capping that wait at the transport's shorter
+    /// slow-stream timeout made the runtime's configured deadline ineffective and caused exact
+    /// AVSS retries to pile up behind an honestly executing request. Direct transport callers keep
+    /// the ordinary `stream_timeout` through [`Self::request`].
+    pub(crate) async fn request_with_timeout(
+        &self,
+        request_id: RequestId,
+        request: PeerRequest,
+        request_timeout: Duration,
+    ) -> Result<PeerResponse, QuicTransportError> {
+        Ok(self.request_with_timeout_outcome(request_id, request, request_timeout).await?.response)
+    }
+
+    pub(crate) async fn request_with_timeout_outcome(
+        &self,
+        request_id: RequestId,
+        request: PeerRequest,
+        request_timeout: Duration,
+    ) -> Result<QuicRequestOutcome, QuicTransportError> {
         validate_request(&request, self.config)?;
         if request_id
             != RequestId::for_peer_request(
@@ -845,17 +1183,44 @@ impl AuthenticatedPeerConnection {
         {
             return Err(QuicTransportError::WrongRequestId);
         }
-        let frame = RequestFrame {
+        let route = request.route();
+        let body_len =
+            u32::try_from(request.body_len()).map_err(|_| QuicTransportError::BodyTooLarge {
+                actual: request.body_len(),
+                maximum: self.config.max_body_bytes,
+            })?;
+        let prelude = RequestPrelude {
             version: WIRE_VERSION,
             network_id: self.network_id,
             request_id,
             from: self.local_party,
             to: self.peer_party,
-            request,
+            route,
+            body_len,
         };
+        let body = request.into_body();
         let operation = async {
             let (mut send, mut receive) = self.connection.open_bi().await?;
-            write_frame(&mut send, &frame, self.config).await?;
+            write_frame_bounded(&mut send, &prelude, MAX_REQUEST_PRELUDE_FRAME_BYTES).await?;
+            let admission: RequestAdmissionFrame =
+                read_frame_bounded(&mut receive, MAX_REQUEST_ADMISSION_FRAME_BYTES).await?;
+            validate_request_admission_frame(
+                &admission,
+                request_id,
+                self.network_id,
+                self.peer_party,
+                self.local_party,
+                self.config,
+            )?;
+            if let RequestAdmission::Rejected(response) = admission.admission {
+                let _ = send.reset(VarInt::from_u32(0));
+                require_eof(&mut receive).await?;
+                return Ok(QuicRequestOutcome {
+                    response,
+                    provenance: QuicResponseProvenance::RejectedBeforeBody,
+                });
+            }
+            write_request_body_with_deadlines(&mut send, &body, self.config).await?;
             send.finish()?;
             let response: ResponseFrame = read_frame(&mut receive, self.config).await?;
             require_eof(&mut receive).await?;
@@ -867,30 +1232,36 @@ impl AuthenticatedPeerConnection {
                 self.local_party,
                 self.config,
             )?;
-            Ok(response.response)
+            Ok(QuicRequestOutcome {
+                response: response.response,
+                provenance: QuicResponseProvenance::AfterBody,
+            })
         };
-        timeout(self.config.stream_timeout, "QUIC request stream", operation).await?
+        timeout(request_timeout, "QUIC request stream", operation).await?
     }
 
-    /// Accept the next request stream. An idle authenticated connection may wait indefinitely;
-    /// once a stream is opened, its frame must arrive within `stream_timeout`.
-    pub async fn accept_request(&self) -> Result<IncomingPeerRequest, QuicTransportError> {
+    /// Accept and authenticate the bounded request prelude on the next stream.
+    ///
+    /// No request body is transmitted by a conforming peer until the caller invokes
+    /// [`IncomingPeerRequestPrelude::read_request`]. A Byzantine peer which transmits early is
+    /// constrained by the transport's small initial stream and connection receive windows.
+    pub async fn accept_request(&self) -> Result<IncomingPeerRequestPrelude, QuicTransportError> {
         let (send, mut receive) = self.connection.accept_bi().await?;
         let operation = async {
-            let frame: RequestFrame = read_frame(&mut receive, self.config).await?;
-            require_eof(&mut receive).await?;
-            validate_request_frame(
-                &frame,
+            let prelude: RequestPrelude =
+                read_frame_bounded(&mut receive, MAX_REQUEST_PRELUDE_FRAME_BYTES).await?;
+            validate_request_prelude(
+                &prelude,
                 self.peer_party,
                 self.local_party,
                 self.network_id,
                 self.config,
             )?;
-            Ok::<RequestFrame, QuicTransportError>(frame)
+            Ok::<RequestPrelude, QuicTransportError>(prelude)
         };
-        let frame =
+        let prelude =
             timeout(self.config.stream_timeout, "QUIC inbound request", operation).await??;
-        Ok(IncomingPeerRequest { frame, send, config: self.config })
+        Ok(IncomingPeerRequestPrelude { prelude, send, receive, config: self.config })
     }
 
     pub fn close(&self, reason: &[u8]) {
@@ -898,9 +1269,137 @@ impl AuthenticatedPeerConnection {
     }
 }
 
+/// Authenticated, size-bounded request metadata whose body has not been admitted or decoded.
+pub struct IncomingPeerRequestPrelude {
+    prelude: RequestPrelude,
+    send: quinn::SendStream,
+    receive: quinn::RecvStream,
+    config: QuicTransportConfig,
+}
+
+impl std::fmt::Debug for IncomingPeerRequestPrelude {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("IncomingPeerRequestPrelude")
+            .field("request_id", &self.prelude.request_id)
+            .field("from", &self.prelude.from)
+            .field("to", &self.prelude.to)
+            .field("route", &self.prelude.route)
+            .field("body_len", &self.prelude.body_len)
+            .finish_non_exhaustive()
+    }
+}
+
+impl IncomingPeerRequestPrelude {
+    pub fn request_id(&self) -> RequestId {
+        self.prelude.request_id
+    }
+
+    pub fn peer_party(&self) -> PartyId {
+        self.prelude.from
+    }
+
+    pub fn is_deposit_sync_objects(&self) -> bool {
+        self.prelude.route.is_deposit_sync_objects()
+    }
+
+    /// Whether this is an ordinary or certified-export immutable object-page read.
+    pub fn is_deposit_object_read(&self) -> bool {
+        self.prelude.route.is_deposit_object_read()
+    }
+
+    /// Whether this request advances one persisted ordinary prefix-support scan.
+    pub fn is_deposit_prefix_support_scan(&self) -> bool {
+        self.prelude.route.is_deposit_prefix_support_scan()
+    }
+
+    /// Whether this is one of the small, authenticated Head/Release control messages.
+    pub fn is_deposit_sync_control(&self) -> bool {
+        self.prelude.route.is_deposit_sync_control()
+    }
+
+    /// Whether this prelude may read a current compact-state lease or object page. Callers use
+    /// this before admitting the body so removed committee members cannot allocate or transmit a
+    /// sync body merely to discover that their current-state authority expired.
+    pub fn is_deposit_sync_state_read(&self) -> bool {
+        self.prelude.route.is_deposit_sync_state_read()
+    }
+
+    /// Return the authenticated deposit route before admitting its body.
+    ///
+    /// This projection carries no protocol authority. It lets the runtime apply cheap
+    /// committee-history admission before allocating large post-handoff request bodies; the
+    /// typed reducer must still authenticate every exact transition and wire binding.
+    pub fn deposit_operation(&self) -> Option<DepositOperation> {
+        self.prelude.route.deposit_operation()
+    }
+
+    pub fn body_len(&self) -> usize {
+        self.prelude.body_len as usize
+    }
+
+    /// Admit this request, notify the sender, then read its exact bounded body.
+    pub async fn read_request(mut self) -> Result<IncomingPeerRequest, QuicTransportError> {
+        let admission = self.admission_frame(RequestAdmission::Accepted);
+        write_frame_bounded(&mut self.send, &admission, MAX_REQUEST_ADMISSION_FRAME_BYTES).await?;
+        let body = read_request_body_with_deadlines(
+            &mut self.receive,
+            self.prelude.body_len as usize,
+            self.config,
+        )
+        .await?;
+        let request = self.prelude.route.with_body(body);
+        validate_request(&request, self.config)?;
+        if self.prelude.request_id
+            != RequestId::for_peer_request(
+                self.prelude.network_id,
+                self.prelude.from,
+                self.prelude.to,
+                &request,
+            )?
+        {
+            return Err(QuicTransportError::WrongRequestId);
+        }
+        Ok(IncomingPeerRequest {
+            prelude: self.prelude,
+            request,
+            send: self.send,
+            config: self.config,
+        })
+    }
+
+    /// Reject a request before its body is transmitted or allocated.
+    pub async fn reject_before_body(
+        mut self,
+        response: PeerResponse,
+    ) -> Result<(), QuicTransportError> {
+        if !matches!(response, PeerResponse::Rejected { .. }) {
+            return Err(QuicTransportError::InvalidRequestAdmission);
+        }
+        validate_response(&response, self.config)?;
+        let admission = self.admission_frame(RequestAdmission::Rejected(response));
+        self.receive.stop(VarInt::from_u32(0))?;
+        write_frame_bounded(&mut self.send, &admission, MAX_REQUEST_ADMISSION_FRAME_BYTES).await?;
+        self.send.finish()?;
+        Ok(())
+    }
+
+    fn admission_frame(&self, admission: RequestAdmission) -> RequestAdmissionFrame {
+        RequestAdmissionFrame {
+            version: WIRE_VERSION,
+            network_id: self.prelude.network_id,
+            request_id: self.prelude.request_id,
+            from: self.prelude.to,
+            to: self.prelude.from,
+            admission,
+        }
+    }
+}
+
 /// Authenticated inbound request retaining the response half of its QUIC stream.
 pub struct IncomingPeerRequest {
-    frame: RequestFrame,
+    prelude: RequestPrelude,
+    request: PeerRequest,
     send: quinn::SendStream,
     config: QuicTransportConfig,
 }
@@ -909,39 +1408,64 @@ impl std::fmt::Debug for IncomingPeerRequest {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("IncomingPeerRequest")
-            .field("request_id", &self.frame.request_id)
-            .field("from", &self.frame.from)
-            .field("to", &self.frame.to)
-            .field("request", &self.frame.request)
+            .field("request_id", &self.prelude.request_id)
+            .field("from", &self.prelude.from)
+            .field("to", &self.prelude.to)
+            .field("route", &self.request.route())
+            .field("body_len", &self.request.body_len())
             .finish_non_exhaustive()
     }
 }
 
 impl IncomingPeerRequest {
     pub fn request_id(&self) -> RequestId {
-        self.frame.request_id
+        self.prelude.request_id
     }
 
     pub fn peer_party(&self) -> PartyId {
-        self.frame.from
+        self.prelude.from
     }
 
     pub fn request(&self) -> &PeerRequest {
-        &self.frame.request
+        &self.request
     }
 
     pub fn into_request(self) -> PeerRequest {
-        self.frame.request
+        self.request
     }
 
-    pub async fn respond(mut self, response: PeerResponse) -> Result<(), QuicTransportError> {
+    /// Move the potentially large request body out without cloning it while retaining the
+    /// authenticated response half of this stream.
+    pub(crate) fn into_request_and_responder(self) -> (PeerRequest, IncomingPeerRequestResponder) {
+        let Self { prelude, request, send, config } = self;
+        (request, IncomingPeerRequestResponder { prelude, send, config })
+    }
+
+    pub async fn respond(self, response: PeerResponse) -> Result<(), QuicTransportError> {
+        let (_, responder) = self.into_request_and_responder();
+        responder.respond(response).await
+    }
+}
+
+/// Authenticated response half retained after moving an inbound request body into its reducer.
+pub(crate) struct IncomingPeerRequestResponder {
+    prelude: RequestPrelude,
+    send: quinn::SendStream,
+    config: QuicTransportConfig,
+}
+
+impl IncomingPeerRequestResponder {
+    pub(crate) async fn respond(
+        mut self,
+        response: PeerResponse,
+    ) -> Result<(), QuicTransportError> {
         validate_response(&response, self.config)?;
         let frame = ResponseFrame {
             version: WIRE_VERSION,
-            network_id: self.frame.network_id,
-            request_id: self.frame.request_id,
-            from: self.frame.to,
-            to: self.frame.from,
+            network_id: self.prelude.network_id,
+            request_id: self.prelude.request_id,
+            from: self.prelude.to,
+            to: self.prelude.from,
             response,
         };
         let operation = async {
@@ -988,19 +1512,32 @@ fn make_transport_config(
     // default QUIC datagram buffers for a second, unhandled ingress path.
     transport.datagram_receive_buffer_size(None);
     transport.datagram_send_buffer_size(0);
-    transport.stream_receive_window(VarInt::from_u32(
-        u32::try_from(config.max_frame_bytes)
-            .map_err(|_| QuicTransportError::InvalidConfiguration("frame limit exceeds u32"))?,
-    ));
-    let connection_window = config
-        .max_frame_bytes
-        .checked_mul(config.max_concurrent_bidi_streams as usize)
+    let initial_stream_window = u32::try_from(INITIAL_STREAM_RECEIVE_WINDOW_BYTES)
+        .map_err(|_| QuicTransportError::InvalidConfiguration("stream window exceeds u32"))?;
+    transport.stream_receive_window(VarInt::from_u32(initial_stream_window));
+    let stream_count = usize::try_from(config.max_concurrent_bidi_streams).map_err(|_| {
+        QuicTransportError::InvalidConfiguration(
+            "stream concurrency does not fit the platform address space",
+        )
+    })?;
+    let connection_window_bytes = INITIAL_STREAM_RECEIVE_WINDOW_BYTES
+        .checked_mul(stream_count)
         .and_then(|window| u64::try_from(window).ok())
-        .and_then(|window| VarInt::from_u64(window).ok())
         .ok_or(QuicTransportError::InvalidConfiguration(
-            "frame and concurrency limits overflow the QUIC receive window",
+            "stream window and concurrency limits overflow the QUIC receive window",
         ))?;
+    let connection_window = VarInt::from_u64(connection_window_bytes).map_err(|_| {
+        QuicTransportError::InvalidConfiguration(
+            "stream window and concurrency limits overflow the QUIC receive window",
+        )
+    })?;
+    // Validation keeps this aggregate window between one 64 KiB stream and 16 MiB (64 KiB times
+    // the hard 256-stream ceiling). Use the same checked aggregate as the local send window: a
+    // peer that stops extending flow-control credit cannot make us queue an entire 8 MiB request
+    // locally, while healthy streams still share one window proportional to configured
+    // multiplexing.
     transport.receive_window(connection_window);
+    transport.send_window(connection_window_bytes);
     transport.max_idle_timeout(Some(
         IdleTimeout::try_from(config.idle_timeout)
             .map_err(|error| QuicTransportError::TlsConfiguration(error.to_string()))?,
@@ -1014,17 +1551,20 @@ async fn write_frame<T: Serialize>(
     frame: &T,
     config: QuicTransportConfig,
 ) -> Result<(), QuicTransportError> {
+    write_frame_bounded(send, frame, config.max_frame_bytes).await
+}
+
+async fn write_frame_bounded<T: Serialize>(
+    send: &mut quinn::SendStream,
+    frame: &T,
+    maximum: usize,
+) -> Result<(), QuicTransportError> {
     let encoded = postcard::to_allocvec(frame).map_err(QuicTransportError::Serialization)?;
-    if encoded.len() > config.max_frame_bytes {
-        return Err(QuicTransportError::FrameTooLarge {
-            actual: encoded.len(),
-            maximum: config.max_frame_bytes,
-        });
+    if encoded.len() > maximum {
+        return Err(QuicTransportError::FrameTooLarge { actual: encoded.len(), maximum });
     }
-    let length = u32::try_from(encoded.len()).map_err(|_| QuicTransportError::FrameTooLarge {
-        actual: encoded.len(),
-        maximum: config.max_frame_bytes,
-    })?;
+    let length = u32::try_from(encoded.len())
+        .map_err(|_| QuicTransportError::FrameTooLarge { actual: encoded.len(), maximum })?;
     send.write_all(&length.to_be_bytes()).await?;
     send.write_all(&encoded).await?;
     Ok(())
@@ -1034,14 +1574,18 @@ async fn read_frame<T: for<'de> Deserialize<'de> + Serialize>(
     receive: &mut quinn::RecvStream,
     config: QuicTransportConfig,
 ) -> Result<T, QuicTransportError> {
+    read_frame_bounded(receive, config.max_frame_bytes).await
+}
+
+async fn read_frame_bounded<T: for<'de> Deserialize<'de> + Serialize>(
+    receive: &mut quinn::RecvStream,
+    maximum: usize,
+) -> Result<T, QuicTransportError> {
     let mut prefix = [0_u8; LENGTH_PREFIX_BYTES];
     receive.read_exact(&mut prefix).await?;
     let length = u32::from_be_bytes(prefix) as usize;
-    if length > config.max_frame_bytes {
-        return Err(QuicTransportError::FrameTooLarge {
-            actual: length,
-            maximum: config.max_frame_bytes,
-        });
+    if length > maximum {
+        return Err(QuicTransportError::FrameTooLarge { actual: length, maximum });
     }
     let mut encoded = vec![0_u8; length];
     receive.read_exact(&mut encoded).await?;
@@ -1060,6 +1604,111 @@ async fn read_frame<T: for<'de> Deserialize<'de> + Serialize>(
     Ok(frame)
 }
 
+fn request_body_transfer_timeout(body_len: usize, idle_timeout: Duration) -> Duration {
+    let transfer_nanos = u128::try_from(body_len)
+        .expect("usize always fits in u128")
+        .saturating_mul(1_000_000_000)
+        .div_ceil(
+            u128::try_from(MIN_REQUEST_BODY_BYTES_PER_SECOND).expect("usize always fits in u128"),
+        );
+    let transfer_nanos = u64::try_from(transfer_nanos).unwrap_or(u64::MAX);
+    idle_timeout
+        .saturating_add(Duration::from_nanos(transfer_nanos))
+        .min(MAX_REQUEST_BODY_TRANSFER_TIMEOUT)
+}
+
+async fn write_request_body_with_deadlines(
+    send: &mut quinn::SendStream,
+    body: &[u8],
+    config: QuicTransportConfig,
+) -> Result<(), QuicTransportError> {
+    if body.is_empty() {
+        return Ok(());
+    }
+    let total_timeout = request_body_transfer_timeout(body.len(), config.stream_timeout);
+    let mut total_deadline = Box::pin(time::sleep(total_timeout));
+    let mut idle_deadline = Box::pin(time::sleep(config.stream_timeout));
+    let mut written = 0_usize;
+    while written < body.len() {
+        let progress = tokio::select! {
+            biased;
+            () = &mut total_deadline => {
+                return Err(QuicTransportError::Timeout {
+                    operation: "QUIC outbound request body total",
+                });
+            }
+            () = &mut idle_deadline => {
+                return Err(QuicTransportError::Timeout {
+                    operation: "QUIC outbound request body idle",
+                });
+            }
+            result = send.write(&body[written..]) => result?,
+        };
+        if progress == 0 {
+            // Quinn documents a successful nonempty write as making progress. Keep the timers
+            // armed if that invariant ever changes instead of granting a fresh idle interval.
+            continue;
+        }
+        written += progress;
+        idle_deadline.as_mut().reset(time::Instant::now() + config.stream_timeout);
+    }
+    Ok(())
+}
+
+async fn read_request_body_with_deadlines(
+    receive: &mut quinn::RecvStream,
+    body_len: usize,
+    config: QuicTransportConfig,
+) -> Result<Vec<u8>, QuicTransportError> {
+    let total_timeout = request_body_transfer_timeout(body_len, config.stream_timeout);
+    let mut total_deadline = Box::pin(time::sleep(total_timeout));
+    let mut idle_deadline = Box::pin(time::sleep(config.stream_timeout));
+    let mut body = vec![0_u8; body_len];
+    let mut trailing = [0_u8; 1];
+    let mut read = 0_usize;
+    loop {
+        let checking_eof = read == body.len();
+        let buffer = if checking_eof { &mut trailing[..] } else { &mut body[read..] };
+        let progress = tokio::select! {
+            biased;
+            () = &mut total_deadline => {
+                return Err(QuicTransportError::Timeout {
+                    operation: "QUIC inbound request body total",
+                });
+            }
+            () = &mut idle_deadline => {
+                return Err(QuicTransportError::Timeout {
+                    operation: "QUIC inbound request body idle",
+                });
+            }
+            result = receive.read(buffer) => result,
+        };
+        let progress = match progress {
+            Ok(progress) => progress,
+            Err(error) if checking_eof => {
+                return Err(QuicTransportError::ReadToEnd(quinn::ReadToEndError::Read(error)));
+            }
+            Err(error) => {
+                return Err(QuicTransportError::Read(quinn::ReadExactError::ReadError(error)));
+            }
+        };
+        let Some(progress) = progress else {
+            if checking_eof {
+                return Ok(body);
+            }
+            return Err(QuicTransportError::Read(quinn::ReadExactError::FinishedEarly(read)));
+        };
+        if checking_eof {
+            return Err(QuicTransportError::ReadToEnd(quinn::ReadToEndError::TooLong));
+        }
+        if progress == 0 {
+            continue;
+        }
+        read += progress;
+        idle_deadline.as_mut().reset(time::Instant::now() + config.stream_timeout);
+    }
+}
+
 async fn require_eof(receive: &mut quinn::RecvStream) -> Result<(), QuicTransportError> {
     let trailing = receive.read_to_end(0).await?;
     debug_assert!(trailing.is_empty());
@@ -1071,15 +1720,7 @@ fn validate_request(
     config: QuicTransportConfig,
 ) -> Result<(), QuicTransportError> {
     let actual = request.body_len();
-    let maximum = match request {
-        PeerRequest::KeyRotation { operation, .. } => {
-            config.max_body_bytes.min(operation.max_body_bytes())
-        }
-        PeerRequest::Avss { .. }
-        | PeerRequest::Qual { .. }
-        | PeerRequest::Epoch { .. }
-        | PeerRequest::Deposit { .. } => config.max_body_bytes,
-    };
+    let maximum = request.route().maximum_body_bytes(config);
     if actual > maximum {
         return Err(QuicTransportError::BodyTooLarge { actual, maximum });
     }
@@ -1112,11 +1753,45 @@ fn validate_response(
     }
 }
 
-fn validate_request_frame(
-    frame: &RequestFrame,
+fn validate_request_prelude(
+    prelude: &RequestPrelude,
     authenticated_peer: PartyId,
     local_party: PartyId,
     network_id: [u8; 32],
+    config: QuicTransportConfig,
+) -> Result<(), QuicTransportError> {
+    if prelude.version != WIRE_VERSION {
+        return Err(QuicTransportError::UnsupportedVersion(prelude.version));
+    }
+    if prelude.network_id != network_id {
+        return Err(QuicTransportError::WrongNetwork);
+    }
+    if prelude.from != authenticated_peer {
+        return Err(QuicTransportError::WrongSender {
+            expected: authenticated_peer,
+            actual: prelude.from,
+        });
+    }
+    if prelude.to != local_party {
+        return Err(QuicTransportError::WrongRecipient {
+            expected: local_party,
+            actual: prelude.to,
+        });
+    }
+    let actual = prelude.body_len as usize;
+    let maximum = prelude.route.maximum_body_bytes(config);
+    if actual > maximum {
+        return Err(QuicTransportError::BodyTooLarge { actual, maximum });
+    }
+    Ok(())
+}
+
+fn validate_request_admission_frame(
+    frame: &RequestAdmissionFrame,
+    request_id: RequestId,
+    network_id: [u8; 32],
+    authenticated_peer: PartyId,
+    local_party: PartyId,
     config: QuicTransportConfig,
 ) -> Result<(), QuicTransportError> {
     if frame.version != WIRE_VERSION {
@@ -1124,6 +1799,9 @@ fn validate_request_frame(
     }
     if frame.network_id != network_id {
         return Err(QuicTransportError::WrongNetwork);
+    }
+    if frame.request_id != request_id {
+        return Err(QuicTransportError::WrongRequestId);
     }
     if frame.from != authenticated_peer {
         return Err(QuicTransportError::WrongSender {
@@ -1134,11 +1812,11 @@ fn validate_request_frame(
     if frame.to != local_party {
         return Err(QuicTransportError::WrongRecipient { expected: local_party, actual: frame.to });
     }
-    validate_request(&frame.request, config)?;
-    if frame.request_id
-        != RequestId::for_peer_request(network_id, frame.from, frame.to, &frame.request)?
-    {
-        return Err(QuicTransportError::WrongRequestId);
+    if let RequestAdmission::Rejected(response) = &frame.admission {
+        if !matches!(response, PeerResponse::Rejected { .. }) {
+            return Err(QuicTransportError::InvalidRequestAdmission);
+        }
+        validate_response(response, config)?;
     }
     Ok(())
 }
@@ -1249,6 +1927,21 @@ mod tests {
         }
     }
 
+    fn materialized_request_id(
+        network_id: [u8; 32],
+        from: PartyId,
+        to: PartyId,
+        request: &PeerRequest,
+    ) -> RequestId {
+        let encoded = postcard::to_allocvec(request).unwrap();
+        let mut material = Vec::with_capacity(12 + encoded.len());
+        material.extend_from_slice(&from.0.to_le_bytes());
+        material.extend_from_slice(&to.0.to_le_bytes());
+        material.extend_from_slice(&u64::try_from(encoded.len()).unwrap().to_le_bytes());
+        material.extend_from_slice(&encoded);
+        RequestId::derive(network_id, b"canonical-authenticated-peer-request/v8", &material)
+    }
+
     #[test]
     fn request_ids_are_domain_separated() {
         let first = RequestId::derive(TEST_NETWORK, b"avss", b"same material");
@@ -1260,14 +1953,44 @@ mod tests {
     }
 
     #[test]
-    fn current_transport_contract_is_v4_and_request_ids_do_not_alias_v3() {
-        assert_eq!(WIRE_VERSION, 4);
-        assert_eq!(ALPN, b"threshold-monero-peer/4");
+    fn streaming_request_ids_equal_the_reference_materialized_derivation() {
+        let requests = [
+            PeerRequest::Avss { operation: AvssOperation::Deliver, body: vec![] },
+            PeerRequest::Qual { operation: QualOperation::Deliver, body: vec![0x11] },
+            PeerRequest::Epoch { operation: EpochOperation::History, body: vec![0x22; 127] },
+            PeerRequest::Deposit {
+                operation: DepositOperation::DepositObservation,
+                body: vec![0x33; 128],
+            },
+            PeerRequest::Deposit {
+                operation: DepositOperation::Consolidation,
+                body: vec![0x44; 16_384],
+            },
+            PeerRequest::KeyRotation {
+                operation: KeyRotationOperation::ViewCertificate,
+                body: vec![0x55; 52_591],
+            },
+        ];
+        for request in requests {
+            assert_eq!(
+                RequestId::for_peer_request(TEST_NETWORK, PartyId(9), PartyId(10), &request,)
+                    .unwrap(),
+                materialized_request_id(TEST_NETWORK, PartyId(9), PartyId(10), &request),
+            );
+        }
+    }
+
+    #[test]
+    fn current_transport_contract_is_v8_and_request_ids_do_not_alias_v7() {
+        assert_eq!(WIRE_VERSION, 8);
+        assert_eq!(ALPN, b"threshold-monero-peer/8");
 
         let from = PartyId(1);
         let to = PartyId(2);
-        let request =
-            PeerRequest::Deposit { operation: DepositOperation::DepositObservation, body: vec![7] };
+        let request = PeerRequest::Deposit {
+            operation: DepositOperation::DepositObservation,
+            body: vec![8; 52_591],
+        };
         let encoded = postcard::to_allocvec(&request).unwrap();
         let mut material = Vec::with_capacity(12 + encoded.len());
         material.extend_from_slice(&from.0.to_le_bytes());
@@ -1278,12 +2001,205 @@ mod tests {
         let current = RequestId::for_peer_request(TEST_NETWORK, from, to, &request).unwrap();
         assert_eq!(
             current,
-            RequestId::derive(TEST_NETWORK, b"canonical-authenticated-peer-request/v4", &material,)
+            RequestId::derive(TEST_NETWORK, b"canonical-authenticated-peer-request/v8", &material,)
         );
         assert_ne!(
             current,
-            RequestId::derive(TEST_NETWORK, b"canonical-authenticated-peer-request/v3", &material,)
+            RequestId::derive(TEST_NETWORK, b"canonical-authenticated-peer-request/v7", &material,)
         );
+    }
+
+    #[test]
+    fn sync_control_routes_have_exact_pre_body_caps_and_distinct_authority() {
+        let config = QuicTransportConfig::default();
+        let head = PeerRequestRoute::Deposit(DepositOperation::SyncHead);
+        let release = PeerRequestRoute::Deposit(DepositOperation::SyncRelease);
+        assert!(head.is_deposit_sync_control());
+        assert!(release.is_deposit_sync_control());
+        assert!(head.is_deposit_sync_state_read());
+        assert!(
+            !release.is_deposit_sync_state_read(),
+            "the exact lease MAC, not current-committee membership, authorizes release",
+        );
+
+        for (operation, maximum) in [
+            (DepositOperation::SyncHead, MAX_DEPOSIT_SYNC_HEAD_REQUEST_BYTES),
+            (DepositOperation::SyncRelease, MAX_DEPOSIT_SYNC_RELEASE_REQUEST_BYTES),
+        ] {
+            let route = PeerRequestRoute::Deposit(operation);
+            assert_eq!(route.maximum_body_bytes(config), maximum);
+
+            let request = PeerRequest::Deposit { operation, body: vec![0x5a; maximum] };
+            validate_request(&request, config).unwrap();
+            let mut prelude = RequestPrelude {
+                version: WIRE_VERSION,
+                network_id: TEST_NETWORK,
+                request_id: RequestId::for_peer_request(
+                    TEST_NETWORK,
+                    PartyId(1),
+                    PartyId(2),
+                    &request,
+                )
+                .unwrap(),
+                from: PartyId(1),
+                to: PartyId(2),
+                route,
+                body_len: u32::try_from(maximum).unwrap(),
+            };
+            validate_request_prelude(&prelude, PartyId(1), PartyId(2), TEST_NETWORK, config)
+                .unwrap();
+
+            prelude.body_len = u32::try_from(maximum + 1).unwrap();
+            assert!(matches!(
+                validate_request_prelude(
+                    &prelude,
+                    PartyId(1),
+                    PartyId(2),
+                    TEST_NETWORK,
+                    config,
+                ),
+                Err(QuicTransportError::BodyTooLarge { actual, maximum: rejected_maximum })
+                    if actual == maximum + 1 && rejected_maximum == maximum
+            ));
+
+            let oversized = PeerRequest::Deposit { operation, body: vec![0; maximum + 1] };
+            assert!(matches!(
+                validate_request(&oversized, config),
+                Err(QuicTransportError::BodyTooLarge { actual, maximum: rejected_maximum })
+                    if actual == maximum + 1 && rejected_maximum == maximum
+            ));
+        }
+    }
+
+    #[test]
+    fn v8_reserves_distinct_typed_prefix_and_handoff_routes_with_exact_caps() {
+        let routes = [
+            DepositOperation::PrefixSupportStart,
+            DepositOperation::PrefixSupportContinue,
+            DepositOperation::PostHandoffExportSealRequest,
+            DepositOperation::PostHandoffExportSealVote,
+            DepositOperation::PostHandoffExportSealCertificate,
+            DepositOperation::ExportHead,
+            DepositOperation::ExportObjects,
+            DepositOperation::ExportRelease,
+            DepositOperation::StateImportedAck,
+            DepositOperation::StateImportedCertificate,
+        ];
+        let tags = routes
+            .into_iter()
+            .map(|route| postcard::to_allocvec(&route).unwrap())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(tags.len(), routes.len());
+
+        let start = PeerRequestRoute::Deposit(DepositOperation::PrefixSupportStart);
+        let continuation = PeerRequestRoute::Deposit(DepositOperation::PrefixSupportContinue);
+        let export_objects = PeerRequestRoute::Deposit(DepositOperation::ExportObjects);
+        assert!(start.is_deposit_prefix_support_scan());
+        assert!(continuation.is_deposit_prefix_support_scan());
+        assert!(start.is_deposit_sync_state_read());
+        assert!(continuation.is_deposit_sync_state_read());
+        assert!(export_objects.is_deposit_object_read());
+        assert!(!export_objects.is_deposit_sync_objects());
+        assert!(!export_objects.is_deposit_sync_state_read());
+
+        let config = QuicTransportConfig::default();
+        assert_eq!(start.maximum_body_bytes(config), MAX_DEPOSIT_PREFIX_SUPPORT_START_WIRE_BYTES);
+        assert_eq!(
+            continuation.maximum_body_bytes(config),
+            MAX_DEPOSIT_PREFIX_SUPPORT_CONTINUE_WIRE_BYTES
+        );
+        for (operation, expected) in [
+            (
+                DepositOperation::PostHandoffExportSealRequest,
+                MAX_POST_HANDOFF_EXPORT_SEAL_REQUEST_BYTES,
+            ),
+            (DepositOperation::PostHandoffExportSealVote, MAX_POST_HANDOFF_EXPORT_SEAL_VOTE_BYTES),
+            (
+                DepositOperation::PostHandoffExportSealCertificate,
+                MAX_POST_HANDOFF_EXPORT_SEAL_CERTIFICATE_DELIVERY_BYTES,
+            ),
+            (DepositOperation::ExportHead, MAX_DEPOSIT_STATE_EXPORT_HEAD_REQUEST_BYTES),
+            (DepositOperation::ExportObjects, MAX_DEPOSIT_STATE_EXPORT_OBJECTS_REQUEST_BYTES),
+            (DepositOperation::ExportRelease, MAX_DEPOSIT_STATE_EXPORT_RELEASE_REQUEST_BYTES),
+            (DepositOperation::StateImportedAck, MAX_DEPOSIT_STATE_IMPORTED_ACK_DELIVERY_BYTES),
+            (
+                DepositOperation::StateImportedCertificate,
+                MAX_DEPOSIT_STATE_IMPORTED_CERTIFICATE_DELIVERY_BYTES,
+            ),
+        ] {
+            assert_eq!(
+                PeerRequestRoute::Deposit(operation).maximum_body_bytes(config),
+                expected,
+                "{operation:?} must use its typed v8 decoder limit",
+            );
+            assert!(expected <= HARD_MAX_BODY_BYTES);
+        }
+        assert!(
+            MAX_POST_HANDOFF_EXPORT_SEAL_REQUEST_BYTES
+                > MAX_POST_HANDOFF_EXPORT_CANDIDATE_EVIDENCE_BYTES,
+            "the typed request cap must include its candidate plus authenticated request framing"
+        );
+
+        assert!(
+            DepositOperation::PostHandoffExportSealRequest.causal_priority()
+                < DepositOperation::PostHandoffExportSealVote.causal_priority()
+        );
+        assert!(
+            DepositOperation::PostHandoffExportSealVote.causal_priority()
+                < DepositOperation::PostHandoffExportSealCertificate.causal_priority()
+        );
+        assert!(
+            DepositOperation::PostHandoffExportSealCertificate.causal_priority()
+                < DepositOperation::ExportHead.causal_priority()
+        );
+        assert!(
+            DepositOperation::ExportRelease.causal_priority()
+                < DepositOperation::StateImportedCertificate.causal_priority()
+        );
+
+        let attempt =
+            crate::deposit_sync_support::DepositSyncPrefixSupportAttempt::from_bytes([0x71; 32])
+                .unwrap();
+        let first_body =
+            crate::deposit_sync_support::DepositSyncPrefixSupportContinue::new(attempt, 1)
+                .unwrap()
+                .to_bytes()
+                .unwrap();
+        let next_body =
+            crate::deposit_sync_support::DepositSyncPrefixSupportContinue::new(attempt, 2)
+                .unwrap()
+                .to_bytes()
+                .unwrap();
+        let first = PeerRequest::Deposit {
+            operation: DepositOperation::PrefixSupportContinue,
+            body: first_body,
+        };
+        let next = PeerRequest::Deposit {
+            operation: DepositOperation::PrefixSupportContinue,
+            body: next_body,
+        };
+        assert_ne!(
+            RequestId::for_peer_request(TEST_NETWORK, PartyId(1), PartyId(2), &first).unwrap(),
+            RequestId::for_peer_request(TEST_NETWORK, PartyId(1), PartyId(2), &next).unwrap(),
+            "each persisted scan revision must bypass the prior Pending response-cache entry"
+        );
+    }
+
+    #[test]
+    fn only_connection_loss_errors_invalidate_a_multiplexed_connection() {
+        let stream_timeout = QuicTransportError::Timeout { operation: "QUIC request stream" };
+        let stream_reset = QuicTransportError::Read(quinn::ReadExactError::ReadError(
+            quinn::ReadError::Reset(VarInt::from_u32(7)),
+        ));
+        let connection_loss = QuicTransportError::Connection(quinn::ConnectionError::LocallyClosed);
+        let nested_connection_loss = QuicTransportError::Write(quinn::WriteError::ConnectionLost(
+            quinn::ConnectionError::Reset,
+        ));
+
+        assert!(!stream_timeout.is_connection_lost());
+        assert!(!stream_reset.is_connection_lost());
+        assert!(connection_loss.is_connection_lost());
+        assert!(nested_connection_loss.is_connection_lost());
     }
 
     #[test]
@@ -1422,13 +2338,18 @@ mod tests {
     #[test]
     fn key_rotation_routes_are_causally_ordered_and_independently_bounded() {
         assert_eq!(KeyRotationOperation::Advertisement.causal_priority(), 0);
-        assert_eq!(KeyRotationOperation::Consensus.causal_priority(), 1);
-        assert_eq!(KeyRotationOperation::ViewCertificate.causal_priority(), 2);
-        assert_eq!(KeyRotationOperation::Certificate.causal_priority(), 3);
+        assert_eq!(KeyRotationOperation::FallbackVote.causal_priority(), 1);
+        assert_eq!(KeyRotationOperation::Consensus.causal_priority(), 2);
+        assert_eq!(KeyRotationOperation::ViewCertificate.causal_priority(), 3);
+        assert_eq!(KeyRotationOperation::Certificate.causal_priority(), 4);
 
         assert_eq!(
             KeyRotationOperation::Advertisement.max_body_bytes(),
             MAX_KEY_ROTATION_ADVERTISEMENT_WIRE_BYTES
+        );
+        assert_eq!(
+            KeyRotationOperation::FallbackVote.max_body_bytes(),
+            MAX_KEY_ROTATION_FALLBACK_VOTE_WIRE_BYTES
         );
         assert_eq!(
             KeyRotationOperation::Consensus.max_body_bytes(),
@@ -1443,6 +2364,7 @@ mod tests {
             MAX_KEY_ROTATION_CERTIFICATE_WIRE_BYTES
         );
         assert!(MAX_KEY_ROTATION_ADVERTISEMENT_WIRE_BYTES < HARD_MAX_BODY_BYTES);
+        assert!(MAX_KEY_ROTATION_FALLBACK_VOTE_WIRE_BYTES < HARD_MAX_BODY_BYTES);
         assert!(MAX_KEY_ROTATION_CONSENSUS_WIRE_BYTES < HARD_MAX_BODY_BYTES);
         assert_eq!(MAX_KEY_ROTATION_VIEW_CERTIFICATE_WIRE_BYTES, HARD_MAX_BODY_BYTES);
         assert!(MAX_KEY_ROTATION_CERTIFICATE_WIRE_BYTES < HARD_MAX_BODY_BYTES);
@@ -1473,6 +2395,23 @@ mod tests {
         assert!(matches!(
             KeyRotationOperation::Consensus.encode_wire(&wire),
             Err(QuicTransportError::WrongKeyRotationOperation { .. })
+        ));
+
+        let fallback = KeyRotationWire::FallbackVote(key_rotation_envelope(32));
+        let fallback_request = PeerRequest::key_rotation(&fallback).unwrap();
+        let PeerRequest::KeyRotation { operation: fallback_operation, body: fallback_body } =
+            fallback_request
+        else {
+            panic!("key-rotation constructor returned another request family");
+        };
+        assert_eq!(fallback_operation, KeyRotationOperation::FallbackVote);
+        assert_eq!(fallback_operation.decode_wire(&fallback_body).unwrap(), fallback);
+        assert!(matches!(
+            KeyRotationOperation::Advertisement.decode_wire(&fallback_body),
+            Err(QuicTransportError::WrongKeyRotationOperation {
+                routed: KeyRotationOperation::Advertisement,
+                encoded: KeyRotationOperation::FallbackVote,
+            })
         ));
 
         let mut trailing = body.clone();
@@ -1575,16 +2514,21 @@ mod tests {
             body: vec![0x5a; config.max_body_bytes],
         };
         validate_request(&request, config).unwrap();
-        let frame = RequestFrame {
+        let prelude = RequestPrelude {
             version: WIRE_VERSION,
             network_id: TEST_NETWORK,
             request_id: RequestId::for_peer_request(TEST_NETWORK, PartyId(1), PartyId(2), &request)
                 .unwrap(),
             from: PartyId(1),
             to: PartyId(2),
-            request,
+            route: request.route(),
+            body_len: u32::try_from(request.body_len()).unwrap(),
         };
-        assert!(postcard::to_allocvec(&frame).unwrap().len() <= config.max_frame_bytes);
+        assert!(postcard::to_allocvec(&prelude).unwrap().len() <= MAX_REQUEST_PRELUDE_FRAME_BYTES);
+        assert!(
+            INITIAL_STREAM_RECEIVE_WINDOW_BYTES * (config.max_concurrent_bidi_streams as usize)
+                < config.max_frame_bytes * config.max_concurrent_bidi_streams as usize
+        );
 
         let oversized = PeerRequest::Deposit {
             operation: DepositOperation::Consolidation,
@@ -1598,49 +2542,49 @@ mod tests {
     }
 
     #[test]
-    fn authenticated_party_and_request_id_are_bound_to_frames() {
+    fn authenticated_party_route_and_admission_are_bound_to_preludes() {
         let config = QuicTransportConfig::default();
         let body = PeerRequest::Qual { operation: QualOperation::Deliver, body: vec![] };
-        let request = RequestFrame {
+        let request = RequestPrelude {
             version: WIRE_VERSION,
             network_id: TEST_NETWORK,
             request_id: RequestId::for_peer_request(TEST_NETWORK, PartyId(1), PartyId(2), &body)
                 .unwrap(),
             from: PartyId(1),
             to: PartyId(2),
-            request: body,
+            route: body.route(),
+            body_len: u32::try_from(body.body_len()).unwrap(),
         };
-        validate_request_frame(&request, PartyId(1), PartyId(2), TEST_NETWORK, config).unwrap();
+        validate_request_prelude(&request, PartyId(1), PartyId(2), TEST_NETWORK, config).unwrap();
         let mut equivocation = request.clone();
-        equivocation.request =
-            PeerRequest::Qual { operation: QualOperation::Deliver, body: vec![0x01] };
+        equivocation.body_len = u32::try_from(config.max_body_bytes + 1).unwrap();
         assert!(matches!(
-            validate_request_frame(&equivocation, PartyId(1), PartyId(2), TEST_NETWORK, config,),
-            Err(QuicTransportError::WrongRequestId)
+            validate_request_prelude(&equivocation, PartyId(1), PartyId(2), TEST_NETWORK, config,),
+            Err(QuicTransportError::BodyTooLarge { .. })
         ));
         assert!(matches!(
-            validate_request_frame(&request, PartyId(3), PartyId(2), TEST_NETWORK, config),
+            validate_request_prelude(&request, PartyId(3), PartyId(2), TEST_NETWORK, config),
             Err(QuicTransportError::WrongSender { .. })
         ));
         assert!(matches!(
-            validate_request_frame(&request, PartyId(1), PartyId(2), [0x44; 32], config),
+            validate_request_prelude(&request, PartyId(1), PartyId(2), [0x44; 32], config),
             Err(QuicTransportError::WrongNetwork)
         ));
         assert!(matches!(
-            validate_request_frame(&request, PartyId(1), PartyId(3), TEST_NETWORK, config),
+            validate_request_prelude(&request, PartyId(1), PartyId(3), TEST_NETWORK, config),
             Err(QuicTransportError::WrongRecipient { .. })
         ));
 
-        let response = ResponseFrame {
+        let response = RequestAdmissionFrame {
             version: WIRE_VERSION,
             network_id: TEST_NETWORK,
             request_id: RequestId::from_bytes([2; 32]),
             from: PartyId(2),
             to: PartyId(1),
-            response: PeerResponse::Success { body: vec![] },
+            admission: RequestAdmission::Accepted,
         };
         assert!(matches!(
-            validate_response_frame(
+            validate_request_admission_frame(
                 &response,
                 RequestId::from_bytes([3; 32]),
                 TEST_NETWORK,
@@ -1650,7 +2594,7 @@ mod tests {
             ),
             Err(QuicTransportError::WrongRequestId)
         ));
-        validate_response_frame(
+        validate_request_admission_frame(
             &response,
             RequestId::from_bytes([2; 32]),
             TEST_NETWORK,
@@ -1660,7 +2604,7 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(
-            validate_response_frame(
+            validate_request_admission_frame(
                 &response,
                 RequestId::from_bytes([2; 32]),
                 TEST_NETWORK,
@@ -1671,7 +2615,7 @@ mod tests {
             Err(QuicTransportError::WrongSender { .. })
         ));
         assert!(matches!(
-            validate_response_frame(
+            validate_request_admission_frame(
                 &response,
                 RequestId::from_bytes([2; 32]),
                 TEST_NETWORK,
@@ -1716,35 +2660,38 @@ mod tests {
         assert!(server.connection.max_datagram_size().is_none());
 
         let (mut send, _receive) = client.connection.open_bi().await.unwrap();
-        let oversized = u32::try_from(loopback_config().max_frame_bytes + 1).unwrap();
+        let oversized = u32::try_from(MAX_REQUEST_PRELUDE_FRAME_BYTES + 1).unwrap();
         send.write_all(&oversized.to_be_bytes()).await.unwrap();
         send.finish().unwrap();
         assert!(matches!(
             server.accept_request().await,
             Err(QuicTransportError::FrameTooLarge { actual, maximum })
-                if actual == loopback_config().max_frame_bytes + 1
-                    && maximum == loopback_config().max_frame_bytes
+                if actual == MAX_REQUEST_PRELUDE_FRAME_BYTES + 1
+                    && maximum == MAX_REQUEST_PRELUDE_FRAME_BYTES
         ));
 
-        let frame = RequestFrame {
+        let body =
+            PeerRequest::Epoch { operation: EpochOperation::Activate, body: b"bounded".to_vec() };
+        let frame = RequestPrelude {
             version: WIRE_VERSION,
             network_id: TEST_NETWORK,
-            request_id: RequestId::from_bytes([7; 32]),
+            request_id: RequestId::for_peer_request(TEST_NETWORK, PartyId(1), PartyId(2), &body)
+                .unwrap(),
             from: PartyId(1),
             to: PartyId(2),
-            request: PeerRequest::Epoch {
-                operation: EpochOperation::Activate,
-                body: b"bounded".to_vec(),
-            },
+            route: body.route(),
+            body_len: u32::try_from(body.body_len()).unwrap(),
         };
         let encoded = postcard::to_allocvec(&frame).unwrap();
         let (mut send, _receive) = client.connection.open_bi().await.unwrap();
         send.write_all(&u32::try_from(encoded.len()).unwrap().to_be_bytes()).await.unwrap();
         send.write_all(&encoded).await.unwrap();
+        send.write_all(b"bounded").await.unwrap();
         send.write_all(b"trailing").await.unwrap();
         send.finish().unwrap();
+        let incoming = server.accept_request().await.unwrap();
         assert!(matches!(
-            server.accept_request().await,
+            incoming.read_request().await,
             Err(QuicTransportError::ReadToEnd(quinn::ReadToEndError::TooLong))
         ));
 
@@ -1771,6 +2718,182 @@ mod tests {
             client.request(RequestId::from_bytes([8; 32]), oversized_request).await,
             Err(QuicTransportError::BodyTooLarge { .. })
         ));
+
+        client.close(b"test complete");
+        endpoint_one.close(b"test complete");
+        endpoint_two.close(b"test complete");
+    }
+
+    #[tokio::test]
+    async fn rejected_sync_objects_body_is_never_transmitted_or_decoded_and_retry_succeeds() {
+        let one = TestIdentity::generate(PartyId(1));
+        let two = TestIdentity::generate(PartyId(2));
+        let endpoint_two = QuicPeerEndpoint::bind(
+            "127.0.0.1:0".parse().unwrap(),
+            PartyId(2),
+            TEST_NETWORK,
+            two.local(),
+            [one.pin(PartyId(1))],
+            QuicTransportConfig::default(),
+        )
+        .unwrap();
+        let two_addr = endpoint_two.local_addr().unwrap();
+        let endpoint_one = QuicPeerEndpoint::bind(
+            "127.0.0.1:0".parse().unwrap(),
+            PartyId(1),
+            TEST_NETWORK,
+            one.local(),
+            [two.pin(PartyId(2))],
+            QuicTransportConfig::default(),
+        )
+        .unwrap();
+        let (client, server) =
+            tokio::join!(endpoint_one.connect(PartyId(2), two_addr), endpoint_two.accept());
+        let client = client.unwrap();
+        let server = server.unwrap();
+
+        let request = PeerRequest::Deposit {
+            operation: DepositOperation::SyncObjects,
+            body: vec![0x51; HARD_MAX_BODY_BYTES],
+        };
+        let request_id =
+            RequestId::for_peer_request(TEST_NETWORK, PartyId(1), PartyId(2), &request).unwrap();
+        let first_client = client.clone();
+        let first_timeout = first_client.config.stream_timeout;
+        let first_task = tokio::spawn(async move {
+            first_client.request_with_timeout_outcome(request_id, request, first_timeout).await
+        });
+        let first_prelude = server.accept_request().await.unwrap();
+        assert!(first_prelude.is_deposit_sync_objects());
+        assert_eq!(first_prelude.body_len(), HARD_MAX_BODY_BYTES);
+        let first_request = first_prelude.read_request().await.unwrap();
+
+        let retry_request = PeerRequest::Deposit {
+            operation: DepositOperation::SyncObjects,
+            body: vec![0x52; HARD_MAX_BODY_BYTES],
+        };
+        let retry_id =
+            RequestId::for_peer_request(TEST_NETWORK, PartyId(1), PartyId(2), &retry_request)
+                .unwrap();
+        let retry_client = client.clone();
+        let retry_timeout = retry_client.config.stream_timeout;
+        let retry = tokio::spawn(async move {
+            retry_client.request_with_timeout_outcome(retry_id, retry_request, retry_timeout).await
+        });
+        let mut rejected = server.accept_request().await.unwrap();
+        assert!(rejected.is_deposit_sync_objects());
+        assert_eq!(rejected.body_len(), HARD_MAX_BODY_BYTES);
+        let mut body_probe = [0_u8; 1];
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(50),
+                rejected.receive.read(&mut body_probe),
+            )
+            .await
+            .is_err(),
+            "a conforming sender must await pre-body admission before transmitting any body byte",
+        );
+        let exhausted = PeerResponse::Rejected {
+            code: RejectionCode::ResourceExhausted,
+            retryable: true,
+            message: "test SyncObjects capacity is saturated".to_owned(),
+        };
+        rejected.reject_before_body(exhausted.clone()).await.unwrap();
+        let (retry_response, retry_provenance) = retry.await.unwrap().unwrap().into_parts();
+        assert_eq!(retry_response, exhausted);
+        assert_eq!(retry_provenance, QuicResponseProvenance::RejectedBeforeBody);
+
+        first_request.respond(PeerResponse::Success { body: vec![] }).await.unwrap();
+        let (first_response, first_provenance) = first_task.await.unwrap().unwrap().into_parts();
+        assert_eq!(first_response, PeerResponse::Success { body: vec![] });
+        assert_eq!(first_provenance, QuicResponseProvenance::AfterBody);
+
+        let retry_request = PeerRequest::Deposit {
+            operation: DepositOperation::SyncObjects,
+            body: vec![0x52; HARD_MAX_BODY_BYTES],
+        };
+        assert_eq!(
+            RequestId::for_peer_request(TEST_NETWORK, PartyId(1), PartyId(2), &retry_request)
+                .unwrap(),
+            retry_id,
+        );
+        let retry_client = client.clone();
+        let retry =
+            tokio::spawn(async move { retry_client.request(retry_id, retry_request).await });
+        let retry_request = server.accept_request().await.unwrap().read_request().await.unwrap();
+        retry_request.respond(PeerResponse::Success { body: vec![] }).await.unwrap();
+        assert_eq!(retry.await.unwrap().unwrap(), PeerResponse::Success { body: vec![] });
+
+        client.close(b"test complete");
+        endpoint_one.close(b"test complete");
+        endpoint_two.close(b"test complete");
+    }
+
+    #[tokio::test]
+    async fn caller_deadline_allows_a_slow_reducer_without_poisoning_the_connection() {
+        let one = TestIdentity::generate(PartyId(1));
+        let two = TestIdentity::generate(PartyId(2));
+        let mut config = loopback_config();
+        config.stream_timeout = Duration::from_millis(100);
+        let endpoint_two = QuicPeerEndpoint::bind(
+            "127.0.0.1:0".parse().unwrap(),
+            PartyId(2),
+            TEST_NETWORK,
+            two.local(),
+            [one.pin(PartyId(1))],
+            config,
+        )
+        .unwrap();
+        let two_addr = endpoint_two.local_addr().unwrap();
+        let endpoint_one = QuicPeerEndpoint::bind(
+            "127.0.0.1:0".parse().unwrap(),
+            PartyId(1),
+            TEST_NETWORK,
+            one.local(),
+            [two.pin(PartyId(2))],
+            config,
+        )
+        .unwrap();
+
+        let (client, server) =
+            tokio::join!(endpoint_one.connect(PartyId(2), two_addr), endpoint_two.accept());
+        let client = client.unwrap();
+        let server = server.unwrap();
+
+        let slow_request =
+            PeerRequest::Avss { operation: AvssOperation::Deliver, body: b"slow".to_vec() };
+        let slow_request_id =
+            RequestId::for_peer_request(TEST_NETWORK, PartyId(1), PartyId(2), &slow_request)
+                .unwrap();
+        let slow_client = client.clone();
+        let slow_task = tokio::spawn(async move {
+            slow_client
+                .request_with_timeout(slow_request_id, slow_request, Duration::from_secs(2))
+                .await
+        });
+        let incoming = server.accept_request().await.unwrap().read_request().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        let slow_response = PeerResponse::Success { body: b"durable".to_vec() };
+        incoming.respond(slow_response.clone()).await.unwrap();
+        assert_eq!(slow_task.await.unwrap().unwrap(), slow_response);
+
+        // A slow reducer response is scoped to its request stream. The authenticated,
+        // multiplexed connection must remain usable for the next RPC.
+        let next_request =
+            PeerRequest::Qual { operation: QualOperation::Deliver, body: b"next".to_vec() };
+        let next_request_id =
+            RequestId::for_peer_request(TEST_NETWORK, PartyId(1), PartyId(2), &next_request)
+                .unwrap();
+        let next_client = client.clone();
+        let next_task = tokio::spawn(async move {
+            next_client
+                .request_with_timeout(next_request_id, next_request, Duration::from_secs(1))
+                .await
+        });
+        let incoming = server.accept_request().await.unwrap().read_request().await.unwrap();
+        let next_response = PeerResponse::Success { body: b"ready".to_vec() };
+        incoming.respond(next_response.clone()).await.unwrap();
+        assert_eq!(next_task.await.unwrap().unwrap(), next_response);
 
         client.close(b"test complete");
         endpoint_one.close(b"test complete");
@@ -1815,6 +2938,267 @@ mod tests {
             server.accept_request().await,
             Err(QuicTransportError::Timeout { operation: "QUIC inbound request" })
         ));
+
+        client.close(b"test complete");
+        endpoint_one.close(b"test complete");
+        endpoint_two.close(b"test complete");
+    }
+
+    #[test]
+    fn request_body_transfer_budget_scales_and_caps_at_the_hard_maximum() {
+        let idle_timeout = Duration::from_secs(10);
+        assert_eq!(request_body_transfer_timeout(64 * 1024, idle_timeout), Duration::from_secs(11));
+        assert_eq!(
+            request_body_transfer_timeout(4 * 1024 * 1024, idle_timeout),
+            Duration::from_secs(74)
+        );
+        assert_eq!(
+            request_body_transfer_timeout(HARD_MAX_BODY_BYTES, idle_timeout),
+            MAX_REQUEST_BODY_TRANSFER_TIMEOUT
+        );
+    }
+
+    #[tokio::test]
+    async fn max_sized_stalled_body_is_idle_bounded_without_blocking_concurrent_streams() {
+        let one = TestIdentity::generate(PartyId(1));
+        let two = TestIdentity::generate(PartyId(2));
+        let mut config = loopback_config();
+        config.max_body_bytes = HARD_MAX_BODY_BYTES;
+        config.max_frame_bytes = 9 * 1024 * 1024;
+        config.stream_timeout = Duration::from_millis(750);
+        let endpoint_two = QuicPeerEndpoint::bind(
+            "127.0.0.1:0".parse().unwrap(),
+            PartyId(2),
+            TEST_NETWORK,
+            two.local(),
+            [one.pin(PartyId(1))],
+            config,
+        )
+        .unwrap();
+        let two_addr = endpoint_two.local_addr().unwrap();
+        let endpoint_one = QuicPeerEndpoint::bind(
+            "127.0.0.1:0".parse().unwrap(),
+            PartyId(1),
+            TEST_NETWORK,
+            one.local(),
+            [two.pin(PartyId(2))],
+            config,
+        )
+        .unwrap();
+
+        let (client, server) =
+            tokio::join!(endpoint_one.connect(PartyId(2), two_addr), endpoint_two.accept());
+        let client = client.unwrap();
+        let server = server.unwrap();
+
+        // The request id is deliberately arbitrary: a stalled sender never reaches the
+        // post-body canonical-id check. The declared length exercises the exact hard maximum and
+        // its allocation without first materializing another 8 MiB request in the test.
+        let request_id = RequestId([0x55; 32]);
+        let prelude = RequestPrelude {
+            version: WIRE_VERSION,
+            network_id: TEST_NETWORK,
+            request_id,
+            from: PartyId(1),
+            to: PartyId(2),
+            route: PeerRequestRoute::Qual(QualOperation::Deliver),
+            body_len: u32::try_from(HARD_MAX_BODY_BYTES).unwrap(),
+        };
+        let (mut stalled_send, mut stalled_receive) = client.connection.open_bi().await.unwrap();
+        write_frame_bounded(&mut stalled_send, &prelude, MAX_REQUEST_PRELUDE_FRAME_BYTES)
+            .await
+            .unwrap();
+        let stalled_request = server.accept_request().await.unwrap();
+        let stalled_reader = tokio::spawn(stalled_request.read_request());
+        let admission: RequestAdmissionFrame =
+            read_frame_bounded(&mut stalled_receive, MAX_REQUEST_ADMISSION_FRAME_BYTES)
+                .await
+                .unwrap();
+        assert_eq!(admission.request_id, request_id);
+        assert!(matches!(admission.admission, RequestAdmission::Accepted));
+
+        // New streams on the same authenticated connection must keep making progress while the
+        // maximum-sized admitted stream is idle. This also guards the aggregate send-window
+        // change: it bounds queued bytes without serializing independent streams.
+        let mut quick_tasks = Vec::new();
+        for sequence in 0_u8..3 {
+            let quick_request =
+                PeerRequest::Qual { operation: QualOperation::Deliver, body: vec![b'q', sequence] };
+            let quick_id =
+                RequestId::for_peer_request(TEST_NETWORK, PartyId(1), PartyId(2), &quick_request)
+                    .unwrap();
+            let quick_client = client.clone();
+            quick_tasks.push(tokio::spawn(async move {
+                quick_client
+                    .request_with_timeout(quick_id, quick_request, Duration::from_secs(3))
+                    .await
+            }));
+        }
+        for sequence in 0_u8..3 {
+            let incoming = server.accept_request().await.unwrap().read_request().await.unwrap();
+            let response = PeerResponse::Success { body: vec![b'a', sequence] };
+            incoming.respond(response).await.unwrap();
+        }
+        for quick_task in quick_tasks {
+            assert!(matches!(
+                quick_task.await.unwrap().unwrap(),
+                PeerResponse::Success { body } if body.len() == 2 && body[0] == b'a'
+            ));
+        }
+
+        assert!(matches!(
+            stalled_reader.await.unwrap(),
+            Err(QuicTransportError::Timeout { operation: "QUIC inbound request body idle" })
+        ));
+        let _ = stalled_send.reset(VarInt::from_u32(0));
+
+        client.close(b"test complete");
+        endpoint_one.close(b"test complete");
+        endpoint_two.close(b"test complete");
+    }
+
+    #[tokio::test]
+    async fn request_body_succeeds_when_progress_stays_inside_idle_and_total_budgets() {
+        let one = TestIdentity::generate(PartyId(1));
+        let two = TestIdentity::generate(PartyId(2));
+        let mut config = loopback_config();
+        config.max_body_bytes = 32 * 1024;
+        config.max_frame_bytes = 64 * 1024;
+        config.stream_timeout = Duration::from_millis(500);
+        let endpoint_two = QuicPeerEndpoint::bind(
+            "127.0.0.1:0".parse().unwrap(),
+            PartyId(2),
+            TEST_NETWORK,
+            two.local(),
+            [one.pin(PartyId(1))],
+            config,
+        )
+        .unwrap();
+        let two_addr = endpoint_two.local_addr().unwrap();
+        let endpoint_one = QuicPeerEndpoint::bind(
+            "127.0.0.1:0".parse().unwrap(),
+            PartyId(1),
+            TEST_NETWORK,
+            one.local(),
+            [two.pin(PartyId(2))],
+            config,
+        )
+        .unwrap();
+
+        let (client, server) =
+            tokio::join!(endpoint_one.connect(PartyId(2), two_addr), endpoint_two.accept());
+        let client = client.unwrap();
+        let server = server.unwrap();
+        let request =
+            PeerRequest::Qual { operation: QualOperation::Deliver, body: vec![0x5a; 32 * 1024] };
+        let request_id =
+            RequestId::for_peer_request(TEST_NETWORK, PartyId(1), PartyId(2), &request).unwrap();
+        let prelude = RequestPrelude {
+            version: WIRE_VERSION,
+            network_id: TEST_NETWORK,
+            request_id,
+            from: PartyId(1),
+            to: PartyId(2),
+            route: request.route(),
+            body_len: u32::try_from(request.body_len()).unwrap(),
+        };
+        let body = request.clone().into_body();
+        let (mut send, mut receive) = client.connection.open_bi().await.unwrap();
+        write_frame_bounded(&mut send, &prelude, MAX_REQUEST_PRELUDE_FRAME_BYTES).await.unwrap();
+        let reader = tokio::spawn(server.accept_request().await.unwrap().read_request());
+        let admission: RequestAdmissionFrame =
+            read_frame_bounded(&mut receive, MAX_REQUEST_ADMISSION_FRAME_BYTES).await.unwrap();
+        assert!(matches!(admission.admission, RequestAdmission::Accepted));
+
+        for (index, chunk) in body.chunks(4 * 1024).enumerate() {
+            if index != 0 {
+                time::sleep(Duration::from_millis(60)).await;
+            }
+            send.write_all(chunk).await.unwrap();
+        }
+        send.finish().unwrap();
+        let incoming = reader.await.unwrap().unwrap();
+        assert_eq!(incoming.request(), &request);
+        let response = PeerResponse::Success { body: b"accepted".to_vec() };
+        incoming.respond(response.clone()).await.unwrap();
+        let frame: ResponseFrame = read_frame(&mut receive, config).await.unwrap();
+        assert_eq!(frame.response, response);
+        require_eof(&mut receive).await.unwrap();
+
+        client.close(b"test complete");
+        endpoint_one.close(b"test complete");
+        endpoint_two.close(b"test complete");
+    }
+
+    #[tokio::test]
+    async fn trickling_request_body_hits_the_size_scaled_total_deadline() {
+        let one = TestIdentity::generate(PartyId(1));
+        let two = TestIdentity::generate(PartyId(2));
+        let mut config = loopback_config();
+        config.max_body_bytes = 8 * 1024;
+        config.max_frame_bytes = 16 * 1024;
+        config.stream_timeout = Duration::from_millis(500);
+        let endpoint_two = QuicPeerEndpoint::bind(
+            "127.0.0.1:0".parse().unwrap(),
+            PartyId(2),
+            TEST_NETWORK,
+            two.local(),
+            [one.pin(PartyId(1))],
+            config,
+        )
+        .unwrap();
+        let two_addr = endpoint_two.local_addr().unwrap();
+        let endpoint_one = QuicPeerEndpoint::bind(
+            "127.0.0.1:0".parse().unwrap(),
+            PartyId(1),
+            TEST_NETWORK,
+            one.local(),
+            [two.pin(PartyId(2))],
+            config,
+        )
+        .unwrap();
+
+        let (client, server) =
+            tokio::join!(endpoint_one.connect(PartyId(2), two_addr), endpoint_two.accept());
+        let client = client.unwrap();
+        let server = server.unwrap();
+        let request =
+            PeerRequest::Qual { operation: QualOperation::Deliver, body: vec![0x44; 8 * 1024] };
+        let request_id =
+            RequestId::for_peer_request(TEST_NETWORK, PartyId(1), PartyId(2), &request).unwrap();
+        let prelude = RequestPrelude {
+            version: WIRE_VERSION,
+            network_id: TEST_NETWORK,
+            request_id,
+            from: PartyId(1),
+            to: PartyId(2),
+            route: request.route(),
+            body_len: u32::try_from(request.body_len()).unwrap(),
+        };
+        let (mut send, mut receive) = client.connection.open_bi().await.unwrap();
+        write_frame_bounded(&mut send, &prelude, MAX_REQUEST_PRELUDE_FRAME_BYTES).await.unwrap();
+        let reader = tokio::spawn(server.accept_request().await.unwrap().read_request());
+        let admission: RequestAdmissionFrame =
+            read_frame_bounded(&mut receive, MAX_REQUEST_ADMISSION_FRAME_BYTES).await.unwrap();
+        assert!(matches!(admission.admission, RequestAdmission::Accepted));
+
+        // Each write arrives well inside the 500 ms idle allowance, but 8 KiB receives only
+        // another 125 ms of size-scaled total budget. The absolute deadline therefore fires at
+        // roughly 625 ms even though the sender keeps resetting the idle timer.
+        let trickler = tokio::spawn(async move {
+            loop {
+                if send.write_all(&[0x44]).await.is_err() {
+                    break;
+                }
+                time::sleep(Duration::from_millis(250)).await;
+            }
+        });
+        assert!(matches!(
+            reader.await.unwrap(),
+            Err(QuicTransportError::Timeout { operation: "QUIC inbound request body total" })
+        ));
+        trickler.abort();
+        let _ = trickler.await;
 
         client.close(b"test complete");
         endpoint_one.close(b"test complete");

@@ -793,12 +793,7 @@ impl AvssParty {
     /// Returns an error without counting malformed, cross-instance, unauthenticated-role, or
     /// equivocating input.
     pub fn handle(&mut self, sender: PartyId, message: AvssMessage) -> Result<AvssStep, AvssError> {
-        self.validate_message_header(&message)?;
-        self.validate_sender_role(sender, &message.payload)?;
-        message.commitment.validate_for_threshold(self.config.receivers.threshold)?;
-        if message.commitment.digest() != message.commitment_digest {
-            return Err(AvssError::WrongCommitmentDigest);
-        }
+        self.validate_message_common(sender, &message)?;
 
         match message.payload {
             AvssPayload::DealerSend(polynomials) => self.handle_dealer_send(
@@ -822,6 +817,47 @@ impl AvssParty {
                 AvssMessageKind::Ready,
             ),
         }
+    }
+
+    /// Validate every state-independent property of one already-authenticated inbound message.
+    ///
+    /// Terminal transport retries use this before returning a no-op, when the mutable reducer that
+    /// would ordinarily perform these checks has already been compacted or destroyed.
+    pub fn validate_message(
+        &self,
+        sender: PartyId,
+        message: &AvssMessage,
+    ) -> Result<(), AvssError> {
+        self.validate_message_common(sender, message)?;
+        let local_x = scalar_for_party(&self.config.receivers, self.local_party)?;
+        match &message.payload {
+            AvssPayload::DealerSend(polynomials) => {
+                if !message.commitment.verify_polynomials(local_x, polynomials)? {
+                    return Err(AvssError::InvalidDealerPolynomials);
+                }
+            }
+            AvssPayload::Echo(values) | AvssPayload::Ready(values) => {
+                let sender_x = scalar_for_party(&self.config.receivers, sender)?;
+                if !message.commitment.verify_cross(sender_x, local_x, values)? {
+                    return Err(AvssError::InvalidCrossValues);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_message_common(
+        &self,
+        sender: PartyId,
+        message: &AvssMessage,
+    ) -> Result<(), AvssError> {
+        self.validate_message_header(message)?;
+        self.validate_sender_role(sender, &message.payload)?;
+        message.commitment.validate_for_threshold(self.config.receivers.threshold)?;
+        if message.commitment.digest() != message.commitment_digest {
+            return Err(AvssError::WrongCommitmentDigest);
+        }
+        Ok(())
     }
 
     fn validate_message_header(&self, message: &AvssMessage) -> Result<(), AvssError> {

@@ -384,7 +384,7 @@ test!(
       builder.add_payment(wallet_rpc_addr, 1_000_000);
 
       // Make 2 data that is the full 255 bytes
-      for _ in 0 .. 2 {
+      for _ in 0..2 {
         let data = vec![b'a'; MAX_ARBITRARY_DATA_SIZE];
         builder.add_data(data).unwrap();
       }

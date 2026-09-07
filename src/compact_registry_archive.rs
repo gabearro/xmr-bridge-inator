@@ -40,6 +40,7 @@ pub const MAX_COMPACT_REGISTRY_HEAD_BYTES: usize = 16 * 1024;
 pub const MAX_COMPACT_REGISTRY_LINK_BYTES: usize = 16 * 1024;
 pub const MAX_COMPACT_REGISTRY_WITNESS_BYTES: usize = 256 * 1024;
 pub const MAX_COMPACT_REGISTRY_INDEX_NODE_BYTES: usize = 2 * 1024;
+pub const MAX_COMPLETE_COMPACT_REGISTRY_GRAPH_CURSOR_BYTES: usize = 4 * 1024;
 
 /// Genesis stages one link plus 65 index nodes.  Every append additionally stages one witness.
 pub const COMPACT_REGISTRY_GENESIS_OBJECTS: usize = COMPACT_REGISTRY_INDEX_DEPTH as usize + 2;
@@ -48,6 +49,8 @@ pub const COMPACT_REGISTRY_APPEND_OBJECTS: usize = COMPACT_REGISTRY_INDEX_DEPTH 
 pub const COMPACT_REGISTRY_INDEX_OBJECT_READS: usize = COMPACT_REGISTRY_INDEX_DEPTH as usize + 1;
 
 const HEAD_DIGEST_DOMAIN: &str = "threshold-monero/compact-registry-archive-head/v2";
+const COMPLETE_GRAPH_CURSOR_VERSION: u16 = 1;
+const COMPLETE_GRAPH_FRONTIER_SLOTS: usize = COMPACT_REGISTRY_INDEX_DEPTH as usize + 1;
 
 /// Type tag included in every immutable content address.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
@@ -233,6 +236,120 @@ impl VerifiedCompactRegistryObject {
     }
 }
 
+/// Exact semantic position of one object in a compact-registry traversal.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+pub enum CompactRegistryTraversalTarget {
+    Index { reference: CompactRegistryObjectRef, depth: u8, semantic_hash: [u8; 32] },
+    Link { reference: CompactRegistryObjectRef, epoch: u64, chain_root: [u8; 32] },
+    HandoffWitness { reference: CompactRegistryObjectRef, target_epoch: u64 },
+}
+
+impl CompactRegistryTraversalTarget {
+    #[must_use]
+    pub const fn reference(self) -> CompactRegistryObjectRef {
+        match self {
+            Self::Index { reference, .. }
+            | Self::Link { reference, .. }
+            | Self::HandoffWitness { reference, .. } => reference,
+        }
+    }
+}
+
+/// Authenticate one compact-registry object at an exact semantic position and derive only its
+/// exact successor positions.
+pub fn verify_compact_registry_traversal_object(
+    target: CompactRegistryTraversalTarget,
+    contents: &[u8],
+) -> Result<Vec<CompactRegistryTraversalTarget>, CompactRegistryArchiveError> {
+    let reference = target.reference();
+    reference.verify_contents(contents)?;
+    match target {
+        CompactRegistryTraversalTarget::Index { reference, depth, semantic_hash } => {
+            if reference.kind != CompactRegistryObjectKind::IndexNode
+                || depth > COMPACT_REGISTRY_INDEX_DEPTH
+                || semantic_hash == [0; 32]
+            {
+                return Err(CompactRegistryArchiveError::BrokenIndex);
+            }
+            let node = CompactRegistryIndexNode::from_bytes(contents)?;
+            if node.wallet != reference.wallet || node.semantic_hash()? != semantic_hash {
+                return Err(CompactRegistryArchiveError::BrokenIndex);
+            }
+            match node.body {
+                CompactRegistryIndexNodeBody::Branch { depth: actual, left, right } => {
+                    if actual != depth || depth == COMPACT_REGISTRY_INDEX_DEPTH {
+                        return Err(CompactRegistryArchiveError::BrokenIndex);
+                    }
+                    let child_depth =
+                        depth.checked_add(1).ok_or(CompactRegistryArchiveError::BrokenIndex)?;
+                    Ok([left, right]
+                        .into_iter()
+                        .filter_map(|child| {
+                            child.object.map(|reference| CompactRegistryTraversalTarget::Index {
+                                reference,
+                                depth: child_depth,
+                                semantic_hash: child.semantic_hash,
+                            })
+                        })
+                        .collect())
+                }
+                CompactRegistryIndexNodeBody::Leaf { epoch, link_root, link, witness } => {
+                    if depth != COMPACT_REGISTRY_INDEX_DEPTH {
+                        return Err(CompactRegistryArchiveError::BrokenIndex);
+                    }
+                    let mut children = Vec::with_capacity(2);
+                    children.push(CompactRegistryTraversalTarget::Link {
+                        reference: link,
+                        epoch,
+                        chain_root: link_root,
+                    });
+                    children.extend(witness.map(|reference| {
+                        CompactRegistryTraversalTarget::HandoffWitness {
+                            reference,
+                            target_epoch: epoch,
+                        }
+                    }));
+                    Ok(children)
+                }
+            }
+        }
+        CompactRegistryTraversalTarget::Link { reference, epoch, chain_root } => {
+            if reference.kind != CompactRegistryObjectKind::Link || chain_root == [0; 32] {
+                return Err(CompactRegistryArchiveError::BrokenIndex);
+            }
+            let link = decode_canonical_bounded::<RegistryLink>(
+                contents,
+                MAX_COMPACT_REGISTRY_LINK_BYTES,
+                "compact registry link",
+            )?;
+            link.validate()?;
+            if link.wallet() != reference.wallet
+                || link.epoch() != epoch
+                || link.chain_root()? != chain_root
+            {
+                return Err(CompactRegistryArchiveError::BrokenIndex);
+            }
+            Ok(Vec::new())
+        }
+        CompactRegistryTraversalTarget::HandoffWitness { reference, target_epoch } => {
+            if reference.kind != CompactRegistryObjectKind::HandoffWitness || target_epoch == 0 {
+                return Err(CompactRegistryArchiveError::BrokenIndex);
+            }
+            let certificate = decode_canonical_bounded::<RegistryHandoffCertificate>(
+                contents,
+                MAX_COMPACT_REGISTRY_WITNESS_BYTES,
+                "compact registry handoff witness",
+            )?;
+            if certificate.statement().wallet() != reference.wallet
+                || certificate.statement().target_epoch() != target_epoch
+            {
+                return Err(CompactRegistryArchiveError::BrokenIndex);
+            }
+            Ok(Vec::new())
+        }
+    }
+}
+
 /// Authenticate and canonically decode one compact-registry object, returning only its bounded
 /// content-addressed child edges.
 pub fn verify_compact_registry_object(
@@ -339,7 +456,7 @@ pub fn compact_registry_index_step(
 pub struct CompactRegistryArchiveHead {
     version: u16,
     wallet: DepositWalletId,
-    /// Zero-based CAS generation.  Epochs are contiguous from genesis, so this is exactly the
+    /// Zero-based CAS generation. Epochs are contiguous from genesis, so this is exactly the
     /// active epoch and remains representable when the terminal epoch is `u64::MAX`.
     revision: u64,
     registry: CompactEpochRegistry,
@@ -490,6 +607,295 @@ impl VerifiedRegistryEpoch {
     pub const fn witness_reference(&self) -> Option<CompactRegistryObjectRef> {
         self.witness_reference
     }
+}
+
+/// Canonical restart state for complete historical compact-registry verification.
+///
+/// One call to [`verify_complete_compact_registry_graph_step`] authenticates exactly one epoch,
+/// so work remains bounded by at most two fixed-depth index paths and two bounded witness
+/// decodes. The sparse-Merkle frontier proves that the authenticated index contains exactly the
+/// contiguous prefix already checked, rather than merely proving that each queried leaf exists.
+///
+/// Cursor bytes are resumable progress, not an independently authenticated wire proof. Production
+/// callers must store them under the same authenticated local state which binds the exact archive
+/// head. A completion capability is returned only by the step verifier and is never serializable.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CompleteCompactRegistryGraphCursor {
+    version: u16,
+    head_digest: [u8; 32],
+    registry: RegistryId,
+    verified_epochs: u128,
+    frontier: Vec<Option<[u8; 32]>>,
+}
+
+impl CompleteCompactRegistryGraphCursor {
+    pub fn new(head: &CompactRegistryArchiveHead) -> Result<Self, CompactRegistryArchiveError> {
+        head.validate_shape()?;
+        let cursor = Self {
+            version: COMPLETE_GRAPH_CURSOR_VERSION,
+            head_digest: head.digest()?,
+            registry: head.registry_id(),
+            verified_epochs: 0,
+            frontier: vec![None; COMPLETE_GRAPH_FRONTIER_SLOTS],
+        };
+        cursor.validate_for(head)?;
+        Ok(cursor)
+    }
+
+    pub fn to_bytes(&self) -> Result<Vec<u8>, CompactRegistryArchiveError> {
+        self.validate_shape()?;
+        encode_bounded(
+            self,
+            MAX_COMPLETE_COMPACT_REGISTRY_GRAPH_CURSOR_BYTES,
+            "complete compact registry graph cursor",
+        )
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, CompactRegistryArchiveError> {
+        let cursor: Self = decode_canonical_bounded(
+            bytes,
+            MAX_COMPLETE_COMPACT_REGISTRY_GRAPH_CURSOR_BYTES,
+            "complete compact registry graph cursor",
+        )?;
+        cursor.validate_shape()?;
+        Ok(cursor)
+    }
+
+    #[must_use]
+    pub const fn head_digest(&self) -> [u8; 32] {
+        self.head_digest
+    }
+
+    #[must_use]
+    pub const fn registry_id(&self) -> RegistryId {
+        self.registry
+    }
+
+    #[must_use]
+    pub const fn verified_epochs(&self) -> u128 {
+        self.verified_epochs
+    }
+
+    #[must_use]
+    pub fn next_epoch(&self) -> Option<u64> {
+        let total = complete_registry_epoch_count(self.registry.active_epoch());
+        (self.verified_epochs < total).then(|| u64::try_from(self.verified_epochs).ok()).flatten()
+    }
+
+    fn validate_shape(&self) -> Result<(), CompactRegistryArchiveError> {
+        self.registry.validate()?;
+        let total = complete_registry_epoch_count(self.registry.active_epoch());
+        if self.version != COMPLETE_GRAPH_CURSOR_VERSION
+            || self.head_digest == [0; 32]
+            || self.verified_epochs >= total
+            || self.frontier.len() != COMPLETE_GRAPH_FRONTIER_SLOTS
+        {
+            return Err(CompactRegistryArchiveError::InvalidCompleteGraphCursor);
+        }
+        validate_complete_graph_frontier(self.verified_epochs, &self.frontier)
+    }
+
+    fn validate_for(
+        &self,
+        head: &CompactRegistryArchiveHead,
+    ) -> Result<(), CompactRegistryArchiveError> {
+        self.validate_shape()?;
+        head.validate_shape()?;
+        if self.head_digest != head.digest()? || self.registry != head.registry_id() {
+            return Err(CompactRegistryArchiveError::WrongCompleteGraphHead);
+        }
+        Ok(())
+    }
+
+    fn prefix_index_root(&self) -> Result<[u8; 32], CompactRegistryArchiveError> {
+        complete_graph_frontier_root(self.registry.wallet(), self.verified_epochs, &self.frontier)
+    }
+
+    fn append_verified_link(
+        &mut self,
+        epoch: u64,
+        link_root: [u8; 32],
+    ) -> Result<(), CompactRegistryArchiveError> {
+        if self.verified_epochs != u128::from(epoch) || link_root == [0; 32] {
+            return Err(CompactRegistryArchiveError::InvalidCompleteGraphCursor);
+        }
+        let mut height = 0_usize;
+        let mut subtree =
+            compact_registry_index_leaf_hash(self.registry.wallet(), epoch, link_root);
+        while height < usize::from(COMPACT_REGISTRY_INDEX_DEPTH)
+            && ((self.verified_epochs >> height) & 1) == 1
+        {
+            let left = self.frontier[height]
+                .take()
+                .ok_or(CompactRegistryArchiveError::InvalidCompleteGraphCursor)?;
+            let depth = COMPACT_REGISTRY_INDEX_DEPTH
+                .checked_sub(
+                    u8::try_from(height)
+                        .map_err(|_| CompactRegistryArchiveError::InvalidCompleteGraphCursor)?
+                        .checked_add(1)
+                        .ok_or(CompactRegistryArchiveError::InvalidCompleteGraphCursor)?,
+                )
+                .ok_or(CompactRegistryArchiveError::InvalidCompleteGraphCursor)?;
+            subtree =
+                compact_registry_index_branch_hash(self.registry.wallet(), depth, left, subtree);
+            height += 1;
+        }
+        if self.frontier.get(height).is_none_or(Option::is_some) {
+            return Err(CompactRegistryArchiveError::InvalidCompleteGraphCursor);
+        }
+        self.frontier[height] = Some(subtree);
+        self.verified_epochs =
+            self.verified_epochs.checked_add(1).ok_or(CompactRegistryArchiveError::Overflow)?;
+        validate_complete_graph_frontier(self.verified_epochs, &self.frontier)
+    }
+}
+
+/// Non-serializable proof that every epoch in one exact compact-registry head was authenticated.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VerifiedCompleteCompactRegistryGraph {
+    head_digest: [u8; 32],
+    registry: RegistryId,
+    verified_epochs: u128,
+}
+
+impl VerifiedCompleteCompactRegistryGraph {
+    #[must_use]
+    pub const fn head_digest(&self) -> [u8; 32] {
+        self.head_digest
+    }
+
+    #[must_use]
+    pub const fn registry_id(&self) -> RegistryId {
+        self.registry
+    }
+
+    #[must_use]
+    pub const fn verified_epochs(&self) -> u128 {
+        self.verified_epochs
+    }
+
+    pub fn authenticates(
+        &self,
+        head: &CompactRegistryArchiveHead,
+    ) -> Result<bool, CompactRegistryArchiveError> {
+        Ok(self.head_digest == head.digest()? && self.registry == head.registry_id())
+    }
+}
+
+/// Result of one bounded complete-history verification step.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CompleteCompactRegistryGraphStep {
+    Pending(CompleteCompactRegistryGraphCursor),
+    Complete(VerifiedCompleteCompactRegistryGraph),
+}
+
+/// Authenticate one exact historical epoch and advance the restart cursor.
+///
+/// Completion additionally proves that rebuilding the sparse semantic index from only epochs
+/// `0..=active` yields the head's exact `RegistryId::index_root`. Missing epochs, duplicate or
+/// extra leaves, and index entries not justified by the certified handoff chain therefore fail
+/// closed even when a bounded active-head verification would not visit them.
+pub fn verify_complete_compact_registry_graph_step<R: CompactRegistryObjectReader>(
+    head: &CompactRegistryArchiveHead,
+    mut cursor: CompleteCompactRegistryGraphCursor,
+    reader: &R,
+) -> Result<CompleteCompactRegistryGraphStep, CompactRegistryArchiveError> {
+    cursor.validate_for(head)?;
+    let epoch =
+        cursor.next_epoch().ok_or(CompactRegistryArchiveError::InvalidCompleteGraphCursor)?;
+    let prefix_root = cursor.prefix_index_root()?;
+    let verified = verify_epoch_at(head, epoch, reader)?;
+    if verified.link.parent_index_root() != prefix_root {
+        return Err(CompactRegistryArchiveError::BrokenIndex);
+    }
+    let link_root = verified.link.chain_root()?;
+    cursor.append_verified_link(epoch, link_root)?;
+
+    if epoch != head.registry().active_epoch() {
+        return Ok(CompleteCompactRegistryGraphStep::Pending(cursor));
+    }
+
+    let reconstructed_root = cursor.prefix_index_root()?;
+    let reconstructed = CompactEpochRegistry::from_link(&verified.link, reconstructed_root)?;
+    if reconstructed != *head.registry()
+        || reconstructed_root != head.registry_id().index_root()
+        || verified.link_reference != head.active_link_reference()
+        || verified.witness_reference != head.active_witness_reference()
+        || verified.prior_index_root != prefix_root
+    {
+        return Err(CompactRegistryArchiveError::InvalidHead);
+    }
+    Ok(CompleteCompactRegistryGraphStep::Complete(VerifiedCompleteCompactRegistryGraph {
+        head_digest: cursor.head_digest,
+        registry: cursor.registry,
+        verified_epochs: cursor.verified_epochs,
+    }))
+}
+
+const fn complete_registry_epoch_count(active_epoch: u64) -> u128 {
+    active_epoch as u128 + 1
+}
+
+fn validate_complete_graph_frontier(
+    verified_epochs: u128,
+    frontier: &[Option<[u8; 32]>],
+) -> Result<(), CompactRegistryArchiveError> {
+    let maximum_count = 1_u128 << COMPACT_REGISTRY_INDEX_DEPTH;
+    if verified_epochs > maximum_count || frontier.len() != COMPLETE_GRAPH_FRONTIER_SLOTS {
+        return Err(CompactRegistryArchiveError::InvalidCompleteGraphCursor);
+    }
+    for (height, root) in frontier.iter().enumerate() {
+        let expected = ((verified_epochs >> height) & 1) == 1;
+        if root.is_some() != expected || root.is_some_and(|root| root == [0; 32]) {
+            return Err(CompactRegistryArchiveError::InvalidCompleteGraphCursor);
+        }
+    }
+    Ok(())
+}
+
+fn complete_graph_frontier_root(
+    wallet: DepositWalletId,
+    verified_epochs: u128,
+    frontier: &[Option<[u8; 32]>],
+) -> Result<[u8; 32], CompactRegistryArchiveError> {
+    validate_complete_graph_frontier(verified_epochs, frontier)?;
+    let maximum_count = 1_u128 << COMPACT_REGISTRY_INDEX_DEPTH;
+    if verified_epochs == maximum_count {
+        return frontier[usize::from(COMPACT_REGISTRY_INDEX_DEPTH)]
+            .ok_or(CompactRegistryArchiveError::InvalidCompleteGraphCursor);
+    }
+
+    let mut root = compact_registry_empty_index_hash_at(wallet, COMPACT_REGISTRY_INDEX_DEPTH);
+    for height in 0..usize::from(COMPACT_REGISTRY_INDEX_DEPTH) {
+        let height = u8::try_from(height)
+            .map_err(|_| CompactRegistryArchiveError::InvalidCompleteGraphCursor)?;
+        let depth = COMPACT_REGISTRY_INDEX_DEPTH
+            .checked_sub(
+                height
+                    .checked_add(1)
+                    .ok_or(CompactRegistryArchiveError::InvalidCompleteGraphCursor)?,
+            )
+            .ok_or(CompactRegistryArchiveError::InvalidCompleteGraphCursor)?;
+        let empty_right = compact_registry_empty_index_hash_at(
+            wallet,
+            depth.checked_add(1).ok_or(CompactRegistryArchiveError::InvalidCompleteGraphCursor)?,
+        );
+        let (left, right) = if ((verified_epochs >> height) & 1) == 1 {
+            (
+                frontier[usize::from(height)]
+                    .ok_or(CompactRegistryArchiveError::InvalidCompleteGraphCursor)?,
+                root,
+            )
+        } else {
+            (root, empty_right)
+        };
+        root = if left == empty_right && right == empty_right {
+            compact_registry_empty_index_hash_at(wallet, depth)
+        } else {
+            compact_registry_index_branch_hash(wallet, depth, left, right)
+        };
+    }
+    Ok(root)
 }
 
 /// Build a fresh current-format compact registry.  The returned objects are not yet durable.
@@ -1274,6 +1680,10 @@ pub enum CompactRegistryArchiveError {
     MissingEpoch(u64),
     #[error("epoch {0} already has another authenticated value")]
     DuplicateEpoch(u64),
+    #[error("complete compact-registry graph cursor is malformed")]
+    InvalidCompleteGraphCursor,
+    #[error("complete compact-registry graph cursor names another exact archive head")]
+    WrongCompleteGraphHead,
     #[error("handoff witness is missing, unexpected, or malformed")]
     InvalidWitness,
     #[error("handoff does not bind the exact authenticated pre-terminal portable index head")]
@@ -1474,11 +1884,16 @@ mod tests {
         let previous = anchor.ledger_head();
         let next_index = anchor.next_index();
         let portable = PortableDepositIndexHead::from_head(&local_portable).unwrap();
+        let source_state = crate::deposit_state_export::DepositHandoffStateBinding::new(
+            Some([0xb1; 32]),
+            portable.clone(),
+        )
+        .unwrap();
         let statement = RegistryHandoffStatement::new(
             head.registry(),
             sequence,
             previous,
-            portable.digest(),
+            source_state.clone(),
             target,
             next_index,
         )
@@ -1503,7 +1918,7 @@ mod tests {
             head.registry(),
             sequence,
             previous,
-            portable.digest(),
+            source_state,
             target,
             next_index,
         )
@@ -1549,6 +1964,239 @@ mod tests {
             initial_portable(head.wallet()),
         );
         (certificate, portable)
+    }
+
+    fn registry_lifetime(
+        wallet: DepositWalletId,
+        active_epoch: u64,
+    ) -> (MemoryObjects, CompactRegistryArchiveHead) {
+        let (mut store, mut head, mut source_identities) = genesis(wallet);
+        let mut portable_store = PortableObjects::default();
+        let mut local_portable = initial_portable(wallet);
+        for epoch in 1..=active_epoch {
+            let target_identities = identities(epoch);
+            let target = successor_authority(wallet, committee(epoch, &target_identities));
+            let (certificate, portable, resulting_portable) = handoff(
+                &head,
+                &source_identities,
+                &target,
+                &[0, 1, 2],
+                &mut portable_store,
+                local_portable,
+            );
+            let pending =
+                prepare_compact_registry_append(&head, &target, certificate, &portable, &store)
+                    .unwrap();
+            head = commit(&mut store, pending);
+            source_identities = target_identities;
+            local_portable = resulting_portable;
+        }
+        (store, head)
+    }
+
+    fn complete_registry_verification(
+        head: &CompactRegistryArchiveHead,
+        store: &MemoryObjects,
+        mut cursor: CompleteCompactRegistryGraphCursor,
+    ) -> VerifiedCompleteCompactRegistryGraph {
+        loop {
+            match verify_complete_compact_registry_graph_step(head, cursor, store).unwrap() {
+                CompleteCompactRegistryGraphStep::Pending(next) => cursor = next,
+                CompleteCompactRegistryGraphStep::Complete(verified) => return verified,
+            }
+        }
+    }
+
+    fn rewrite_index_leaf(
+        store: &mut MemoryObjects,
+        head: &mut CompactRegistryArchiveHead,
+        key: u64,
+        rewrite: impl FnOnce(
+            u64,
+            [u8; 32],
+            CompactRegistryObjectRef,
+            Option<CompactRegistryObjectRef>,
+        ) -> CompactRegistryIndexNodeBody,
+    ) {
+        let mut reference = head.index_root_reference();
+        let mut path = Vec::with_capacity(usize::from(COMPACT_REGISTRY_INDEX_DEPTH));
+        for depth in 0..COMPACT_REGISTRY_INDEX_DEPTH {
+            let node = CompactRegistryIndexNode::from_bytes(store.objects.get(&reference).unwrap())
+                .unwrap();
+            let CompactRegistryIndexNodeBody::Branch { depth: actual, left, right } = node.body
+            else {
+                panic!("index path ended before its leaf");
+            };
+            assert_eq!(actual, depth);
+            let shift = u32::from(COMPACT_REGISTRY_INDEX_DEPTH - depth - 1);
+            let selected_is_left = ((key >> shift) & 1) == 0;
+            let (selected, sibling) = if selected_is_left { (left, right) } else { (right, left) };
+            path.push((depth, selected_is_left, sibling));
+            reference = selected.object.expect("test epoch exists");
+        }
+
+        let leaf =
+            CompactRegistryIndexNode::from_bytes(store.objects.get(&reference).unwrap()).unwrap();
+        let CompactRegistryIndexNodeBody::Leaf { epoch, link_root, link, witness } = leaf.body
+        else {
+            panic!("index path did not end in a leaf");
+        };
+        assert_eq!(epoch, key);
+        let mut staged = BTreeMap::new();
+        let forged_leaf = CompactRegistryIndexNode {
+            version: COMPACT_REGISTRY_ARCHIVE_INDEX_NODE_VERSION,
+            wallet: head.wallet(),
+            body: rewrite(epoch, link_root, link, witness),
+        };
+        let mut semantic_hash = forged_leaf.semantic_hash().unwrap();
+        let mut object = stage_object(
+            head.wallet(),
+            CompactRegistryObjectKind::IndexNode,
+            forged_leaf.to_bytes().unwrap(),
+            &mut staged,
+        )
+        .unwrap();
+        for (depth, selected_is_left, sibling) in path.into_iter().rev() {
+            let replacement = IndexChild { semantic_hash, object: Some(object) };
+            let (left, right) =
+                if selected_is_left { (replacement, sibling) } else { (sibling, replacement) };
+            let parent = CompactRegistryIndexNode {
+                version: COMPACT_REGISTRY_ARCHIVE_INDEX_NODE_VERSION,
+                wallet: head.wallet(),
+                body: CompactRegistryIndexNodeBody::Branch { depth, left, right },
+            };
+            semantic_hash = parent.semantic_hash().unwrap();
+            object = stage_object(
+                head.wallet(),
+                CompactRegistryObjectKind::IndexNode,
+                parent.to_bytes().unwrap(),
+                &mut staged,
+            )
+            .unwrap();
+        }
+        store.objects.extend(staged);
+        head.index_root = object;
+        let active_link = decode_canonical_bounded::<RegistryLink>(
+            store.objects.get(&head.active_link_reference()).unwrap(),
+            MAX_COMPACT_REGISTRY_LINK_BYTES,
+            "compact registry link",
+        )
+        .unwrap();
+        head.registry = CompactEpochRegistry::from_link(&active_link, semantic_hash).unwrap();
+        head.validate_shape().unwrap();
+    }
+
+    #[test]
+    fn complete_verifier_authenticates_zero_operation_historical_epochs() {
+        let wallet = DepositWalletId([0x31; 32]);
+        // Every predecessor hands off immediately. Epochs one and two therefore have no
+        // allocations, observations, or consolidation operations between activation and handoff.
+        let (store, head) = registry_lifetime(wallet, 3);
+        let cursor = CompleteCompactRegistryGraphCursor::new(&head).unwrap();
+        let verified = complete_registry_verification(&head, &store, cursor);
+        assert!(verified.authenticates(&head).unwrap());
+        assert_eq!(verified.head_digest(), head.digest().unwrap());
+        assert_eq!(verified.registry_id(), head.registry_id());
+        assert_eq!(verified.verified_epochs(), 4);
+    }
+
+    #[test]
+    fn complete_verifier_rejects_a_tampered_historical_witness() {
+        let wallet = DepositWalletId([0x32; 32]);
+        let (mut store, mut head) = registry_lifetime(wallet, 2);
+        let epoch = lookup_compact_registry_epoch(&head, 1, &store).unwrap();
+        let certificate = epoch.witness().unwrap();
+        let mut witnesses = certificate.witnesses().to_vec();
+        witnesses[0].signature[0] ^= 1;
+        let tampered =
+            RegistryHandoffCertificate::new(certificate.statement().clone(), witnesses).unwrap();
+        let tampered_bytes = tampered.to_bytes().unwrap();
+        RegistryHandoffCertificate::from_bytes(&tampered_bytes).unwrap();
+        let tampered_reference = CompactRegistryObjectRef::for_contents(
+            wallet,
+            CompactRegistryObjectKind::HandoffWitness,
+            &tampered_bytes,
+        )
+        .unwrap();
+        store.objects.insert(tampered_reference, tampered_bytes);
+        rewrite_index_leaf(&mut store, &mut head, 1, |epoch, link_root, link, _witness| {
+            CompactRegistryIndexNodeBody::Leaf {
+                epoch,
+                link_root,
+                link,
+                witness: Some(tampered_reference),
+            }
+        });
+
+        let cursor = CompleteCompactRegistryGraphCursor::new(&head).unwrap();
+        let CompleteCompactRegistryGraphStep::Pending(cursor) =
+            verify_complete_compact_registry_graph_step(&head, cursor, &store).unwrap()
+        else {
+            panic!("genesis cannot complete a three-epoch graph");
+        };
+        assert!(matches!(
+            verify_complete_compact_registry_graph_step(&head, cursor, &store),
+            Err(CompactRegistryArchiveError::Registry(_))
+        ));
+    }
+
+    #[test]
+    fn complete_verifier_rejects_a_missing_epoch_and_duplicate_leaf_label() {
+        let wallet = DepositWalletId([0x33; 32]);
+        let (mut store, mut head) = registry_lifetime(wallet, 1);
+        // The path for epoch one now contains a second leaf labelled epoch zero. The expected
+        // epoch is absent even though every object remains content-authenticated under the forged
+        // exact head.
+        rewrite_index_leaf(&mut store, &mut head, 1, |_epoch, link_root, link, witness| {
+            CompactRegistryIndexNodeBody::Leaf { epoch: 0, link_root, link, witness }
+        });
+        let cursor = CompleteCompactRegistryGraphCursor::new(&head).unwrap();
+        let CompleteCompactRegistryGraphStep::Pending(cursor) =
+            verify_complete_compact_registry_graph_step(&head, cursor, &store).unwrap()
+        else {
+            panic!("genesis cannot complete a two-epoch graph");
+        };
+        assert!(matches!(
+            verify_complete_compact_registry_graph_step(&head, cursor, &store),
+            Err(CompactRegistryArchiveError::MissingEpoch(1))
+                | Err(CompactRegistryArchiveError::BrokenIndex)
+        ));
+    }
+
+    #[test]
+    fn complete_verifier_resumes_from_a_canonical_restart_cursor() {
+        let wallet = DepositWalletId([0x34; 32]);
+        let (store, head) = registry_lifetime(wallet, 3);
+        let cursor = CompleteCompactRegistryGraphCursor::new(&head).unwrap();
+        let CompleteCompactRegistryGraphStep::Pending(cursor) =
+            verify_complete_compact_registry_graph_step(&head, cursor, &store).unwrap()
+        else {
+            panic!("genesis cannot complete a four-epoch graph");
+        };
+        assert_eq!(cursor.verified_epochs(), 1);
+        assert_eq!(cursor.next_epoch(), Some(1));
+        let bytes = cursor.to_bytes().unwrap();
+        assert!(bytes.len() <= MAX_COMPLETE_COMPACT_REGISTRY_GRAPH_CURSOR_BYTES);
+        let restarted = CompleteCompactRegistryGraphCursor::from_bytes(&bytes).unwrap();
+        assert_eq!(restarted, cursor);
+
+        let mut other_exact_head = head.clone();
+        other_exact_head.active_witness =
+            lookup_compact_registry_epoch(&head, 2, &store).unwrap().witness_reference();
+        assert_eq!(other_exact_head.registry_id(), head.registry_id());
+        assert_ne!(other_exact_head.digest().unwrap(), head.digest().unwrap());
+        assert!(matches!(
+            verify_complete_compact_registry_graph_step(
+                &other_exact_head,
+                restarted.clone(),
+                &store
+            ),
+            Err(CompactRegistryArchiveError::WrongCompleteGraphHead)
+        ));
+
+        let verified = complete_registry_verification(&head, &store, restarted);
+        assert!(verified.authenticates(&head).unwrap());
+        assert_eq!(verified.verified_epochs(), 4);
     }
 
     #[test]

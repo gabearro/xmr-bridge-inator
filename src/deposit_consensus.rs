@@ -28,11 +28,12 @@ use thiserror::Error;
 
 use crate::{
     committee::{Committee, CommitteeError, MAX_COMMITTEE_MEMBERS, PartyId, SessionId},
-    identity::{Identity, IdentityError, SignedEnvelope},
+    identity::{EnvelopeSigner, EnvelopeSignerScope, Identity, IdentityError, SignedEnvelope},
+    receiver_key_accumulator::MAX_RECEIVER_KEY_BATCH_UPDATE_PROOF_BYTES,
 };
 
 const CONSENSUS_VERSION: u16 = 1;
-const CONSENSUS_STATE_VERSION: u16 = 1;
+const CONSENSUS_STATE_VERSION: u16 = 2;
 const VALUE_VERSION: u16 = 1;
 const PREPARE_CERTIFICATE_VERSION: u16 = 1;
 const COMMIT_CERTIFICATE_VERSION: u16 = 1;
@@ -76,8 +77,14 @@ fn take_commit_certificate_verifications() -> usize {
 
 /// Hard bound for application-domain labels committed by a consensus context.
 pub const MAX_CONSENSUS_APPLICATION_BYTES: usize = 64;
-/// Hard bound for an opaque canonical application value.
-pub const MAX_CONSENSUS_VALUE_BYTES: usize = 64 * 1024;
+/// Fixed non-proof allowance for a maximum-size receiver-key advertisement set and canonical
+/// application framing. The dominant sparse proof is independently derived from committee size
+/// and its fixed 256-bit tree depth.
+const MAX_CONSENSUS_VALUE_FRAMING_BYTES: usize = 32 * 1024;
+/// Hard bound for an opaque canonical application value. It is independent of epoch/history
+/// length; increasing receiver-key history cannot grow this bound.
+pub const MAX_CONSENSUS_VALUE_BYTES: usize =
+    MAX_RECEIVER_KEY_BATCH_UPDATE_PROOF_BYTES + MAX_CONSENSUS_VALUE_FRAMING_BYTES;
 /// Hard bound for one signed consensus payload, including nested full-witness certificates.
 pub const MAX_CONSENSUS_MESSAGE_BYTES: usize = 1024 * 1024;
 /// Highest representable view.  This keeps signed-envelope sequence slots collision-free.
@@ -86,6 +93,10 @@ pub const MAX_CONSENSUS_VIEW: u64 = (1_u64 << WIRE_SEQUENCE_VIEW_BITS) - 1;
 pub const MAX_CONSENSUS_EVIDENCE: usize = MAX_COMMITTEE_MEMBERS * 2;
 /// A singleton `f=0` reducer can emit a view change, proposal, and both vote phases in one step.
 pub const MAX_CONSENSUS_OUTBOUND_PER_STEP: usize = 4;
+/// A restricted reducer retains only exact application-value digests which the deposit service
+/// authenticated before reduction. This matches the host's bounded competing-value pool while
+/// keeping the generic consensus layer independent of deposit-ledger payload semantics.
+pub(crate) const MAX_RESTRICTED_AUTHORIZED_VALUES: usize = 128;
 
 /// Application and chain bindings shared by every height in one deployment.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -487,6 +498,47 @@ fn deserialize_certificate_witnesses<'de, D: Deserializer<'de>>(
     deserializer.deserialize_seq(WitnessVisitor)
 }
 
+fn deserialize_restricted_authorized_values<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<BTreeSet<ConsensusValueDigest>, D::Error> {
+    struct AuthorizedValueVisitor;
+
+    impl<'de> Visitor<'de> for AuthorizedValueVisitor {
+        type Value = BTreeSet<ConsensusValueDigest>;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(
+                formatter,
+                "at most {MAX_RESTRICTED_AUTHORIZED_VALUES} unique consensus-value digests"
+            )
+        }
+
+        fn visit_seq<A: SeqAccess<'de>>(self, mut sequence: A) -> Result<Self::Value, A::Error> {
+            let hinted = sequence.size_hint().unwrap_or(0);
+            if hinted > MAX_RESTRICTED_AUTHORIZED_VALUES {
+                return Err(A::Error::invalid_length(hinted, &self));
+            }
+            let mut values = BTreeSet::new();
+            while let Some(value) = sequence.next_element()? {
+                if values.len() == MAX_RESTRICTED_AUTHORIZED_VALUES {
+                    return Err(A::Error::invalid_length(
+                        MAX_RESTRICTED_AUTHORIZED_VALUES.saturating_add(1),
+                        &self,
+                    ));
+                }
+                if !values.insert(value) {
+                    return Err(A::Error::custom(
+                        "restricted authorization contains a duplicate value digest",
+                    ));
+                }
+            }
+            Ok(values)
+        }
+    }
+
+    deserializer.deserialize_seq(AuthorizedValueVisitor)
+}
+
 /// Leader proposal for one view.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct Proposal {
@@ -697,6 +749,15 @@ impl CommitCertificate {
             MessageKind::Precommit,
             &self.witnesses,
         )
+    }
+
+    /// Digest of the exact consensus context authenticated by every witness.
+    ///
+    /// Durable application snapshots use this to retire only the matching transport retry
+    /// scope after a stronger terminal certificate has embedded this commit certificate.
+    #[must_use]
+    pub(crate) const fn context_digest(&self) -> [u8; 32] {
+        self.context
     }
 
     /// Return parties that directly double-signed conflicting commits in the same view.
@@ -914,6 +975,16 @@ pub enum ConsensusError {
     UnknownVoter(PartyId),
     #[error("identity does not belong to the local reducer party")]
     WrongLocalIdentity,
+    #[error("signer scope is not authorized for this consensus reducer")]
+    UnauthorizedSignerScope,
+    #[error("consensus value is not authorized by the handoff-only reducer")]
+    UnauthorizedHandoffValue,
+    #[error("invalid handoff-only consensus signing policy")]
+    InvalidHandoffSigningPolicy,
+    #[error("consensus value is not authorized by the recovery-and-fence-only reducer")]
+    UnauthorizedRecoveryAndFenceValue,
+    #[error("invalid recovery-and-fence-only consensus signing policy")]
+    InvalidRecoveryAndFenceSigningPolicy,
     #[error("proposal did not come from the deterministic view leader")]
     WrongLeader,
     #[error("invalid certificate: {0}")]
@@ -963,12 +1034,256 @@ impl MessageKind {
     }
 }
 
+/// Durable authorization boundary for the local envelope signer.
+///
+/// Public/generic reducers are always `FullOnly`. The deposit service may construct crate-private
+/// transition variants only after authenticating exact values. Their allowlists are persisted
+/// with the reducer so restart or a later view change cannot widen a stable signing capability.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+enum ConsensusSigningPolicy {
+    FullOnly,
+    RecoveryAndFenceOnly {
+        context: [u8; 32],
+        recovery_authority: [u8; 32],
+        #[serde(deserialize_with = "deserialize_restricted_authorized_values")]
+        recovery_values: BTreeSet<ConsensusValueDigest>,
+        #[serde(deserialize_with = "deserialize_restricted_authorized_values")]
+        fence_values: BTreeSet<ConsensusValueDigest>,
+    },
+    HandoffOnly {
+        context: [u8; 32],
+        #[serde(deserialize_with = "deserialize_restricted_authorized_values")]
+        authorized_values: BTreeSet<ConsensusValueDigest>,
+    },
+}
+
+impl ConsensusSigningPolicy {
+    fn recovery_and_fence_only<R, F>(
+        context: &ConsensusContext,
+        recovery_authority: [u8; 32],
+        recovery_values: R,
+        fence_values: F,
+    ) -> Result<Self, ConsensusError>
+    where
+        R: IntoIterator<Item = ConsensusValueDigest>,
+        F: IntoIterator<Item = ConsensusValueDigest>,
+    {
+        let policy = Self::RecoveryAndFenceOnly {
+            context: context.digest(),
+            recovery_authority,
+            recovery_values: recovery_values.into_iter().collect(),
+            fence_values: fence_values.into_iter().collect(),
+        };
+        policy.validate(context)?;
+        Ok(policy)
+    }
+
+    fn handoff_only<I>(
+        context: &ConsensusContext,
+        authorized_values: I,
+    ) -> Result<Self, ConsensusError>
+    where
+        I: IntoIterator<Item = ConsensusValueDigest>,
+    {
+        let authorized_values = authorized_values.into_iter().collect::<BTreeSet<_>>();
+        if authorized_values.is_empty()
+            || authorized_values.len() > MAX_RESTRICTED_AUTHORIZED_VALUES
+        {
+            return Err(ConsensusError::InvalidHandoffSigningPolicy);
+        }
+        Ok(Self::HandoffOnly { context: context.digest(), authorized_values })
+    }
+
+    fn validate(&self, context: &ConsensusContext) -> Result<(), ConsensusError> {
+        match self {
+            Self::FullOnly => Ok(()),
+            Self::RecoveryAndFenceOnly {
+                context: bound_context,
+                recovery_authority,
+                recovery_values,
+                fence_values,
+            } if *bound_context == context.digest()
+                && *recovery_authority != [0; 32]
+                && (!recovery_values.is_empty() || !fence_values.is_empty())
+                && recovery_values.len().saturating_add(fence_values.len())
+                    <= MAX_RESTRICTED_AUTHORIZED_VALUES
+                && recovery_values.is_disjoint(fence_values) =>
+            {
+                Ok(())
+            }
+            Self::RecoveryAndFenceOnly { .. } => {
+                Err(ConsensusError::InvalidRecoveryAndFenceSigningPolicy)
+            }
+            Self::HandoffOnly { context: bound_context, authorized_values }
+                if *bound_context == context.digest()
+                    && !authorized_values.is_empty()
+                    && authorized_values.len() <= MAX_RESTRICTED_AUTHORIZED_VALUES =>
+            {
+                Ok(())
+            }
+            Self::HandoffOnly { .. } => Err(ConsensusError::InvalidHandoffSigningPolicy),
+        }
+    }
+
+    fn authorize_handoff_values<I>(&mut self, values: I) -> Result<(), ConsensusError>
+    where
+        I: IntoIterator<Item = ConsensusValueDigest>,
+    {
+        let Self::HandoffOnly { authorized_values, .. } = self else {
+            return Err(ConsensusError::InvalidHandoffSigningPolicy);
+        };
+        let mut extended = authorized_values.clone();
+        extended.extend(values);
+        if extended.is_empty() || extended.len() > MAX_RESTRICTED_AUTHORIZED_VALUES {
+            return Err(ConsensusError::InvalidHandoffSigningPolicy);
+        }
+        *authorized_values = extended;
+        Ok(())
+    }
+
+    fn authorize_recovery_values<I>(&mut self, values: I) -> Result<(), ConsensusError>
+    where
+        I: IntoIterator<Item = ConsensusValueDigest>,
+    {
+        let Self::RecoveryAndFenceOnly { recovery_values, fence_values, .. } = self else {
+            return Err(ConsensusError::InvalidRecoveryAndFenceSigningPolicy);
+        };
+        let mut extended = recovery_values.clone();
+        extended.extend(values);
+        if extended.is_empty() && fence_values.is_empty()
+            || extended.len().saturating_add(fence_values.len()) > MAX_RESTRICTED_AUTHORIZED_VALUES
+            || !extended.is_disjoint(fence_values)
+        {
+            return Err(ConsensusError::InvalidRecoveryAndFenceSigningPolicy);
+        }
+        *recovery_values = extended;
+        Ok(())
+    }
+
+    fn authorize_fence_values<I>(&mut self, values: I) -> Result<(), ConsensusError>
+    where
+        I: IntoIterator<Item = ConsensusValueDigest>,
+    {
+        let Self::RecoveryAndFenceOnly { recovery_values, fence_values, .. } = self else {
+            return Err(ConsensusError::InvalidRecoveryAndFenceSigningPolicy);
+        };
+        let mut extended = fence_values.clone();
+        extended.extend(values);
+        if recovery_values.is_empty() && extended.is_empty()
+            || recovery_values.len().saturating_add(extended.len())
+                > MAX_RESTRICTED_AUTHORIZED_VALUES
+            || !recovery_values.is_disjoint(&extended)
+        {
+            return Err(ConsensusError::InvalidRecoveryAndFenceSigningPolicy);
+        }
+        *fence_values = extended;
+        Ok(())
+    }
+
+    fn ensure_signer(&self, identity: &dyn EnvelopeSigner) -> Result<(), ConsensusError> {
+        match (self, identity.scope()) {
+            (Self::FullOnly, EnvelopeSignerScope::Full)
+            | (Self::RecoveryAndFenceOnly { .. }, EnvelopeSignerScope::Full)
+            | (Self::HandoffOnly { .. }, EnvelopeSignerScope::Full)
+            | (Self::HandoffOnly { .. }, EnvelopeSignerScope::HandoffOnly) => Ok(()),
+            (
+                Self::RecoveryAndFenceOnly { recovery_authority, .. },
+                EnvelopeSignerScope::RecoveryAndFenceOnly,
+            ) if identity.recovery_authority() == Some(*recovery_authority) => Ok(()),
+            (
+                Self::FullOnly | Self::HandoffOnly { .. },
+                EnvelopeSignerScope::RecoveryAndFenceOnly,
+            )
+            | (
+                Self::FullOnly | Self::RecoveryAndFenceOnly { .. },
+                EnvelopeSignerScope::HandoffOnly,
+            )
+            | (Self::RecoveryAndFenceOnly { .. }, EnvelopeSignerScope::RecoveryAndFenceOnly) => {
+                Err(ConsensusError::UnauthorizedSignerScope)
+            }
+        }
+    }
+
+    fn ensure_value_digest(&self, digest: ConsensusValueDigest) -> Result<(), ConsensusError> {
+        match self {
+            Self::FullOnly => Ok(()),
+            Self::RecoveryAndFenceOnly { recovery_values, fence_values, .. }
+                if recovery_values.contains(&digest) || fence_values.contains(&digest) =>
+            {
+                Ok(())
+            }
+            Self::RecoveryAndFenceOnly { .. } => {
+                Err(ConsensusError::UnauthorizedRecoveryAndFenceValue)
+            }
+            Self::HandoffOnly { authorized_values, .. } if authorized_values.contains(&digest) => {
+                Ok(())
+            }
+            Self::HandoffOnly { .. } => Err(ConsensusError::UnauthorizedHandoffValue),
+        }
+    }
+
+    fn ensure_value(&self, value: &ConsensusValue) -> Result<(), ConsensusError> {
+        value.validate()?;
+        self.ensure_value_digest(value.digest())
+    }
+
+    fn ensure_prepare_certificate(
+        &self,
+        certificate: &PrepareCertificate,
+    ) -> Result<(), ConsensusError> {
+        self.ensure_value(certificate.value())
+    }
+
+    fn ensure_message_body(
+        &self,
+        context: &ConsensusContext,
+        body: &ConsensusMessageBody,
+    ) -> Result<(), ConsensusError> {
+        match body {
+            ConsensusMessageBody::Proposal(proposal) => {
+                self.ensure_value(&proposal.value)?;
+                if let Some(proof) = &proposal.proof_of_lock {
+                    self.ensure_prepare_certificate(proof)?;
+                }
+                if let Some(certificate) = &proposal.view_change {
+                    self.ensure_view_certificate(context, certificate)?;
+                }
+            }
+            ConsensusMessageBody::Prevote(vote) | ConsensusMessageBody::Precommit(vote) => {
+                self.ensure_value_digest(vote.value)?;
+            }
+            ConsensusMessageBody::ViewChange(change) => {
+                if let Some(prepared) = &change.highest_prepared {
+                    self.ensure_prepare_certificate(prepared)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn ensure_view_certificate(
+        &self,
+        context: &ConsensusContext,
+        certificate: &ViewChangeCertificate,
+    ) -> Result<(), ConsensusError> {
+        visit_view_certificate_values(context, certificate, &mut |value| self.ensure_value(value))
+    }
+
+    fn ensure_commit_certificate(
+        &self,
+        certificate: &CommitCertificate,
+    ) -> Result<(), ConsensusError> {
+        self.ensure_value(certificate.value())
+    }
+}
+
 /// Durable state for one party and one context.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct DepositConsensus {
     state_version: u16,
     context: ConsensusContext,
     local_party: PartyId,
+    signing_policy: ConsensusSigningPolicy,
     started: bool,
     view: u64,
     candidate: Option<ConsensusValue>,
@@ -988,6 +1303,7 @@ struct UncheckedDepositConsensus {
     state_version: u16,
     context: ConsensusContext,
     local_party: PartyId,
+    signing_policy: ConsensusSigningPolicy,
     started: bool,
     view: u64,
     candidate: Option<ConsensusValue>,
@@ -1009,6 +1325,7 @@ impl<'de> Deserialize<'de> for DepositConsensus {
             state_version: unchecked.state_version,
             context: unchecked.context,
             local_party: unchecked.local_party,
+            signing_policy: unchecked.signing_policy,
             started: unchecked.started,
             view: unchecked.view,
             candidate: unchecked.candidate,
@@ -1029,7 +1346,59 @@ impl<'de> Deserialize<'de> for DepositConsensus {
 
 impl DepositConsensus {
     pub fn new(context: ConsensusContext, local_party: PartyId) -> Result<Self, ConsensusError> {
+        Self::new_with_signing_policy(context, local_party, ConsensusSigningPolicy::FullOnly)
+    }
+
+    /// Construct a transition-bound reducer for exact recovery and Fence values.
+    ///
+    /// The caller must authenticate every recovery digest from a matching Prepare/Commit
+    /// certificate and every Fence digest against the exact certified transition before invoking
+    /// this constructor. The nonzero authority must match the recovery signer which later drives
+    /// the reducer; a full identity remains able to make progress without carrying that token.
+    pub(crate) fn new_recovery_and_fence_only<R, F>(
+        context: ConsensusContext,
+        local_party: PartyId,
+        recovery_authority: [u8; 32],
+        recovery_values: R,
+        fence_values: F,
+    ) -> Result<Self, ConsensusError>
+    where
+        R: IntoIterator<Item = ConsensusValueDigest>,
+        F: IntoIterator<Item = ConsensusValueDigest>,
+    {
+        let signing_policy = ConsensusSigningPolicy::recovery_and_fence_only(
+            &context,
+            recovery_authority,
+            recovery_values,
+            fence_values,
+        )?;
+        Self::new_with_signing_policy(context, local_party, signing_policy)
+    }
+
+    /// Construct the only reducer which may consume a historical handoff-only signer.
+    ///
+    /// The caller must first authenticate every supplied digest as an exact handoff value. The
+    /// allowlist is durable and applies even when a live full identity drives this reducer, so an
+    /// old-epoch restart cannot turn a previously generic lane into a handoff signing oracle.
+    pub(crate) fn new_handoff_only<I>(
+        context: ConsensusContext,
+        local_party: PartyId,
+        authorized_values: I,
+    ) -> Result<Self, ConsensusError>
+    where
+        I: IntoIterator<Item = ConsensusValueDigest>,
+    {
+        let signing_policy = ConsensusSigningPolicy::handoff_only(&context, authorized_values)?;
+        Self::new_with_signing_policy(context, local_party, signing_policy)
+    }
+
+    fn new_with_signing_policy(
+        context: ConsensusContext,
+        local_party: PartyId,
+        signing_policy: ConsensusSigningPolicy,
+    ) -> Result<Self, ConsensusError> {
         context.validate()?;
+        signing_policy.validate(&context)?;
         context
             .committee
             .member(local_party)
@@ -1038,6 +1407,7 @@ impl DepositConsensus {
             state_version: CONSENSUS_STATE_VERSION,
             context,
             local_party,
+            signing_policy,
             started: false,
             view: 0,
             candidate: None,
@@ -1051,6 +1421,89 @@ impl DepositConsensus {
             committed: None,
             evidence: VecDeque::new(),
         })
+    }
+
+    /// Extend a handoff reducer with values which the deposit service has already authenticated.
+    ///
+    /// This operation cannot convert a generic reducer into a handoff reducer and is monotonic.
+    /// The service persists the expanded policy atomically with the reduction that first consumes
+    /// any newly authorized value.
+    pub(crate) fn authorize_handoff_value_digests<I>(
+        &mut self,
+        values: I,
+    ) -> Result<(), ConsensusError>
+    where
+        I: IntoIterator<Item = ConsensusValueDigest>,
+    {
+        self.signing_policy.authorize_handoff_values(values)
+    }
+
+    /// Monotonically add exact quorum-certificate-backed recovery values.
+    ///
+    /// The service must persist the certificate provenance atomically with this expansion. This
+    /// method cannot create or convert a generic, Fence-only, or final-handoff reducer.
+    pub(crate) fn authorize_recovery_value_digests<I>(
+        &mut self,
+        values: I,
+    ) -> Result<(), ConsensusError>
+    where
+        I: IntoIterator<Item = ConsensusValueDigest>,
+    {
+        self.signing_policy.authorize_recovery_values(values)
+    }
+
+    /// Monotonically add exact host-validated Fence values.
+    ///
+    /// Recovery and Fence classifications are deliberately disjoint. A final handoff value must
+    /// use a separate `HandoffOnly` reducer and cannot be added through this method.
+    pub(crate) fn authorize_fence_value_digests<I>(
+        &mut self,
+        values: I,
+    ) -> Result<(), ConsensusError>
+    where
+        I: IntoIterator<Item = ConsensusValueDigest>,
+    {
+        self.signing_policy.authorize_fence_values(values)
+    }
+
+    #[must_use]
+    pub(crate) fn is_handoff_only(&self) -> bool {
+        matches!(&self.signing_policy, ConsensusSigningPolicy::HandoffOnly { .. })
+    }
+
+    #[must_use]
+    pub(crate) fn is_recovery_and_fence_only(&self) -> bool {
+        matches!(&self.signing_policy, ConsensusSigningPolicy::RecoveryAndFenceOnly { .. })
+    }
+
+    #[must_use]
+    pub(crate) fn recovery_authority_digest(&self) -> Option<[u8; 32]> {
+        match &self.signing_policy {
+            ConsensusSigningPolicy::RecoveryAndFenceOnly { recovery_authority, .. } => {
+                Some(*recovery_authority)
+            }
+            ConsensusSigningPolicy::FullOnly | ConsensusSigningPolicy::HandoffOnly { .. } => None,
+        }
+    }
+
+    #[must_use]
+    pub(crate) fn recovery_authorized_value_digests(
+        &self,
+    ) -> Option<&BTreeSet<ConsensusValueDigest>> {
+        match &self.signing_policy {
+            ConsensusSigningPolicy::RecoveryAndFenceOnly { recovery_values, .. } => {
+                Some(recovery_values)
+            }
+            ConsensusSigningPolicy::FullOnly | ConsensusSigningPolicy::HandoffOnly { .. } => None,
+        }
+    }
+
+    #[must_use]
+    pub(crate) fn fence_authorized_value_digests(&self) -> Option<&BTreeSet<ConsensusValueDigest>> {
+        match &self.signing_policy {
+            ConsensusSigningPolicy::RecoveryAndFenceOnly { fence_values, .. } => Some(fence_values),
+            ConsensusSigningPolicy::FullOnly | ConsensusSigningPolicy::HandoffOnly { .. } => None,
+        }
     }
 
     #[must_use]
@@ -1068,6 +1521,24 @@ impl DepositConsensus {
     #[must_use]
     pub const fn started(&self) -> bool {
         self.started
+    }
+
+    pub(crate) fn candidate(&self) -> Option<&ConsensusValue> {
+        self.candidate.as_ref()
+    }
+
+    /// Replace only the fallback for a future proposal. Never rewrite an emitted proposal,
+    /// vote, lock, or certificate; a view certificate's prepared value still takes precedence.
+    pub(crate) fn replace_candidate(
+        &mut self,
+        identity: &dyn EnvelopeSigner,
+        candidate: ConsensusValue,
+    ) -> Result<(), ConsensusError> {
+        self.ensure_live()?;
+        self.ensure_identity(identity)?;
+        self.signing_policy.ensure_value(&candidate)?;
+        self.candidate = Some(candidate);
+        Ok(())
     }
 
     #[must_use]
@@ -1100,6 +1571,158 @@ impl DepositConsensus {
         &self.evidence
     }
 
+    /// Exact values currently backed by a stored Prepare or Commit certificate.
+    ///
+    /// This deliberately omits the raw local candidate, proposal value, and individual votes.
+    /// Service restore validation pairs the result with its separately persisted certificate
+    /// provenance, ensuring a restricted allowlist cannot be reconstructed from unbacked traffic.
+    pub(crate) fn certificate_backed_value_digests(
+        &self,
+    ) -> Result<BTreeSet<ConsensusValueDigest>, ConsensusError> {
+        self.validate_signing_policy_state()?;
+        let mut digests = BTreeSet::new();
+        let mut insert = |value: &ConsensusValue| {
+            digests.insert(value.digest());
+            Ok(())
+        };
+        if let Some(proposal) = self.current_proposal()? {
+            if let Some(proof) = &proposal.proof_of_lock {
+                insert(proof.value())?;
+            }
+            if let Some(certificate) = &proposal.view_change {
+                visit_view_certificate_values(&self.context, certificate, &mut insert)?;
+            }
+        }
+        for certificate in [&self.locked, &self.highest_prepared].into_iter().flatten() {
+            insert(certificate.value())?;
+        }
+        if let Some(certificate) = &self.committed {
+            insert(certificate.value())?;
+        }
+        if let Some(certificate) = &self.view_certificate {
+            visit_view_certificate_values(&self.context, certificate, &mut insert)?;
+        }
+        for envelope in self.next_view_changes.values() {
+            let message = decode_signed_message(&self.context, envelope)?;
+            let ConsensusMessageBody::ViewChange(change) = message.body else {
+                return Err(ConsensusError::InvalidPersistedState(
+                    "stored view change has the wrong phase",
+                ));
+            };
+            if let Some(prepared) = change.highest_prepared {
+                insert(prepared.value())?;
+            }
+        }
+        Ok(digests)
+    }
+
+    /// Atomically narrow a restricted signing policy to values still referenced by live reducer
+    /// state.
+    ///
+    /// Restricted allowlists are a signing-safety boundary, but monotonic growth across
+    /// arbitrarily many pre-GST views would eventually turn their resource cap into a liveness
+    /// failure. The keep-set covers every full application value plus digest-only current-view
+    /// votes. Prepare/commit certificates, locks, the local candidate and view certificates are
+    /// therefore preserved. Equivocation evidence is diagnostic rather than safety state; evidence
+    /// which alone references a retired value is dropped before the allowlist is narrowed.
+    ///
+    /// The update is performed on a clone and installed only after the complete reducer and signing
+    /// policy revalidate, so malformed state cannot be partially pruned.
+    pub(crate) fn prune_restricted_authorized_value_digests(
+        &mut self,
+    ) -> Result<Option<BTreeSet<ConsensusValueDigest>>, ConsensusError> {
+        if matches!(self.signing_policy, ConsensusSigningPolicy::FullOnly) {
+            return Ok(None);
+        }
+        if !self.started {
+            return Err(ConsensusError::InvalidPersistedState(
+                "cannot prune an unstarted restricted reducer",
+            ));
+        }
+
+        let mut candidate = self.clone();
+        let mut reachable = BTreeSet::new();
+        candidate.validate_application_values(|value| {
+            reachable.insert(value.digest());
+            true
+        })?;
+        for (expected_prevote, envelopes) in
+            [(true, &candidate.prevotes), (false, &candidate.precommits)]
+        {
+            for envelope in envelopes.values() {
+                let message = decode_signed_message(&candidate.context, envelope)?;
+                match message.body {
+                    ConsensusMessageBody::Prevote(vote) if expected_prevote => {
+                        reachable.insert(vote.value);
+                    }
+                    ConsensusMessageBody::Precommit(vote) if !expected_prevote => {
+                        reachable.insert(vote.value);
+                    }
+                    _ => {
+                        return Err(ConsensusError::InvalidPersistedState(
+                            "stored vote has the wrong phase",
+                        ));
+                    }
+                }
+            }
+        }
+        if reachable.is_empty() {
+            return Err(ConsensusError::InvalidPersistedState(
+                "started restricted reducer has no reachable value",
+            ));
+        }
+
+        let mut retained_evidence = VecDeque::new();
+        for evidence in &candidate.evidence {
+            let mut referenced = BTreeSet::new();
+            for envelope in [&evidence.first, &evidence.conflicting] {
+                let message = decode_signed_message(&candidate.context, envelope)?;
+                validate_message_application_values(
+                    &candidate.context,
+                    &message.body,
+                    &mut |value| {
+                        referenced.insert(value.digest());
+                        true
+                    },
+                )?;
+                match message.body {
+                    ConsensusMessageBody::Prevote(vote) | ConsensusMessageBody::Precommit(vote) => {
+                        referenced.insert(vote.value);
+                    }
+                    ConsensusMessageBody::Proposal(_) | ConsensusMessageBody::ViewChange(_) => {}
+                }
+            }
+            if referenced.is_subset(&reachable) {
+                retained_evidence.push_back(evidence.clone());
+            }
+        }
+        candidate.evidence = retained_evidence;
+
+        match &mut candidate.signing_policy {
+            ConsensusSigningPolicy::RecoveryAndFenceOnly {
+                recovery_values, fence_values, ..
+            } => {
+                recovery_values.retain(|digest| reachable.contains(digest));
+                fence_values.retain(|digest| reachable.contains(digest));
+                let authorized =
+                    recovery_values.union(fence_values).copied().collect::<BTreeSet<_>>();
+                if authorized != reachable {
+                    return Err(ConsensusError::InvalidRecoveryAndFenceSigningPolicy);
+                }
+            }
+            ConsensusSigningPolicy::HandoffOnly { authorized_values, .. } => {
+                authorized_values.retain(|digest| reachable.contains(digest));
+                if *authorized_values != reachable {
+                    return Err(ConsensusError::InvalidHandoffSigningPolicy);
+                }
+            }
+            ConsensusSigningPolicy::FullOnly => unreachable!("checked above"),
+        }
+        candidate.validate_signing_policy_state()?;
+        *self = candidate;
+        Ok(Some(reachable))
+    }
+
     /// Re-apply the application's semantic predicate after restoring a structurally and
     /// cryptographically validated snapshot. Serde cannot persist executable validation policy;
     /// callers must run this before resuming a reducer loaded from durable storage.
@@ -1110,6 +1733,7 @@ impl DepositConsensus {
     where
         F: FnMut(&ConsensusValue) -> bool,
     {
+        self.validate_signing_policy_state()?;
         let mut seen = BTreeSet::new();
         let mut check = |value: &ConsensusValue| {
             if seen.insert(value.digest()) && !validate_value(value) {
@@ -1156,14 +1780,14 @@ impl DepositConsensus {
     /// Start this height with a locally valid candidate.  Only the current leader proposes it.
     pub fn start(
         &mut self,
-        identity: &Identity,
+        identity: &dyn EnvelopeSigner,
         candidate: ConsensusValue,
     ) -> Result<ConsensusStep, ConsensusError> {
         if self.started {
             return Err(ConsensusError::AlreadyStarted);
         }
         self.ensure_identity(identity)?;
-        candidate.validate()?;
+        self.signing_policy.ensure_value(&candidate)?;
         self.started = true;
         self.candidate = Some(candidate);
         let mut step = ConsensusStep { changed: true, ..ConsensusStep::default() };
@@ -1175,30 +1799,14 @@ impl DepositConsensus {
     /// Explicitly request the next view.  The reducer never invokes this from a clock.
     pub fn request_view_change(
         &mut self,
-        identity: &Identity,
+        identity: &dyn EnvelopeSigner,
     ) -> Result<ConsensusStep, ConsensusError> {
         self.ensure_live()?;
         self.ensure_identity(identity)?;
-        let target_view = self.view.checked_add(1).ok_or(ConsensusError::ViewExhausted)?;
-        if target_view > MAX_CONSENSUS_VIEW {
-            return Err(ConsensusError::ViewExhausted);
-        }
-        if self.next_view_changes.contains_key(&self.local_party) {
+        let mut step = ConsensusStep::default();
+        if !self.emit_local_view_change(identity, &mut step)? {
             return Ok(ConsensusStep { duplicate: true, ..ConsensusStep::default() });
         }
-        let change = ViewChange {
-            from_view: self.view,
-            target_view,
-            highest_prepared: self.highest_prepared.clone(),
-        };
-        let envelope = sign_consensus_message(
-            &self.context,
-            identity,
-            ConsensusMessageBody::ViewChange(change),
-        )?;
-        self.next_view_changes.insert(self.local_party, envelope.clone());
-        let mut step =
-            ConsensusStep { broadcast: vec![envelope], changed: true, ..ConsensusStep::default() };
         self.maybe_enter_next_view(identity, &mut step)?;
         self.check_outbound(&step)?;
         Ok(step)
@@ -1209,7 +1817,7 @@ impl DepositConsensus {
     /// untrusted ingress.
     pub fn handle_structurally_valid(
         &mut self,
-        identity: &Identity,
+        identity: &dyn EnvelopeSigner,
         envelope: SignedEnvelope,
     ) -> Result<ConsensusStep, ConsensusError> {
         self.handle_with_value_validator(identity, envelope, |_| true)
@@ -1218,7 +1826,7 @@ impl DepositConsensus {
     /// Authenticate and reduce a portable message with an application validity predicate.
     pub fn handle_with_value_validator<F>(
         &mut self,
-        identity: &Identity,
+        identity: &dyn EnvelopeSigner,
         envelope: SignedEnvelope,
         mut validate_value: F,
     ) -> Result<ConsensusStep, ConsensusError>
@@ -1239,6 +1847,7 @@ impl DepositConsensus {
             step.duplicate = true;
         } else {
             let message = decode_signed_message(&self.context, &envelope)?;
+            self.signing_policy.ensure_message_body(&self.context, &message.body)?;
             let sender = envelope.from;
             match message.body {
                 ConsensusMessageBody::Proposal(proposal) => {
@@ -1276,11 +1885,114 @@ impl DepositConsensus {
         Ok(step)
     }
 
+    /// Fully authenticate and validate one portable message without applying its temporal state
+    /// transition.
+    ///
+    /// A host may use this only after independently proving that the message is semantically
+    /// dominated by durable state. In particular, stale traffic must cross the same leader,
+    /// nested-certificate, signing-policy, and application-value checks as live traffic before the
+    /// host acknowledges it. Keeping this validation stateless prevents malformed stale messages
+    /// from reaching reducer paths whose first operation is a view comparison.
+    pub(crate) fn validate_message_ingress_with_value_validator<F>(
+        &self,
+        envelope: &SignedEnvelope,
+        mut validate_value: F,
+    ) -> Result<(), ConsensusError>
+    where
+        F: FnMut(&ConsensusValue) -> bool,
+    {
+        self.ensure_live()?;
+        let message = decode_signed_message(&self.context, envelope)?;
+        self.signing_policy.ensure_message_body(&self.context, &message.body)?;
+        match &message.body {
+            ConsensusMessageBody::Proposal(proposal) => {
+                validate_proposal_structure(&self.context, proposal, envelope.from)?;
+            }
+            ConsensusMessageBody::ViewChange(change) => {
+                validate_view_change(&self.context, change)?;
+            }
+            ConsensusMessageBody::Prevote(_) | ConsensusMessageBody::Precommit(_) => {
+                // `decode_signed_message` already applies the bounded-view and nonzero-digest
+                // checks required by vote bodies.
+            }
+        }
+        validate_message_application_values(&self.context, &message.body, &mut validate_value)
+    }
+
+    /// Fully validate a portable view certificate without applying it to the reducer.
+    pub(crate) fn validate_view_certificate_ingress_with_value_validator<F>(
+        &self,
+        certificate: &ViewChangeCertificate,
+        mut validate_value: F,
+    ) -> Result<(), ConsensusError>
+    where
+        F: FnMut(&ConsensusValue) -> bool,
+    {
+        self.ensure_live()?;
+        certificate.verify(&self.context)?;
+        self.signing_policy.ensure_view_certificate(&self.context, certificate)?;
+        validate_view_certificate_application_values(
+            &self.context,
+            certificate,
+            &mut validate_value,
+        )
+    }
+
+    /// Whether this is the exact certificate already authenticated in durable reducer state.
+    ///
+    /// This is deliberately only an equality relation. Alternate quorum subsets must still cross
+    /// full ingress validation even when they target the already-installed view.
+    pub(crate) fn is_exact_view_certificate_replay(
+        &self,
+        certificate: &ViewChangeCertificate,
+    ) -> bool {
+        self.view_certificate.as_ref() == Some(certificate)
+    }
+
+    /// Initialize an unstarted reducer from an authenticated, application-valid proposal without
+    /// emitting a competing local proposal first.
+    ///
+    /// The ordinary [`Self::handle_with_value_validator`] path deliberately enforces the host's
+    /// persisted pre-proposal acceptance gate. Applications whose proposal value is itself a
+    /// complete acceptance proof may opt into this narrower bootstrap path. Non-proposal traffic
+    /// still cannot start a reducer, and the trial state is installed only after the complete
+    /// proposal (including any view certificate) has passed structural, signature, and
+    /// application validation.
+    pub fn handle_initial_proposal_with_value_validator<F>(
+        &mut self,
+        identity: &dyn EnvelopeSigner,
+        envelope: SignedEnvelope,
+        validate_value: F,
+    ) -> Result<ConsensusStep, ConsensusError>
+    where
+        F: FnMut(&ConsensusValue) -> bool,
+    {
+        if self.started {
+            return self.handle_with_value_validator(identity, envelope, validate_value);
+        }
+        self.ensure_identity(identity)?;
+        let message = decode_signed_message(&self.context, &envelope)?;
+        let ConsensusMessageBody::Proposal(proposal) = message.body else {
+            return Err(ConsensusError::NotStarted);
+        };
+        self.signing_policy.ensure_message_body(
+            &self.context,
+            &ConsensusMessageBody::Proposal(proposal.clone()),
+        )?;
+
+        let mut trial = self.clone();
+        trial.started = true;
+        trial.candidate = Some(proposal.value);
+        let step = trial.handle_with_value_validator(identity, envelope, validate_value)?;
+        *self = trial;
+        Ok(step)
+    }
+
     /// Trusted-ingress convenience wrapper for a structurally valid view certificate. Prefer
     /// [`Self::handle_view_certificate_with_validator`] at untrusted ingress.
     pub fn handle_view_certificate_structurally_valid(
         &mut self,
-        identity: &Identity,
+        identity: &dyn EnvelopeSigner,
         certificate: ViewChangeCertificate,
     ) -> Result<ConsensusStep, ConsensusError> {
         self.handle_view_certificate_with_validator(identity, certificate, |_| true)
@@ -1290,7 +2002,7 @@ impl DepositConsensus {
     /// carried by its signed view-change witnesses.
     pub fn handle_view_certificate_with_validator<F>(
         &mut self,
-        identity: &Identity,
+        identity: &dyn EnvelopeSigner,
         certificate: ViewChangeCertificate,
         mut validate_value: F,
     ) -> Result<ConsensusStep, ConsensusError>
@@ -1306,7 +2018,8 @@ impl DepositConsensus {
             return Ok(ConsensusStep { duplicate: true, ..ConsensusStep::default() });
         }
         certificate.verify(&self.context)?;
-        if certificate.target_view <= self.view {
+        self.signing_policy.ensure_view_certificate(&self.context, &certificate)?;
+        if certificate.target_view < self.view {
             return Err(ConsensusError::StaleView {
                 message: certificate.target_view,
                 current: self.view,
@@ -1317,6 +2030,14 @@ impl DepositConsensus {
             &certificate,
             &mut validate_value,
         )?;
+        // Different honest replicas may enter the same view from different valid `n-f` witness
+        // subsets. Such a certificate is not an exact replay, so it must cross every expensive
+        // cryptographic, signing-policy, and application-value check above. Once verified it is
+        // semantically dominated by the already durable current-view certificate and can be
+        // acknowledged as a duplicate without replacing that certificate.
+        if certificate.target_view == self.view {
+            return Ok(ConsensusStep { duplicate: true, ..ConsensusStep::default() });
+        }
         let mut step = ConsensusStep::default();
         self.enter_view(certificate, identity, &mut step, true)?;
         self.check_outbound(&step)?;
@@ -1348,6 +2069,7 @@ impl DepositConsensus {
             return Ok(ConsensusStep { duplicate: true, ..ConsensusStep::default() });
         }
         certificate.verify(&self.context)?;
+        self.signing_policy.ensure_commit_certificate(&certificate)?;
         if let Some(existing) = &self.committed {
             if existing.value.digest() == certificate.value.digest() {
                 return Ok(ConsensusStep { duplicate: true, ..ConsensusStep::default() });
@@ -1381,7 +2103,7 @@ impl DepositConsensus {
         envelope: SignedEnvelope,
         proposal: Proposal,
         validate_value: &mut dyn FnMut(&ConsensusValue) -> bool,
-        identity: &Identity,
+        identity: &dyn EnvelopeSigner,
         step: &mut ConsensusStep,
     ) -> Result<(), ConsensusError> {
         proposal.value.validate()?;
@@ -1495,7 +2217,7 @@ impl DepositConsensus {
         envelope: SignedEnvelope,
         change: ViewChange,
         validate_value: &mut dyn FnMut(&ConsensusValue) -> bool,
-        identity: &Identity,
+        identity: &dyn EnvelopeSigner,
         step: &mut ConsensusStep,
     ) -> Result<(), ConsensusError> {
         let expected = self.view.checked_add(1).ok_or(ConsensusError::ViewExhausted)?;
@@ -1542,12 +2264,44 @@ impl DepositConsensus {
         )?;
         self.next_view_changes.insert(sender, envelope);
         step.changed = true;
+
+        // Once `f + 1` distinct parties request the next view, at least one requester is honest.
+        // Join that request exactly once so asymmetric delivery cannot strand the committee below
+        // `n - f`; `f` Byzantine requests alone remain unable to make an honest party leave.
+        let amplification_threshold = usize::from(self.context.fault_bound()) + 1;
+        if self.next_view_changes.len() >= amplification_threshold {
+            self.emit_local_view_change(identity, step)?;
+        }
         self.maybe_enter_next_view(identity, step)
+    }
+
+    fn emit_local_view_change(
+        &mut self,
+        identity: &dyn EnvelopeSigner,
+        step: &mut ConsensusStep,
+    ) -> Result<bool, ConsensusError> {
+        let target_view = self.view.checked_add(1).ok_or(ConsensusError::ViewExhausted)?;
+        if target_view > MAX_CONSENSUS_VIEW {
+            return Err(ConsensusError::ViewExhausted);
+        }
+        if self.next_view_changes.contains_key(&self.local_party) {
+            return Ok(false);
+        }
+        let change = ViewChange {
+            from_view: self.view,
+            target_view,
+            highest_prepared: self.highest_prepared.clone(),
+        };
+        let envelope = self.sign_message(identity, ConsensusMessageBody::ViewChange(change))?;
+        self.next_view_changes.insert(self.local_party, envelope.clone());
+        step.broadcast.push(envelope);
+        step.changed = true;
+        Ok(true)
     }
 
     fn maybe_enter_next_view(
         &mut self,
-        identity: &Identity,
+        identity: &dyn EnvelopeSigner,
         step: &mut ConsensusStep,
     ) -> Result<(), ConsensusError> {
         if self.next_view_changes.len() < self.context.quorum() {
@@ -1563,7 +2317,7 @@ impl DepositConsensus {
     fn enter_view(
         &mut self,
         certificate: ViewChangeCertificate,
-        identity: &Identity,
+        identity: &dyn EnvelopeSigner,
         step: &mut ConsensusStep,
         drive: bool,
     ) -> Result<(), ConsensusError> {
@@ -1594,7 +2348,7 @@ impl DepositConsensus {
 
     fn drive(
         &mut self,
-        identity: &Identity,
+        identity: &dyn EnvelopeSigner,
         step: &mut ConsensusStep,
     ) -> Result<(), ConsensusError> {
         loop {
@@ -1627,11 +2381,8 @@ impl DepositConsensus {
                     view_change: self.view_certificate.clone(),
                 };
                 self.validate_proposal(&proposal, self.local_party)?;
-                let envelope = sign_consensus_message(
-                    &self.context,
-                    identity,
-                    ConsensusMessageBody::Proposal(proposal),
-                )?;
+                let envelope =
+                    self.sign_message(identity, ConsensusMessageBody::Proposal(proposal))?;
                 self.proposal = Some(envelope.clone());
                 step.broadcast.push(envelope);
                 step.changed = true;
@@ -1644,11 +2395,7 @@ impl DepositConsensus {
                 && self.can_prevote(&proposal)
             {
                 let vote = Vote { view: self.view, value: proposal.value.digest() };
-                let envelope = sign_consensus_message(
-                    &self.context,
-                    identity,
-                    ConsensusMessageBody::Prevote(vote),
-                )?;
+                let envelope = self.sign_message(identity, ConsensusMessageBody::Prevote(vote))?;
                 self.prevotes.insert(self.local_party, envelope.clone());
                 step.broadcast.push(envelope);
                 step.changed = true;
@@ -1666,11 +2413,8 @@ impl DepositConsensus {
                 self.update_highest_prepared(certificate.clone())?;
                 self.locked = Some(certificate);
                 let vote = Vote { view: self.view, value: digest };
-                let envelope = sign_consensus_message(
-                    &self.context,
-                    identity,
-                    ConsensusMessageBody::Precommit(vote),
-                )?;
+                let envelope =
+                    self.sign_message(identity, ConsensusMessageBody::Precommit(vote))?;
                 self.precommits.insert(self.local_party, envelope.clone());
                 step.broadcast.push(envelope);
                 step.changed = true;
@@ -1758,7 +2502,8 @@ impl DepositConsensus {
         Ok(())
     }
 
-    fn ensure_identity(&self, identity: &Identity) -> Result<(), ConsensusError> {
+    fn ensure_identity(&self, identity: &dyn EnvelopeSigner) -> Result<(), ConsensusError> {
+        self.signing_policy.ensure_signer(identity)?;
         if identity.party() != self.local_party {
             return Err(ConsensusError::WrongLocalIdentity);
         }
@@ -1767,6 +2512,16 @@ impl DepositConsensus {
             return Err(ConsensusError::WrongLocalIdentity);
         }
         Ok(())
+    }
+
+    fn sign_message(
+        &self,
+        identity: &dyn EnvelopeSigner,
+        body: ConsensusMessageBody,
+    ) -> Result<SignedEnvelope, ConsensusError> {
+        self.ensure_identity(identity)?;
+        self.signing_policy.ensure_message_body(&self.context, &body)?;
+        sign_consensus_message_unchecked(&self.context, identity, body)
     }
 
     fn ensure_live(&self) -> Result<(), ConsensusError> {
@@ -1816,6 +2571,41 @@ impl DepositConsensus {
         }
     }
 
+    fn validate_signing_policy_state(&self) -> Result<(), ConsensusError> {
+        self.signing_policy.validate(&self.context)?;
+        if let Some(candidate) = &self.candidate {
+            self.signing_policy.ensure_value(candidate)?;
+        }
+        if let Some(proposal) = &self.proposal {
+            let message = decode_signed_message(&self.context, proposal)?;
+            self.signing_policy.ensure_message_body(&self.context, &message.body)?;
+        }
+        for envelope in self.prevotes.values().chain(self.precommits.values()) {
+            let message = decode_signed_message(&self.context, envelope)?;
+            self.signing_policy.ensure_message_body(&self.context, &message.body)?;
+        }
+        for envelope in self.next_view_changes.values() {
+            let message = decode_signed_message(&self.context, envelope)?;
+            self.signing_policy.ensure_message_body(&self.context, &message.body)?;
+        }
+        for certificate in [&self.locked, &self.highest_prepared].into_iter().flatten() {
+            self.signing_policy.ensure_prepare_certificate(certificate)?;
+        }
+        if let Some(certificate) = &self.committed {
+            self.signing_policy.ensure_commit_certificate(certificate)?;
+        }
+        if let Some(certificate) = &self.view_certificate {
+            self.signing_policy.ensure_view_certificate(&self.context, certificate)?;
+        }
+        for evidence in &self.evidence {
+            for envelope in [&evidence.first, &evidence.conflicting] {
+                let message = decode_signed_message(&self.context, envelope)?;
+                self.signing_policy.ensure_message_body(&self.context, &message.body)?;
+            }
+        }
+        Ok(())
+    }
+
     fn validate_restored(&self) -> Result<(), ConsensusError> {
         if self.state_version != CONSENSUS_STATE_VERSION {
             return Err(ConsensusError::InvalidPersistedState(
@@ -1823,6 +2613,7 @@ impl DepositConsensus {
             ));
         }
         self.context.validate()?;
+        self.signing_policy.validate(&self.context)?;
         self.context
             .committee
             .member(self.local_party)
@@ -1887,6 +2678,9 @@ impl DepositConsensus {
         validate_vote_map(&self.context, self.view, MessageKind::Precommit, &self.precommits)?;
         if !self.next_view_changes.is_empty() {
             let next = self.view.checked_add(1).ok_or(ConsensusError::ViewExhausted)?;
+            if self.next_view_changes.len() >= self.context.quorum() {
+                return Err(ConsensusError::InvalidPersistedState("unapplied view-change quorum"));
+            }
             for (sender, envelope) in &self.next_view_changes {
                 if *sender != envelope.from {
                     return Err(ConsensusError::InvalidPersistedState(
@@ -1903,6 +2697,14 @@ impl DepositConsensus {
                         "stored view change targets another view",
                     ));
                 }
+            }
+            let amplification_threshold = usize::from(self.context.fault_bound()) + 1;
+            if self.next_view_changes.len() >= amplification_threshold
+                && !self.next_view_changes.contains_key(&self.local_party)
+            {
+                return Err(ConsensusError::InvalidPersistedState(
+                    "amplified view change lacks the local witness",
+                ));
             }
         }
         if let Some(locked) = &self.locked {
@@ -1985,6 +2787,7 @@ impl DepositConsensus {
             }
             validate_evidence(&self.context, evidence)?;
         }
+        self.validate_signing_policy_state()?;
         Ok(())
     }
 }
@@ -1993,7 +2796,18 @@ impl DepositConsensus {
 /// this helper without giving the reducer ownership of long-lived identity material.
 pub fn sign_consensus_message(
     context: &ConsensusContext,
-    identity: &Identity,
+    identity: &dyn EnvelopeSigner,
+    body: ConsensusMessageBody,
+) -> Result<SignedEnvelope, ConsensusError> {
+    if identity.scope() != EnvelopeSignerScope::Full {
+        return Err(ConsensusError::UnauthorizedSignerScope);
+    }
+    sign_consensus_message_unchecked(context, identity, body)
+}
+
+fn sign_consensus_message_unchecked(
+    context: &ConsensusContext,
+    identity: &dyn EnvelopeSigner,
     body: ConsensusMessageBody,
 ) -> Result<SignedEnvelope, ConsensusError> {
     context.validate()?;
@@ -2437,7 +3251,10 @@ mod tests {
     use std::collections::VecDeque;
 
     use super::*;
-    use crate::committee::Member;
+    use crate::{
+        committee::Member,
+        identity::{StableRecoverySigningIdentity, StableSigningIdentity},
+    };
 
     fn test_x25519_secret(party: PartyId, epoch: u64) -> [u8; 32] {
         let mut secret = [0x58; 32];
@@ -2446,8 +3263,12 @@ mod tests {
         secret
     }
 
-    fn fixtures() -> (ConsensusContext, Vec<Identity>) {
-        let identities = (1_u16..=4)
+    fn fixtures_with_profile(
+        member_count: u16,
+        threshold: u16,
+        fault_bound: u16,
+    ) -> (ConsensusContext, Vec<Identity>) {
+        let identities = (1_u16..=member_count)
             .map(|party| {
                 let party = PartyId(party);
                 let signing_seed = [party.0 as u8; 32];
@@ -2457,7 +3278,7 @@ mod tests {
             .collect::<Vec<_>>();
         let committee = Committee {
             epoch: 7,
-            threshold: 2,
+            threshold,
             members: identities
                 .iter()
                 .map(|identity| Member {
@@ -2478,7 +3299,7 @@ mod tests {
             },
             SessionId([6; 32]),
             committee,
-            1,
+            fault_bound,
             0,
             1,
             [0; 32],
@@ -2487,8 +3308,35 @@ mod tests {
         (context, identities)
     }
 
+    fn fixtures() -> (ConsensusContext, Vec<Identity>) {
+        fixtures_with_profile(4, 2, 1)
+    }
+
     fn value(byte: u8) -> ConsensusValue {
         ConsensusValue::new(vec![byte; 16]).unwrap()
+    }
+
+    fn stable_signer(context: &ConsensusContext, party: PartyId) -> StableSigningIdentity {
+        StableSigningIdentity::for_committee(
+            party,
+            &[u8::try_from(party.0).unwrap(); 32],
+            context.committee(),
+        )
+        .unwrap()
+    }
+
+    fn recovery_signer(
+        context: &ConsensusContext,
+        party: PartyId,
+        authority: [u8; 32],
+    ) -> StableRecoverySigningIdentity {
+        StableRecoverySigningIdentity::for_certified_transition(
+            party,
+            &[u8::try_from(party.0).unwrap(); 32],
+            context.committee(),
+            authority,
+        )
+        .unwrap()
     }
 
     fn vote_envelopes(
@@ -2511,6 +3359,401 @@ mod tests {
                 sign_consensus_message(context, &identities[*index], body).unwrap()
             })
             .collect()
+    }
+
+    fn sign_structurally_unchecked_for_test(
+        context: &ConsensusContext,
+        identity: &Identity,
+        body: ConsensusMessageBody,
+    ) -> SignedEnvelope {
+        let view = body.view();
+        let kind = body.kind();
+        let payload = postcard::to_allocvec(&ConsensusMessage::new(context, body)).unwrap();
+        identity
+            .sign_envelope(
+                context.committee(),
+                context.session(),
+                None,
+                wire_sequence(context, view, kind).unwrap(),
+                payload,
+            )
+            .unwrap()
+    }
+
+    #[test]
+    fn generic_reducer_and_public_signing_helper_reject_handoff_only_scope() {
+        let (context, identities) = fixtures();
+        let leader = context.leader(0);
+        let leader_index =
+            identities.iter().position(|identity| identity.party() == leader).unwrap();
+        let stable = stable_signer(&context, leader);
+        let candidate = value(41);
+        let body = ConsensusMessageBody::Proposal(Proposal {
+            view: 0,
+            value: candidate.clone(),
+            proof_of_lock: None,
+            view_change: None,
+        });
+
+        assert_eq!(
+            sign_consensus_message(&context, &stable, body),
+            Err(ConsensusError::UnauthorizedSignerScope)
+        );
+
+        let mut reducer = DepositConsensus::new(context, leader).unwrap();
+        assert_eq!(
+            reducer.authorize_handoff_value_digests([candidate.digest()]),
+            Err(ConsensusError::InvalidHandoffSigningPolicy)
+        );
+        assert_eq!(reducer.start(&stable, candidate), Err(ConsensusError::UnauthorizedSignerScope));
+        assert!(!reducer.started());
+        assert!(reducer.start(&identities[leader_index], value(42)).is_ok());
+    }
+
+    #[test]
+    fn recovery_and_fence_reducer_binds_authority_scope_and_value_classes() {
+        let (context, identities) = fixtures();
+        let leader = context.leader(0);
+        let leader_index =
+            identities.iter().position(|identity| identity.party() == leader).unwrap();
+        let authority = [0x71; 32];
+        let recovery = value(71);
+        let fence = value(72);
+        let unauthorized = value(73);
+        let signer = recovery_signer(&context, leader, authority);
+        let wrong_signer = recovery_signer(&context, leader, [0x72; 32]);
+        let final_handoff_signer = stable_signer(&context, leader);
+
+        assert_eq!(
+            DepositConsensus::new_recovery_and_fence_only(
+                context.clone(),
+                leader,
+                [0; 32],
+                [recovery.digest()],
+                [fence.digest()],
+            ),
+            Err(ConsensusError::InvalidRecoveryAndFenceSigningPolicy)
+        );
+        assert_eq!(
+            DepositConsensus::new_recovery_and_fence_only(
+                context.clone(),
+                leader,
+                authority,
+                [],
+                [],
+            ),
+            Err(ConsensusError::InvalidRecoveryAndFenceSigningPolicy)
+        );
+
+        let new_reducer = || {
+            DepositConsensus::new_recovery_and_fence_only(
+                context.clone(),
+                leader,
+                authority,
+                [recovery.digest()],
+                [fence.digest()],
+            )
+            .unwrap()
+        };
+        let mut wrong_authority = new_reducer();
+        assert_eq!(
+            wrong_authority.start(&wrong_signer, recovery.clone()),
+            Err(ConsensusError::UnauthorizedSignerScope)
+        );
+        let mut wrong_scope = new_reducer();
+        assert_eq!(
+            wrong_scope.start(&final_handoff_signer, recovery.clone()),
+            Err(ConsensusError::UnauthorizedSignerScope)
+        );
+        let mut unauthorized_value = new_reducer();
+        assert_eq!(
+            unauthorized_value.start(&signer, unauthorized.clone()),
+            Err(ConsensusError::UnauthorizedRecoveryAndFenceValue)
+        );
+
+        let mut full_driven = new_reducer();
+        assert!(full_driven.start(&identities[leader_index], fence.clone()).is_ok());
+        let mut recovery_driven = new_reducer();
+        assert!(recovery_driven.start(&signer, recovery.clone()).is_ok());
+
+        let mut expanding = new_reducer();
+        expanding.authorize_recovery_value_digests([unauthorized.digest()]).unwrap();
+        assert_eq!(
+            expanding.recovery_authorized_value_digests(),
+            Some(&[recovery.digest(), unauthorized.digest()].into_iter().collect::<BTreeSet<_>>())
+        );
+        let baseline = expanding.clone();
+        assert_eq!(
+            expanding.authorize_fence_value_digests([recovery.digest()]),
+            Err(ConsensusError::InvalidRecoveryAndFenceSigningPolicy)
+        );
+        assert_eq!(expanding, baseline);
+        assert_eq!(expanding.recovery_authority_digest(), Some(authority));
+        assert!(expanding.is_recovery_and_fence_only());
+        assert!(!expanding.is_handoff_only());
+
+        let mut handoff =
+            DepositConsensus::new_handoff_only(context, leader, [recovery.digest()]).unwrap();
+        assert_eq!(
+            handoff.authorize_recovery_value_digests([unauthorized.digest()]),
+            Err(ConsensusError::InvalidRecoveryAndFenceSigningPolicy)
+        );
+        assert_eq!(handoff.start(&signer, recovery), Err(ConsensusError::UnauthorizedSignerScope));
+    }
+
+    #[test]
+    fn recovery_policy_and_certificate_backing_survive_restart() {
+        let (context, identities) = fixtures();
+        let local_index =
+            identities.iter().position(|identity| identity.party() != context.leader(0)).unwrap();
+        let local_party = identities[local_index].party();
+        let authority = [0x81; 32];
+        let recovery = value(81);
+        let fence = value(82);
+        let signer = recovery_signer(&context, local_party, authority);
+        let mut reducer = DepositConsensus::new_recovery_and_fence_only(
+            context.clone(),
+            local_party,
+            authority,
+            [recovery.digest()],
+            [fence.digest()],
+        )
+        .unwrap();
+        reducer.start(&signer, recovery.clone()).unwrap();
+
+        let prepare = PrepareCertificate::from_witnesses(
+            &context,
+            0,
+            recovery.clone(),
+            vote_envelopes(&context, &identities, MessageKind::Prevote, 0, &recovery, &[0, 1, 2]),
+        )
+        .unwrap();
+        let sender_index =
+            identities.iter().position(|identity| identity.party() != local_party).unwrap();
+        let change = sign_consensus_message(
+            &context,
+            &identities[sender_index],
+            ConsensusMessageBody::ViewChange(ViewChange {
+                from_view: 0,
+                target_view: 1,
+                highest_prepared: Some(prepare),
+            }),
+        )
+        .unwrap();
+        reducer.handle_with_value_validator(&signer, change, |_| true).unwrap();
+        assert_eq!(
+            reducer.certificate_backed_value_digests().unwrap(),
+            [recovery.digest()].into_iter().collect()
+        );
+
+        let bytes = postcard::to_allocvec(&reducer).unwrap();
+        let restored: DepositConsensus = postcard::from_bytes(&bytes).unwrap();
+        assert_eq!(restored.recovery_authority_digest(), Some(authority));
+        assert_eq!(
+            restored.recovery_authorized_value_digests(),
+            Some(&[recovery.digest()].into_iter().collect())
+        );
+        assert_eq!(
+            restored.fence_authorized_value_digests(),
+            Some(&[fence.digest()].into_iter().collect())
+        );
+        assert_eq!(
+            restored.certificate_backed_value_digests().unwrap(),
+            [recovery.digest()].into_iter().collect()
+        );
+    }
+
+    #[test]
+    fn restricted_policy_gc_preserves_live_vote_and_candidate_across_restart() {
+        let (context, identities) = fixtures();
+        let local_party = context.leader(0);
+        let authority = [0x83; 32];
+        let candidate = value(83);
+        let live_vote = value(84);
+        let stale_evidence_only = value(85);
+        let signer = recovery_signer(&context, local_party, authority);
+        let mut reducer = DepositConsensus::new_recovery_and_fence_only(
+            context.clone(),
+            local_party,
+            authority,
+            [candidate.digest()],
+            [live_vote.digest(), stale_evidence_only.digest()],
+        )
+        .unwrap();
+        reducer.start(&signer, candidate.clone()).unwrap();
+
+        let voter = identities.iter().find(|identity| identity.party() != local_party).unwrap();
+        let live = sign_consensus_message(
+            &context,
+            voter,
+            ConsensusMessageBody::Prevote(Vote { view: 0, value: live_vote.digest() }),
+        )
+        .unwrap();
+        reducer.handle_with_value_validator(&signer, live, |_| true).unwrap();
+        let conflicting = sign_consensus_message(
+            &context,
+            voter,
+            ConsensusMessageBody::Prevote(Vote { view: 0, value: stale_evidence_only.digest() }),
+        )
+        .unwrap();
+        reducer.handle_with_value_validator(&signer, conflicting, |_| true).unwrap();
+        assert_eq!(reducer.evidence().len(), 1);
+
+        let expected = BTreeSet::from([candidate.digest(), live_vote.digest()]);
+        assert_eq!(
+            reducer.prune_restricted_authorized_value_digests().unwrap(),
+            Some(expected.clone()),
+        );
+        assert_eq!(
+            reducer.recovery_authorized_value_digests(),
+            Some(&BTreeSet::from([candidate.digest()])),
+        );
+        assert_eq!(
+            reducer.fence_authorized_value_digests(),
+            Some(&BTreeSet::from([live_vote.digest()])),
+        );
+        assert!(reducer.evidence().is_empty());
+        reducer.validate_application_values(|value| expected.contains(&value.digest())).unwrap();
+
+        let bytes = postcard::to_allocvec(&reducer).unwrap();
+        let mut restored: DepositConsensus = postcard::from_bytes(&bytes).unwrap();
+        assert_eq!(restored, reducer);
+        assert_eq!(restored.prune_restricted_authorized_value_digests().unwrap(), Some(expected),);
+    }
+
+    #[test]
+    fn handoff_reducer_accepts_only_allowlisted_values_for_full_and_stable_signers() {
+        let (context, identities) = fixtures();
+        let leader = context.leader(0);
+        let leader_index =
+            identities.iter().position(|identity| identity.party() == leader).unwrap();
+        let stable = stable_signer(&context, leader);
+        let allowed = value(51);
+        let unauthorized = value(52);
+
+        let mut full_attempt =
+            DepositConsensus::new_handoff_only(context.clone(), leader, [allowed.digest()])
+                .unwrap();
+        assert_eq!(
+            full_attempt.start(&identities[leader_index], unauthorized.clone()),
+            Err(ConsensusError::UnauthorizedHandoffValue)
+        );
+        assert!(!full_attempt.started());
+        full_attempt.authorize_handoff_value_digests([unauthorized.digest()]).unwrap();
+        assert!(full_attempt.start(&identities[leader_index], unauthorized.clone()).is_ok());
+
+        let mut stable_attempt =
+            DepositConsensus::new_handoff_only(context, leader, [allowed.digest()]).unwrap();
+        assert_eq!(
+            stable_attempt.start(&stable, unauthorized),
+            Err(ConsensusError::UnauthorizedHandoffValue)
+        );
+        assert!(!stable_attempt.started());
+        let step = stable_attempt.start(&stable, allowed).unwrap();
+        assert!(!step.broadcast.is_empty());
+    }
+
+    #[test]
+    fn handoff_policy_survives_restart_and_rejects_proposals_votes_and_view_proofs() {
+        let (context, identities) = fixtures();
+        let local_index =
+            identities.iter().position(|identity| identity.party() != context.leader(0)).unwrap();
+        let local_party = identities[local_index].party();
+        let stable = stable_signer(&context, local_party);
+        let allowed = value(61);
+        let unauthorized = value(62);
+        let mut reducer =
+            DepositConsensus::new_handoff_only(context.clone(), local_party, [allowed.digest()])
+                .unwrap();
+        reducer.start(&stable, allowed).unwrap();
+        let bytes = postcard::to_allocvec(&reducer).unwrap();
+        let mut reducer: DepositConsensus = postcard::from_bytes(&bytes).unwrap();
+        assert!(reducer.is_handoff_only());
+        let baseline = reducer.clone();
+
+        let leader_index =
+            identities.iter().position(|identity| identity.party() == context.leader(0)).unwrap();
+        let proposal = sign_consensus_message(
+            &context,
+            &identities[leader_index],
+            ConsensusMessageBody::Proposal(Proposal {
+                view: 0,
+                value: unauthorized.clone(),
+                proof_of_lock: None,
+                view_change: None,
+            }),
+        )
+        .unwrap();
+        assert_eq!(
+            reducer.handle_with_value_validator(&stable, proposal, |_| true),
+            Err(ConsensusError::UnauthorizedHandoffValue)
+        );
+        assert_eq!(reducer, baseline);
+
+        let vote = sign_consensus_message(
+            &context,
+            &identities[leader_index],
+            ConsensusMessageBody::Prevote(Vote { view: 0, value: unauthorized.digest() }),
+        )
+        .unwrap();
+        assert_eq!(
+            reducer.handle_with_value_validator(&stable, vote, |_| true),
+            Err(ConsensusError::UnauthorizedHandoffValue)
+        );
+        assert_eq!(reducer, baseline);
+
+        let prepare = PrepareCertificate::from_witnesses(
+            &context,
+            0,
+            unauthorized.clone(),
+            vote_envelopes(
+                &context,
+                &identities,
+                MessageKind::Prevote,
+                0,
+                &unauthorized,
+                &[0, 1, 2],
+            ),
+        )
+        .unwrap();
+        let direct_view_change = sign_consensus_message(
+            &context,
+            &identities[leader_index],
+            ConsensusMessageBody::ViewChange(ViewChange {
+                from_view: 0,
+                target_view: 1,
+                highest_prepared: Some(prepare.clone()),
+            }),
+        )
+        .unwrap();
+        assert_eq!(
+            reducer.handle_with_value_validator(&stable, direct_view_change, |_| true),
+            Err(ConsensusError::UnauthorizedHandoffValue)
+        );
+        assert_eq!(reducer, baseline);
+
+        let changes = identities
+            .iter()
+            .take(context.quorum())
+            .map(|identity| {
+                sign_consensus_message(
+                    &context,
+                    identity,
+                    ConsensusMessageBody::ViewChange(ViewChange {
+                        from_view: 0,
+                        target_view: 1,
+                        highest_prepared: Some(prepare.clone()),
+                    }),
+                )
+                .unwrap()
+            })
+            .collect();
+        let certificate = ViewChangeCertificate::from_witnesses(&context, 1, changes).unwrap();
+        assert_eq!(
+            reducer.handle_view_certificate_with_validator(&stable, certificate, |_| true),
+            Err(ConsensusError::UnauthorizedHandoffValue)
+        );
+        assert_eq!(reducer, baseline);
     }
 
     #[test]
@@ -2604,7 +3847,7 @@ mod tests {
         let (context, identities) = fixtures();
         let mut node = DepositConsensus::new(context.clone(), PartyId(4)).unwrap();
         node.start(&identities[3], value(1)).unwrap();
-        for identity in identities.iter().take(3) {
+        for identity in identities.iter().take(2) {
             let envelope = sign_consensus_message(
                 &context,
                 identity,
@@ -2633,6 +3876,239 @@ mod tests {
             node.handle_structurally_valid(&identities[3], old),
             Err(ConsensusError::StaleView { message: 0, current: 1 })
         );
+    }
+
+    #[test]
+    fn stateless_ingress_fully_validates_dominated_nested_bodies_without_mutation() {
+        let (context, identities) = fixtures();
+        let candidate = value(71);
+        let local = PartyId(4);
+        let mut node = DepositConsensus::new(context.clone(), local).unwrap();
+        node.start(&identities[3], candidate.clone()).unwrap();
+        let certificate = |target_view: u64, highest_prepared: Option<PrepareCertificate>| {
+            let witnesses = identities
+                .iter()
+                .take(context.quorum())
+                .map(|identity| {
+                    sign_consensus_message(
+                        &context,
+                        identity,
+                        ConsensusMessageBody::ViewChange(ViewChange {
+                            from_view: target_view - 1,
+                            target_view,
+                            highest_prepared: highest_prepared.clone(),
+                        }),
+                    )
+                    .unwrap()
+                })
+                .collect();
+            ViewChangeCertificate::from_witnesses(&context, target_view, witnesses).unwrap()
+        };
+        let view_one = certificate(1, None);
+        for target_view in [1_u64, 2] {
+            let entered = node
+                .handle_view_certificate_structurally_valid(
+                    &identities[3],
+                    if target_view == 1 {
+                        view_one.clone()
+                    } else {
+                        certificate(target_view, None)
+                    },
+                )
+                .unwrap()
+                .entered_view;
+            assert_eq!(entered, Some(target_view));
+        }
+        assert_eq!(node.view(), 2);
+        let baseline = node.clone();
+
+        let leader = context.leader(1);
+        let leader_identity =
+            identities.iter().find(|identity| identity.party() == leader).unwrap();
+        let valid_stale_proposal = sign_consensus_message(
+            &context,
+            leader_identity,
+            ConsensusMessageBody::Proposal(Proposal {
+                view: 1,
+                value: candidate.clone(),
+                proof_of_lock: None,
+                view_change: Some(view_one),
+            }),
+        )
+        .unwrap();
+        assert_eq!(
+            node.validate_message_ingress_with_value_validator(&valid_stale_proposal, |_| false),
+            Err(ConsensusError::InvalidApplicationValue)
+        );
+
+        let wrong_leader = identities.iter().find(|identity| identity.party() != leader).unwrap();
+        let wrong_leader_proposal = sign_consensus_message(
+            &context,
+            wrong_leader,
+            ConsensusMessageBody::Proposal(Proposal {
+                view: 1,
+                value: candidate.clone(),
+                proof_of_lock: None,
+                view_change: Some(certificate(1, None)),
+            }),
+        )
+        .unwrap();
+        let mut wrong_leader_application_checks = 0;
+        assert_eq!(
+            node.validate_message_ingress_with_value_validator(&wrong_leader_proposal, |_| {
+                wrong_leader_application_checks += 1;
+                true
+            },),
+            Err(ConsensusError::WrongLeader)
+        );
+        assert_eq!(wrong_leader_application_checks, 0);
+
+        let prepared_zero = PrepareCertificate::from_witnesses(
+            &context,
+            0,
+            candidate.clone(),
+            vote_envelopes(&context, &identities, MessageKind::Prevote, 0, &candidate, &[0, 1, 2]),
+        )
+        .unwrap();
+        let valid_stale_change = sign_consensus_message(
+            &context,
+            &identities[0],
+            ConsensusMessageBody::ViewChange(ViewChange {
+                from_view: 0,
+                target_view: 1,
+                highest_prepared: Some(prepared_zero.clone()),
+            }),
+        )
+        .unwrap();
+        assert_eq!(
+            node.validate_message_ingress_with_value_validator(&valid_stale_change, |_| false),
+            Err(ConsensusError::InvalidApplicationValue)
+        );
+
+        let prepared_same_view = PrepareCertificate::from_witnesses(
+            &context,
+            1,
+            candidate.clone(),
+            vote_envelopes(&context, &identities, MessageKind::Prevote, 1, &candidate, &[0, 1, 2]),
+        )
+        .unwrap();
+        let malformed_stale_change = sign_structurally_unchecked_for_test(
+            &context,
+            &identities[0],
+            ConsensusMessageBody::ViewChange(ViewChange {
+                from_view: 0,
+                target_view: 1,
+                highest_prepared: Some(prepared_same_view),
+            }),
+        );
+        let mut malformed_application_checks = 0;
+        assert_eq!(
+            node.validate_message_ingress_with_value_validator(&malformed_stale_change, |_| {
+                malformed_application_checks += 1;
+                true
+            },),
+            Err(ConsensusError::InvalidCertificate("view change carries a non-prior prepare"))
+        );
+        assert_eq!(malformed_application_checks, 0);
+
+        let alternate_stale_certificate = certificate(1, Some(prepared_zero));
+        assert_eq!(
+            node.validate_view_certificate_ingress_with_value_validator(
+                &alternate_stale_certificate,
+                |_| false,
+            ),
+            Err(ConsensusError::InvalidApplicationValue)
+        );
+        assert_eq!(node, baseline);
+    }
+
+    #[test]
+    fn f_plus_one_view_changes_amplify_once_and_survive_restart() {
+        let (context, identities) = fixtures_with_profile(5, 3, 1);
+        let local_index = 4;
+        let local_party = identities[local_index].party();
+        let mut node = DepositConsensus::new(context.clone(), local_party).unwrap();
+        node.start(&identities[local_index], value(10)).unwrap();
+        let change = |index: usize| {
+            sign_consensus_message(
+                &context,
+                &identities[index],
+                ConsensusMessageBody::ViewChange(ViewChange {
+                    from_view: 0,
+                    target_view: 1,
+                    highest_prepared: None,
+                }),
+            )
+            .unwrap()
+        };
+        let first = change(0);
+        let second = change(1);
+        let third = change(2);
+
+        let below_threshold =
+            node.handle_structurally_valid(&identities[local_index], first.clone()).unwrap();
+        assert!(below_threshold.changed);
+        assert!(below_threshold.broadcast.is_empty());
+        assert_eq!(node.view(), 0);
+        assert_eq!(node.next_view_changes.len(), usize::from(context.fault_bound()));
+        assert!(!node.next_view_changes.contains_key(&local_party));
+
+        let before_duplicate = node.clone();
+        let duplicate = node.handle_structurally_valid(&identities[local_index], first).unwrap();
+        assert!(duplicate.duplicate);
+        assert!(!duplicate.changed);
+        assert!(duplicate.broadcast.is_empty());
+        assert_eq!(node, before_duplicate);
+
+        let encoded = postcard::to_allocvec(&node).unwrap();
+        let mut node: DepositConsensus = postcard::from_bytes(&encoded).unwrap();
+        assert_eq!(node, before_duplicate);
+
+        let amplified =
+            node.handle_structurally_valid(&identities[local_index], second.clone()).unwrap();
+        assert!(amplified.changed);
+        assert!(!amplified.duplicate);
+        assert_eq!(amplified.broadcast.len(), 1);
+        assert_eq!(node.view(), 0);
+        assert_eq!(node.next_view_changes.len(), 3);
+        let local_change = node.next_view_changes.get(&local_party).unwrap();
+        assert_eq!(amplified.broadcast, vec![local_change.clone()]);
+        let message = decode_consensus_message(&context, local_change).unwrap();
+        assert_eq!(
+            message.body,
+            ConsensusMessageBody::ViewChange(ViewChange {
+                from_view: 0,
+                target_view: 1,
+                highest_prepared: None,
+            })
+        );
+
+        let mut invalid_snapshot = node.clone();
+        invalid_snapshot.next_view_changes.remove(&local_party);
+        let encoded = postcard::to_allocvec(&invalid_snapshot).unwrap();
+        assert!(postcard::from_bytes::<DepositConsensus>(&encoded).is_err());
+
+        let mut unapplied_quorum = node.clone();
+        unapplied_quorum.next_view_changes.insert(third.from, third.clone());
+        let encoded = postcard::to_allocvec(&unapplied_quorum).unwrap();
+        assert!(postcard::from_bytes::<DepositConsensus>(&encoded).is_err());
+
+        let encoded = postcard::to_allocvec(&node).unwrap();
+        let mut restored: DepositConsensus = postcard::from_bytes(&encoded).unwrap();
+        assert_eq!(restored, node);
+        let before_duplicate = restored.clone();
+        let duplicate =
+            restored.handle_structurally_valid(&identities[local_index], second).unwrap();
+        assert!(duplicate.duplicate);
+        assert!(!duplicate.changed);
+        assert!(duplicate.broadcast.is_empty());
+        assert_eq!(restored, before_duplicate);
+
+        let entered = restored.handle_structurally_valid(&identities[local_index], third).unwrap();
+        assert_eq!(entered.entered_view, Some(1));
+        assert!(entered.relay_view_certificate.is_some());
+        assert_eq!(restored.view(), 1);
+        assert!(restored.next_view_changes.is_empty());
     }
 
     #[test]
@@ -2753,6 +4229,54 @@ mod tests {
     }
 
     #[test]
+    fn explicit_initial_proposal_bootstrap_preserves_the_default_acceptance_gate() {
+        let (context, identities) = fixtures();
+        let candidate = value(13);
+        let proposal = sign_consensus_message(
+            &context,
+            &identities[0],
+            ConsensusMessageBody::Proposal(Proposal {
+                view: 0,
+                value: candidate.clone(),
+                proof_of_lock: None,
+                view_change: None,
+            }),
+        )
+        .unwrap();
+
+        let mut ordinary = DepositConsensus::new(context.clone(), PartyId(3)).unwrap();
+        assert_eq!(
+            ordinary.handle_with_value_validator(&identities[2], proposal.clone(), |_| true),
+            Err(ConsensusError::NotStarted)
+        );
+        assert!(!ordinary.started());
+
+        let mut rejected = DepositConsensus::new(context.clone(), PartyId(3)).unwrap();
+        assert_eq!(
+            rejected.handle_initial_proposal_with_value_validator(
+                &identities[2],
+                proposal.clone(),
+                |_| false,
+            ),
+            Err(ConsensusError::InvalidApplicationValue)
+        );
+        assert!(!rejected.started());
+
+        let mut bootstrapped = DepositConsensus::new(context, PartyId(3)).unwrap();
+        let step = bootstrapped
+            .handle_initial_proposal_with_value_validator(&identities[2], proposal, |value| {
+                value == &candidate
+            })
+            .unwrap();
+        assert!(bootstrapped.started());
+        assert!(step.changed);
+        assert!(step.broadcast.iter().any(|envelope| matches!(
+            decode_consensus_message(bootstrapped.context(), envelope).unwrap().body,
+            ConsensusMessageBody::Prevote(_)
+        )));
+    }
+
+    #[test]
     fn exact_proposal_and_view_certificate_replays_skip_nested_verification_after_restart() {
         let (context, identities) = fixtures();
         let candidate = value(21);
@@ -2785,7 +4309,7 @@ mod tests {
         .unwrap();
 
         let mut node = DepositConsensus::new(context.clone(), PartyId(3)).unwrap();
-        node.start(&identities[2], candidate).unwrap();
+        node.start(&identities[2], candidate.clone()).unwrap();
         node.handle_view_certificate_structurally_valid(&identities[2], certificate.clone())
             .unwrap();
         node.handle_structurally_valid(&identities[2], proposal.clone()).unwrap();
@@ -2827,18 +4351,27 @@ mod tests {
         assert_eq!(replay_values, 0);
         assert_eq!(take_view_certificate_verifications(), 0);
 
-        // Another valid quorum subset is logically related but not an exact replay. It still
-        // verifies before being rejected as stale.
+        // Another valid quorum subset is logically related but not an exact replay. It must cross
+        // full certificate and nested application validation before it can be treated as a
+        // semantic duplicate of the already installed current-view authority.
+        let alternate_prepare = PrepareCertificate::from_witnesses(
+            &context,
+            0,
+            candidate.clone(),
+            vote_envelopes(&context, &identities, MessageKind::Prevote, 0, &candidate, &[0, 1, 2]),
+        )
+        .unwrap();
         let alternate_changes = [0_usize, 1, 3]
             .into_iter()
-            .map(|index| {
+            .enumerate()
+            .map(|(position, index)| {
                 sign_consensus_message(
                     &context,
                     &identities[index],
                     ConsensusMessageBody::ViewChange(ViewChange {
                         from_view: 0,
                         target_view: 1,
-                        highest_prepared: None,
+                        highest_prepared: (position == 0).then(|| alternate_prepare.clone()),
                     }),
                 )
                 .unwrap()
@@ -2847,10 +4380,16 @@ mod tests {
         let alternate =
             ViewChangeCertificate::from_witnesses(&context, 1, alternate_changes).unwrap();
         let _ = take_view_certificate_verifications();
-        assert_eq!(
-            restored.handle_view_certificate_structurally_valid(&identities[2], alternate),
-            Err(ConsensusError::StaleView { message: 1, current: 1 })
-        );
+        let mut alternate_values = 0;
+        let semantic_replay = restored
+            .handle_view_certificate_with_validator(&identities[2], alternate, |value| {
+                alternate_values += 1;
+                value == &candidate
+            })
+            .unwrap();
+        assert!(semantic_replay.duplicate);
+        assert!(!semantic_replay.changed);
+        assert_eq!(alternate_values, 1);
         assert!(take_view_certificate_verifications() > 0);
 
         // A conflicting leader proposal is also non-equal, so its nested proof is verified and
@@ -3123,6 +4662,7 @@ mod tests {
         // Height zero/view one rotates to party two, which must ignore its local candidate.
         let mut leader = DepositConsensus::new(context.clone(), PartyId(2)).unwrap();
         leader.start(&identities[1], value(99)).unwrap();
+        leader.replace_candidate(&identities[1], value(100)).unwrap();
         let mut final_step = ConsensusStep::default();
         for change in changes {
             final_step = leader.handle_structurally_valid(&identities[1], change).unwrap();
@@ -3143,6 +4683,50 @@ mod tests {
         assert_eq!(proposal.value, locked_value);
         assert_eq!(proposal.proof_of_lock, Some(prepare));
         assert_eq!(proposal.view_change, Some(certificate));
+    }
+
+    #[test]
+    fn replacing_fallback_preserves_signed_state_and_waits_for_a_new_view() {
+        let (context, identities) = fixtures();
+        let mut leader = DepositConsensus::new(context.clone(), PartyId(1)).unwrap();
+        leader.start(&identities[0], value(8)).unwrap();
+        let proposal = leader.proposal.clone();
+        let votes = leader.prevotes.clone();
+        leader.replace_candidate(&identities[0], value(9)).unwrap();
+        assert_eq!(leader.proposal, proposal);
+        assert_eq!(leader.prevotes, votes);
+        let restarted: DepositConsensus =
+            postcard::from_bytes(&postcard::to_allocvec(&leader).unwrap()).unwrap();
+        assert_eq!(restarted.candidate(), Some(&value(9)));
+        assert_eq!(restarted.proposal, proposal);
+
+        let mut next = DepositConsensus::new(context.clone(), PartyId(2)).unwrap();
+        next.start(&identities[1], value(8)).unwrap();
+        next.replace_candidate(&identities[1], value(9)).unwrap();
+        let changes = identities
+            .iter()
+            .take(3)
+            .map(|identity| {
+                sign_consensus_message(
+                    &context,
+                    identity,
+                    ConsensusMessageBody::ViewChange(ViewChange {
+                        from_view: 0,
+                        target_view: 1,
+                        highest_prepared: None,
+                    }),
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let certificate = ViewChangeCertificate::from_witnesses(&context, 1, changes).unwrap();
+        let step = next
+            .handle_view_certificate_with_validator(&identities[1], certificate, |_| true)
+            .unwrap();
+        assert!(step.broadcast.iter().any(|envelope| {
+            matches!(decode_consensus_message(&context, envelope).unwrap().body,
+                ConsensusMessageBody::Proposal(proposal) if proposal.value == value(9))
+        }));
     }
 
     #[test]

@@ -34,7 +34,7 @@ async fn test_blockchain() {
   assert_eq!(latest_block.hash(), hashes[0]);
   assert_eq!(rpc.block(hashes[0]).await.unwrap(), latest_block);
 
-  let contiguous_blocks = rpc.contiguous_blocks(number ..= number).await.unwrap();
+  let contiguous_blocks = rpc.contiguous_blocks(number..=number).await.unwrap();
   assert_eq!(contiguous_blocks.len(), 1);
   assert_eq!(contiguous_blocks[0], latest_block);
 
@@ -42,7 +42,7 @@ async fn test_blockchain() {
     .generate_blocks(&MoneroAddress::from_str(Network::Mainnet, ADDRESS).unwrap(), 2000)
     .await
     .unwrap();
-  let contiguous_blocks = rpc.contiguous_blocks(number ..= new_number).await.unwrap();
+  let contiguous_blocks = rpc.contiguous_blocks(number..=new_number).await.unwrap();
   assert_eq!(contiguous_blocks[0], latest_block);
   assert_eq!(
     &{
@@ -52,13 +52,13 @@ async fn test_blockchain() {
       }
       blocks
     },
-    &contiguous_blocks[1 ..]
+    &contiguous_blocks[1..]
   );
   assert_eq!(contiguous_blocks.len(), new_number - number + 1);
   for ((block, hash), number) in contiguous_blocks
     .iter()
     .zip(core::iter::once(latest_block.hash()).chain(hashes))
-    .zip(number ..= new_number)
+    .zip(number..=new_number)
   {
     assert_eq!(block.hash(), hash);
     assert_eq!(block.number(), number);
@@ -96,32 +96,32 @@ async fn test_decoys() {
   {
     let distribution_len = rpc.latest_block_number().await.unwrap() + 1;
 
-    rpc.ringct_output_distribution(0 ..= distribution_len).await.unwrap_err();
+    rpc.ringct_output_distribution(0..=distribution_len).await.unwrap_err();
     assert_eq!(
-      rpc.ringct_output_distribution(0 .. distribution_len).await.unwrap().len(),
+      rpc.ringct_output_distribution(0..distribution_len).await.unwrap().len(),
       distribution_len
     );
     assert_eq!(
-      rpc.ringct_output_distribution(.. distribution_len).await.unwrap().len(),
+      rpc.ringct_output_distribution(..distribution_len).await.unwrap().len(),
       distribution_len
     );
 
     assert_eq!(
-      rpc.ringct_output_distribution(.. (distribution_len - 1)).await.unwrap().len(),
+      rpc.ringct_output_distribution(..(distribution_len - 1)).await.unwrap().len(),
       distribution_len - 1
     );
     assert_eq!(
-      rpc.ringct_output_distribution(1 .. distribution_len).await.unwrap().len(),
+      rpc.ringct_output_distribution(1..distribution_len).await.unwrap().len(),
       distribution_len - 1
     );
 
-    assert_eq!(rpc.ringct_output_distribution(0 ..= 0).await.unwrap().len(), 1);
-    assert_eq!(rpc.ringct_output_distribution(0 ..= 1).await.unwrap().len(), 2);
-    assert_eq!(rpc.ringct_output_distribution(1 ..= 1).await.unwrap().len(), 1);
+    assert_eq!(rpc.ringct_output_distribution(0..=0).await.unwrap().len(), 1);
+    assert_eq!(rpc.ringct_output_distribution(0..=1).await.unwrap().len(), 2);
+    assert_eq!(rpc.ringct_output_distribution(1..=1).await.unwrap().len(), 1);
 
-    rpc.ringct_output_distribution(0 .. 0).await.unwrap_err();
+    rpc.ringct_output_distribution(0..0).await.unwrap_err();
     #[expect(clippy::reversed_empty_ranges)]
-    rpc.ringct_output_distribution(1 .. 0).await.unwrap_err();
+    rpc.ringct_output_distribution(1..0).await.unwrap_err();
   }
 
   {
@@ -129,7 +129,7 @@ async fn test_decoys() {
 
     let lock_satisfied = latest_block_number - monero_oxide::COINBASE_LOCK_WINDOW;
     let lock_satisfied =
-      rpc.ringct_output_distribution(lock_satisfied ..= lock_satisfied).await.unwrap();
+      rpc.ringct_output_distribution(lock_satisfied..=lock_satisfied).await.unwrap();
     assert_eq!(lock_satisfied.len(), 1);
 
     {

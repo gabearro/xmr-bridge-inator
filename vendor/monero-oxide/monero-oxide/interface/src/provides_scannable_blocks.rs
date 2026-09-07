@@ -170,7 +170,7 @@ pub trait ProvidesUnvalidatedScannableBlocks: Sync {
     number: usize,
   ) -> impl Send + Future<Output = Result<UnvalidatedScannableBlock, InterfaceError>> {
     async move {
-      let mut blocks = self.contiguous_scannable_blocks(number ..= number).await?;
+      let mut blocks = self.contiguous_scannable_blocks(number..=number).await?;
       if blocks.len() != 1 {
         Err(InterfaceError::InternalError(format!(
           "`{}` returned {} blocks, expected {}",

@@ -1,17 +1,16 @@
 //! Fresh-format, bounded QUIC catch-up payloads for the deposit protocol.
 //!
-//! A joining party starts from one [`DepositSyncAdvertisement`], verifies its quorum-authenticated
-//! portable index checkpoint, and follows only content references reached from the advertised
-//! compact-registry and portable-index roots. Peers are availability providers: an object is not
-//! authoritative merely because a peer returned it. The caller must feed registry objects through
-//! [`crate::compact_registry_archive`] and index objects through [`crate::deposit_index`] while
-//! walking those authenticated roots.
+//! A joining party starts from one [`DepositSyncAdvertisement`]. Advertised roots can be requested
+//! directly. After returning an authenticated object, a source grants opaque, source-local
+//! [`DepositSyncObjectCapability`] values for that object's authenticated children. A subsequent
+//! request for a non-root object must return the exact capability for that parent-child edge.
+//! Capability admission prevents detached storage probing; it does not make returned objects
+//! authoritative. The caller must still validate every decoded parent-child edge and independently
+//! verify the quorum-authenticated registry, archive, and portable-index state.
 //!
 //! This protocol never lists a storage directory and never requests a lifetime ledger prefix.
-//! Requests carry a finite reference frontier, responses are hard bounded by both object count and
-//! plaintext bytes, and every continuation cursor is bound to the exact request and advertised
-//! roots. Exact ledger, observation, and checkpoint certificates are content-addressed leaves in
-//! that same authenticated finite frontier.
+//! Each cursorless request and response is one hard-bounded page. Exact ledger, observation, and
+//! checkpoint certificates are content-addressed leaves in the same capability-authorized graph.
 
 use std::{collections::BTreeSet, fmt};
 
@@ -19,13 +18,16 @@ use serde::{
     Deserialize, Deserializer, Serialize,
     de::{DeserializeOwned, Error as _, SeqAccess, Visitor},
 };
+use subtle::ConstantTimeEq as _;
 use thiserror::Error;
 
 use crate::{
-    compact_epoch_registry::RegistryId,
+    committee::PartyId,
+    compact_epoch_registry::{COMPACT_REGISTRY_INDEX_DEPTH, RegistryId},
     compact_registry_archive::{
-        CompactRegistryArchiveHead, CompactRegistryObjectRef, MAX_COMPACT_REGISTRY_HEAD_BYTES,
-        verify_compact_registry_object,
+        CompactRegistryArchiveHead, CompactRegistryObjectRef, CompactRegistryTraversalTarget,
+        MAX_COMPACT_REGISTRY_HEAD_BYTES, verify_compact_registry_object,
+        verify_compact_registry_traversal_object,
     },
     compact_registry_store::CompactRegistryStoreCheckpoint,
     deposit_archive::{
@@ -38,8 +40,9 @@ use crate::{
         MAX_DEPOSIT_INDEX_CHECKPOINT_CERTIFICATE_ARTIFACT_BYTES,
     },
     deposit_index::{
-        DepositIndexHead, DepositIndexObjectId, MAX_DEPOSIT_INDEX_OBJECT_BYTES,
-        verify_portable_index_object,
+        DepositIndexHead, DepositIndexObjectId, MAX_DEPOSIT_INDEX_OBJECT_BYTES, MAX_HAMT_DEPTH,
+        PortableIndexTraversalTarget, verify_portable_index_object,
+        verify_portable_index_traversal_object,
     },
     deposit_index_checkpoint::{
         DepositIndexCheckpointCertificate, DepositIndexCheckpointOperation,
@@ -53,22 +56,30 @@ use crate::{
 };
 
 /// Fixed operation-domain tag. It makes dispatching a payload under another QUIC operation fail.
-pub const DEPOSIT_SYNC_WIRE_DOMAIN: [u8; 16] = *b"tm-deposit-sync1";
-pub const DEPOSIT_SYNC_WIRE_VERSION: u16 = 2;
+pub const DEPOSIT_SYNC_WIRE_DOMAIN: [u8; 16] = *b"tm-deposit-sync4";
+pub const DEPOSIT_SYNC_WIRE_VERSION: u16 = 4;
 
 /// The authenticated QUIC transport's body ceiling.
 pub const MAX_DEPOSIT_SYNC_WIRE_BYTES: usize = 8 * 1024 * 1024;
-/// A caller may ask for at most this many exact references in one finite frontier.
-pub const MAX_DEPOSIT_SYNC_REQUEST_OBJECTS: usize = 256;
+/// A caller may ask for at most this many exact references in one page.
+pub const MAX_DEPOSIT_SYNC_REQUEST_OBJECTS: usize = MAX_DEPOSIT_SYNC_PAGE_OBJECTS;
 /// A response may carry at most this many objects even if they are individually tiny.
 pub const MAX_DEPOSIT_SYNC_PAGE_OBJECTS: usize = 64;
 /// Leaves one MiB below the QUIC ceiling for references and canonical framing.
 pub const MAX_DEPOSIT_SYNC_PAGE_PLAINTEXT_BYTES: usize = 7 * 1024 * 1024;
-/// Complete connected manifests are verified before any of their plaintext is returned.
-pub const MAX_DEPOSIT_SYNC_MANIFEST_PLAINTEXT_BYTES: usize = 32 * 1024 * 1024;
-const MAX_HEAD_REQUEST_BYTES: usize = 256;
+/// A page may issue enough child capabilities for 64 full archive segments.
+pub const MAX_DEPOSIT_SYNC_PAGE_CAPABILITIES: usize = MAX_DEPOSIT_SYNC_PAGE_OBJECTS
+    * (crate::deposit_archive::MAX_DEPOSIT_ARCHIVE_SEGMENT_EVENTS + 1);
+/// Maximum canonical body accepted by the `SyncHead` QUIC route.
+pub const MAX_DEPOSIT_SYNC_HEAD_REQUEST_BYTES: usize = 256;
 const MAX_ADVERTISEMENT_BYTES: usize = MAX_COMPACT_REGISTRY_HEAD_BYTES + 256 * 1024;
-const MAX_OBJECT_REQUEST_BYTES: usize = 128 * 1024;
+const MAX_HEAD_RESPONSE_BYTES: usize = MAX_ADVERTISEMENT_BYTES + 2 * 1024;
+/// Maximum canonical request body accepted by the `SyncObjects` QUIC route.
+pub const MAX_DEPOSIT_SYNC_OBJECT_REQUEST_BYTES: usize = 128 * 1024;
+/// Maximum canonical body for releasing one exact source-side historical-root pin.
+pub const MAX_DEPOSIT_SYNC_RELEASE_REQUEST_BYTES: usize = 2 * 1024;
+/// Maximum canonical typed acknowledgement for one exact release request.
+pub const MAX_DEPOSIT_SYNC_RELEASE_ACK_BYTES: usize = 512;
 const MAX_INDEX_CHECKPOINT_ATTEST_WIRE_BYTES: usize = 16 * 1024;
 const MAX_INDEX_CHECKPOINT_CERTIFICATE_WIRE_BYTES: usize = 2 * 1024 * 1024;
 
@@ -76,7 +87,13 @@ const CONTEXT_DIGEST_DOMAIN: &str = "threshold-monero/deposit-sync/context/v1";
 const ADVERTISEMENT_DIGEST_DOMAIN: &str = "threshold-monero/deposit-sync/advertisement/v1";
 const CERTIFICATE_ARCHIVE_DIGEST_DOMAIN: &str =
     "threshold-monero/deposit-sync/certificate-archive/v1";
-const OBJECT_MANIFEST_DIGEST_DOMAIN: &str = "threshold-monero/deposit-sync/object-manifest/v1";
+const HEAD_REQUEST_DIGEST_DOMAIN: &str = "threshold-monero/deposit-sync/head-request/v4";
+const ANCHOR_LEASE_DIGEST_DOMAIN: &str = "threshold-monero/deposit-sync/anchor-lease/v4";
+const ANCHOR_LEASE_MAC_DOMAIN: &[u8] = b"threshold-monero/deposit-sync/anchor-lease-mac/v4";
+const RELEASE_REQUEST_DIGEST_DOMAIN: &str = "threshold-monero/deposit-sync/release-request/v4";
+const OBJECT_REQUEST_DIGEST_DOMAIN: &str = "threshold-monero/deposit-sync/object-request/v4";
+const OBJECT_RESPONSE_DIGEST_DOMAIN: &str = "threshold-monero/deposit-sync/object-response/v4";
+const OBJECT_CAPABILITY_MAC_DOMAIN: &[u8] = b"threshold-monero/deposit-sync/object-capability/v4";
 
 /// Deployment and wallet binding repeated by every fresh catch-up message.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -634,18 +651,25 @@ impl DepositObservationIndexCheckpointCertificateWire {
 pub struct DepositSyncHeadRequest {
     version: u16,
     context: DepositSyncContext,
+    source: PartyId,
+    requester: PartyId,
 }
 
 impl DepositSyncHeadRequest {
-    pub fn new(context: DepositSyncContext) -> Result<Self, DepositSyncWireError> {
-        let request = Self { version: DEPOSIT_SYNC_WIRE_VERSION, context };
+    pub fn new(
+        context: DepositSyncContext,
+        source: PartyId,
+        requester: PartyId,
+    ) -> Result<Self, DepositSyncWireError> {
+        let request = Self { version: DEPOSIT_SYNC_WIRE_VERSION, context, source, requester };
         request.validate()?;
         Ok(request)
     }
 
     fn validate(self) -> Result<(), DepositSyncWireError> {
         self.context.validate()?;
-        if self.version != DEPOSIT_SYNC_WIRE_VERSION {
+        if self.version != DEPOSIT_SYNC_WIRE_VERSION || self.source.0 == 0 || self.requester.0 == 0
+        {
             return Err(DepositSyncWireError::UnsupportedVersion);
         }
         Ok(())
@@ -656,15 +680,38 @@ impl DepositSyncHeadRequest {
         self.context
     }
 
-    pub fn to_bytes(self) -> Result<Vec<u8>, DepositSyncWireError> {
-        self.validate()?;
-        encode_canonical(&self, MAX_HEAD_REQUEST_BYTES)
+    #[must_use]
+    pub const fn source(self) -> PartyId {
+        self.source
     }
 
-    pub fn from_bytes(bytes: &[u8]) -> Result<Self, DepositSyncWireError> {
-        let request = decode_canonical::<Self>(bytes, MAX_HEAD_REQUEST_BYTES)?;
+    #[must_use]
+    pub const fn requester(self) -> PartyId {
+        self.requester
+    }
+
+    #[must_use]
+    pub fn digest(self) -> [u8; 32] {
+        let bytes = postcard::to_allocvec(&self).expect("validated head request serializes");
+        length_prefixed_hash(HEAD_REQUEST_DIGEST_DOMAIN, &bytes)
+    }
+
+    pub fn to_bytes(self) -> Result<Vec<u8>, DepositSyncWireError> {
+        self.validate()?;
+        encode_canonical(&self, MAX_DEPOSIT_SYNC_HEAD_REQUEST_BYTES)
+    }
+
+    pub fn from_bytes(
+        source: PartyId,
+        requester: PartyId,
+        bytes: &[u8],
+    ) -> Result<Self, DepositSyncWireError> {
+        let request = decode_canonical::<Self>(bytes, MAX_DEPOSIT_SYNC_HEAD_REQUEST_BYTES)?;
         request.validate()?;
-        require_canonical(&request, bytes, MAX_HEAD_REQUEST_BYTES)?;
+        if request.source != source || request.requester != requester {
+            return Err(DepositSyncWireError::InvalidHeadLease);
+        }
+        require_canonical(&request, bytes, MAX_DEPOSIT_SYNC_HEAD_REQUEST_BYTES)?;
         Ok(request)
     }
 }
@@ -734,6 +781,9 @@ impl DepositSyncAdvertisement {
             .validate()
             .map_err(|_| DepositSyncWireError::InvalidAdvertisement)?;
         self.registry_id.validate().map_err(|_| DepositSyncWireError::InvalidAdvertisement)?;
+        self.portable_index
+            .maximum_reachable_objects()
+            .map_err(|_| DepositSyncWireError::InvalidAdvertisement)?;
         if self.version != DEPOSIT_SYNC_WIRE_VERSION
             || self.registry_checkpoint == [0; 32]
             || self.registry_archive.wallet() != self.context.wallet
@@ -759,14 +809,21 @@ impl DepositSyncAdvertisement {
             .start_sequence()
             .checked_sub(1)
             .ok_or(DepositSyncWireError::InvalidAdvertisement)?;
-        if self.portable_index.through_sequence() < boundary {
-            return Err(DepositSyncWireError::InvalidAdvertisement);
-        }
-        if self.portable_index.through_sequence() == boundary
-            && (self.portable_index.digest() != active.portable_index_checkpoint()
-                || self.portable_index.ledger_head() != active.predecessor_ledger_head()
-                || self.portable_index.next_index() != active.first_index())
-        {
+        let boundary_fields_match = self.portable_index.ledger_head()
+            == active.predecessor_ledger_head()
+            && self.portable_index.next_index() == active.first_index();
+        let epoch_zero_checkpoint_matches = (active.epoch() == 0)
+            .then(|| self.portable_index.digest() == active.portable_index_checkpoint());
+        // Epoch zero directly commits its empty boundary head. A successor cannot do so without
+        // a hash cycle: its registry link commits the preterminal source head, while the exported
+        // boundary head includes the handoff statement digest. Full sync/export verification
+        // authenticates that transition against the exact handoff witness.
+        if !portable_index_respects_registry_boundary(
+            self.portable_index.through_sequence(),
+            boundary,
+            boundary_fields_match,
+            epoch_zero_checkpoint_matches,
+        ) {
             return Err(DepositSyncWireError::InvalidAdvertisement);
         }
 
@@ -841,40 +898,21 @@ impl DepositSyncAdvertisement {
         self.checkpoint_certificate.as_ref()
     }
 
-    fn canonical_bytes(&self) -> Result<Vec<u8>, DepositSyncWireError> {
+    pub fn to_bytes(&self) -> Result<Vec<u8>, DepositSyncWireError> {
         self.validate()?;
         encode_canonical(self, MAX_ADVERTISEMENT_BYTES)
     }
 
-    pub fn to_bytes(
-        &self,
-        request: DepositSyncHeadRequest,
-    ) -> Result<Vec<u8>, DepositSyncWireError> {
-        request.validate()?;
-        self.validate()?;
-        if self.context != request.context {
-            return Err(DepositSyncWireError::InvalidAdvertisement);
-        }
-        self.canonical_bytes()
-    }
-
-    pub fn from_bytes(
-        request: DepositSyncHeadRequest,
-        bytes: &[u8],
-    ) -> Result<Self, DepositSyncWireError> {
-        request.validate()?;
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, DepositSyncWireError> {
         let advertisement = decode_canonical::<Self>(bytes, MAX_ADVERTISEMENT_BYTES)?;
         advertisement.validate()?;
-        if advertisement.context != request.context {
-            return Err(DepositSyncWireError::InvalidAdvertisement);
-        }
         require_canonical(&advertisement, bytes, MAX_ADVERTISEMENT_BYTES)?;
         Ok(advertisement)
     }
 
     #[must_use]
     pub fn digest(&self) -> [u8; 32] {
-        let bytes = self.canonical_bytes().expect("validated advertisement serializes canonically");
+        let bytes = self.to_bytes().expect("validated advertisement serializes canonically");
         length_prefixed_hash(ADVERTISEMENT_DIGEST_DOMAIN, &bytes)
     }
 
@@ -882,6 +920,18 @@ impl DepositSyncAdvertisement {
     pub fn object_anchor(&self) -> DepositSyncObjectAnchor {
         DepositSyncObjectAnchor::from_advertisement(self)
     }
+}
+
+fn portable_index_respects_registry_boundary(
+    through_sequence: u64,
+    boundary: u64,
+    boundary_fields_match: bool,
+    epoch_zero_checkpoint_matches: Option<bool>,
+) -> bool {
+    through_sequence > boundary
+        || (through_sequence == boundary
+            && boundary_fields_match
+            && epoch_zero_checkpoint_matches.unwrap_or(true))
 }
 
 /// Exact advertised roots to which every finite object frontier is pinned.
@@ -894,8 +944,12 @@ pub struct DepositSyncObjectAnchor {
     registry_checkpoint: [u8; 32],
     registry_id: [u8; 32],
     registry_root: CompactRegistryObjectRef,
+    registry_semantic_root: [u8; 32],
+    registry_active_epoch: u64,
     portable_index: [u8; 32],
     portable_root: Option<DepositIndexObjectId>,
+    portable_entries: u64,
+    portable_maximum_objects: u64,
     certificate_archive: [u8; 32],
     certificate_event_root: Option<WalletArtifactRef>,
     certificate_segment_root: Option<WalletArtifactRef>,
@@ -913,8 +967,15 @@ impl DepositSyncObjectAnchor {
             registry_checkpoint: advertisement.registry_checkpoint,
             registry_id: advertisement.registry_id.digest(),
             registry_root: advertisement.registry_archive.index_root_reference(),
+            registry_semantic_root: advertisement.registry_id.index_root(),
+            registry_active_epoch: advertisement.registry_id.active_epoch(),
             portable_index: advertisement.portable_index.digest(),
             portable_root: advertisement.portable_index.root(),
+            portable_entries: advertisement.portable_index.entry_count(),
+            portable_maximum_objects: advertisement
+                .portable_index
+                .maximum_reachable_objects()
+                .expect("validated portable head has a bounded object count"),
             certificate_archive: certificate_archive_digest(advertisement.certificate_archive),
             certificate_event_root: advertisement.certificate_archive.event_reference(),
             certificate_segment_root: advertisement.certificate_archive.segment_reference(),
@@ -928,17 +989,64 @@ impl DepositSyncObjectAnchor {
         context: DepositSyncContext,
         advertisement: &DepositSyncAdvertisement,
     ) -> Result<(), DepositSyncWireError> {
-        context.validate()?;
+        self.validate(context)?;
         advertisement.validate()?;
-        if self.version != DEPOSIT_SYNC_WIRE_VERSION
-            || self.wallet != context.wallet
-            || self.context != context.digest()
-            || context != advertisement.context
-            || self != Self::from_advertisement(advertisement)
-        {
+        if context != advertisement.context || self != Self::from_advertisement(advertisement) {
             return Err(DepositSyncWireError::WrongAdvertisement);
         }
         Ok(())
+    }
+
+    fn validate(self, context: DepositSyncContext) -> Result<(), DepositSyncWireError> {
+        context.validate()?;
+        if self.version != DEPOSIT_SYNC_WIRE_VERSION
+            || self.wallet != context.wallet
+            || self.context != context.digest()
+            || self.advertisement == [0; 32]
+            || self.registry_checkpoint == [0; 32]
+            || self.registry_id == [0; 32]
+            || self.registry_semantic_root == [0; 32]
+            || self.portable_index == [0; 32]
+            || (self.portable_entries == 0) != self.portable_root.is_none()
+            || (self.portable_entries == 0) != (self.portable_maximum_objects == 0)
+            || self.certificate_archive == [0; 32]
+            || (self.checkpoint_sequence == 0)
+                != (self.certificate_event_root.is_none()
+                    && self.certificate_segment_root.is_none())
+            || self.certificate_event_root.is_none() != self.certificate_segment_root.is_none()
+        {
+            return Err(DepositSyncWireError::InvalidHeadLease);
+        }
+        DepositSyncObjectRef::Registry(self.registry_root).validate_for(self.wallet)?;
+        if let Some(root) = self.portable_root {
+            DepositSyncObjectRef::Index(root).validate_for(self.wallet)?;
+        }
+        if let Some(root) = self.certificate_event_root {
+            if root.kind() != DEPOSIT_ARCHIVE_EVENT_ARTIFACT {
+                return Err(DepositSyncWireError::InvalidHeadLease);
+            }
+            DepositSyncObjectRef::CertificateArchive(root).validate_for(self.wallet)?;
+        }
+        if let Some(root) = self.certificate_segment_root {
+            if root.kind() != DEPOSIT_ARCHIVE_SEGMENT_ARTIFACT {
+                return Err(DepositSyncWireError::InvalidHeadLease);
+            }
+            DepositSyncObjectRef::CertificateArchive(root).validate_for(self.wallet)?;
+        }
+        Ok(())
+    }
+
+    /// Revalidate a deserialized anchor when it is embedded by another crate-internal protocol.
+    pub(crate) fn validate_context(
+        self,
+        context: DepositSyncContext,
+    ) -> Result<(), DepositSyncWireError> {
+        self.validate(context)
+    }
+
+    #[must_use]
+    pub const fn wallet(self) -> DepositWalletId {
+        self.wallet
     }
 
     #[must_use]
@@ -952,8 +1060,28 @@ impl DepositSyncObjectAnchor {
     }
 
     #[must_use]
+    pub const fn registry_semantic_root(self) -> [u8; 32] {
+        self.registry_semantic_root
+    }
+
+    #[must_use]
+    pub const fn registry_active_epoch(self) -> u64 {
+        self.registry_active_epoch
+    }
+
+    #[must_use]
     pub const fn portable_root(self) -> Option<DepositIndexObjectId> {
         self.portable_root
+    }
+
+    #[must_use]
+    pub const fn portable_entries(self) -> u64 {
+        self.portable_entries
+    }
+
+    #[must_use]
+    pub const fn portable_maximum_objects(self) -> u64 {
+        self.portable_maximum_objects
     }
 
     #[must_use]
@@ -989,6 +1117,384 @@ impl DepositSyncObjectAnchor {
     #[must_use]
     pub const fn certificate_segment_root(self) -> Option<WalletArtifactRef> {
         self.certificate_segment_root
+    }
+
+    #[must_use]
+    pub fn is_advertised_root(self, reference: DepositSyncObjectRef) -> bool {
+        reference == DepositSyncObjectRef::Registry(self.registry_root)
+            || self.portable_root.is_some_and(|root| reference == DepositSyncObjectRef::Index(root))
+            || self
+                .certificate_segment_root
+                .is_some_and(|root| reference == DepositSyncObjectRef::CertificateArchive(root))
+    }
+}
+
+/// Restart-stable authority for one exact source-pinned advertised object graph.
+///
+/// The requester persists this small lease beside the fully validated advertisement. Subsequent
+/// object requests carry only the lease; the source authenticates it with a stable key derived
+/// from its identity seed. The source durably retains the corresponding historical portable-index
+/// root until the requester sends an exact authenticated [`DepositSyncReleaseRequest`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct DepositSyncAnchorLease {
+    version: u16,
+    domain: [u8; 16],
+    context: DepositSyncContext,
+    anchor: DepositSyncObjectAnchor,
+    source: PartyId,
+    requester: PartyId,
+    tag: [u8; 32],
+}
+
+impl DepositSyncAnchorLease {
+    fn issue(
+        mac_key: &[u8; 32],
+        request: DepositSyncHeadRequest,
+        advertisement: &DepositSyncAdvertisement,
+    ) -> Result<Self, DepositSyncWireError> {
+        reject_zero_mac_key(mac_key)?;
+        request.validate()?;
+        advertisement.validate()?;
+        if advertisement.context != request.context {
+            return Err(DepositSyncWireError::InvalidAdvertisement);
+        }
+        let mut lease = Self {
+            version: DEPOSIT_SYNC_WIRE_VERSION,
+            domain: DEPOSIT_SYNC_WIRE_DOMAIN,
+            context: request.context,
+            anchor: advertisement.object_anchor(),
+            source: request.source,
+            requester: request.requester,
+            tag: [0; 32],
+        };
+        lease.validate_for_advertisement(request, advertisement)?;
+        lease.tag = anchor_lease_mac(mac_key, &lease)?;
+        Ok(lease)
+    }
+
+    fn validate(&self) -> Result<(), DepositSyncWireError> {
+        self.context.validate()?;
+        self.anchor.validate(self.context)?;
+        if self.version != DEPOSIT_SYNC_WIRE_VERSION
+            || self.domain != DEPOSIT_SYNC_WIRE_DOMAIN
+            || self.source.0 == 0
+            || self.requester.0 == 0
+        {
+            return Err(DepositSyncWireError::InvalidHeadLease);
+        }
+        Ok(())
+    }
+
+    pub fn validate_for_advertisement(
+        &self,
+        request: DepositSyncHeadRequest,
+        advertisement: &DepositSyncAdvertisement,
+    ) -> Result<(), DepositSyncWireError> {
+        self.validate()?;
+        request.validate()?;
+        advertisement.validate()?;
+        if self.context != request.context
+            || self.source != request.source
+            || self.requester != request.requester
+            || advertisement.context != request.context
+            || self.anchor != advertisement.object_anchor()
+        {
+            return Err(DepositSyncWireError::InvalidHeadLease);
+        }
+        Ok(())
+    }
+
+    /// Authenticate this exact historical anchor for the transport-authenticated parties.
+    pub fn authenticate_for(
+        &self,
+        mac_key: &[u8; 32],
+        source: PartyId,
+        requester: PartyId,
+    ) -> Result<(), DepositSyncWireError> {
+        reject_zero_mac_key(mac_key)?;
+        self.validate()?;
+        if self.source != source || self.requester != requester {
+            return Err(DepositSyncWireError::InvalidHeadLease);
+        }
+        let expected = anchor_lease_mac(mac_key, self)?;
+        if !bool::from(self.tag.ct_eq(&expected)) {
+            return Err(DepositSyncWireError::InvalidHeadLease);
+        }
+        Ok(())
+    }
+
+    #[must_use]
+    pub const fn context(self) -> DepositSyncContext {
+        self.context
+    }
+
+    #[must_use]
+    pub const fn anchor(self) -> DepositSyncObjectAnchor {
+        self.anchor
+    }
+
+    #[must_use]
+    pub const fn advertisement_digest(self) -> [u8; 32] {
+        self.anchor.advertisement
+    }
+
+    #[must_use]
+    pub const fn source(self) -> PartyId {
+        self.source
+    }
+
+    #[must_use]
+    pub const fn requester(self) -> PartyId {
+        self.requester
+    }
+
+    #[must_use]
+    pub fn digest(self) -> [u8; 32] {
+        let bytes = postcard::to_allocvec(&self).expect("validated anchor lease serializes");
+        length_prefixed_hash(ANCHOR_LEASE_DIGEST_DOMAIN, &bytes)
+    }
+}
+
+/// Fully validated advertisement plus its durable historical-serving lease.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct DepositSyncHeadResponse {
+    version: u16,
+    request: [u8; 32],
+    advertisement: DepositSyncAdvertisement,
+    lease: DepositSyncAnchorLease,
+}
+
+impl DepositSyncHeadResponse {
+    pub fn issue(
+        request: DepositSyncHeadRequest,
+        advertisement: DepositSyncAdvertisement,
+        mac_key: &[u8; 32],
+    ) -> Result<Self, DepositSyncWireError> {
+        request.validate()?;
+        advertisement.validate()?;
+        let lease = DepositSyncAnchorLease::issue(mac_key, request, &advertisement)?;
+        let response = Self {
+            version: DEPOSIT_SYNC_WIRE_VERSION,
+            request: request.digest(),
+            advertisement,
+            lease,
+        };
+        response.validate_for(request)?;
+        Ok(response)
+    }
+
+    fn validate_for(&self, request: DepositSyncHeadRequest) -> Result<(), DepositSyncWireError> {
+        request.validate()?;
+        self.advertisement.validate()?;
+        self.lease.validate_for_advertisement(request, &self.advertisement)?;
+        if self.version != DEPOSIT_SYNC_WIRE_VERSION || self.request != request.digest() {
+            return Err(DepositSyncWireError::InvalidHeadLease);
+        }
+        Ok(())
+    }
+
+    #[must_use]
+    pub const fn advertisement(&self) -> &DepositSyncAdvertisement {
+        &self.advertisement
+    }
+
+    #[must_use]
+    pub const fn lease(&self) -> DepositSyncAnchorLease {
+        self.lease
+    }
+
+    pub fn to_bytes(
+        &self,
+        request: DepositSyncHeadRequest,
+    ) -> Result<Vec<u8>, DepositSyncWireError> {
+        self.validate_for(request)?;
+        encode_canonical(self, MAX_HEAD_RESPONSE_BYTES)
+    }
+
+    pub fn from_bytes(
+        request: DepositSyncHeadRequest,
+        bytes: &[u8],
+    ) -> Result<Self, DepositSyncWireError> {
+        let response = decode_canonical::<Self>(bytes, MAX_HEAD_RESPONSE_BYTES)?;
+        response.validate_for(request)?;
+        require_canonical(&response, bytes, MAX_HEAD_RESPONSE_BYTES)?;
+        Ok(response)
+    }
+}
+
+/// Authenticated request to release one exact source-side historical-root pin.
+///
+/// The lease itself is carried rather than only its digest so the source can re-authenticate the
+/// original source/requester/context binding after a process restart. A requester must retain and
+/// retransmit this exact body until it receives a matching [`DepositSyncReleaseAck`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct DepositSyncReleaseRequest {
+    version: u16,
+    lease: DepositSyncAnchorLease,
+}
+
+impl DepositSyncReleaseRequest {
+    pub fn new(lease: DepositSyncAnchorLease) -> Result<Self, DepositSyncWireError> {
+        let request = Self { version: DEPOSIT_SYNC_WIRE_VERSION, lease };
+        request.validate()?;
+        Ok(request)
+    }
+
+    fn validate(self) -> Result<(), DepositSyncWireError> {
+        self.lease.validate()?;
+        if self.version != DEPOSIT_SYNC_WIRE_VERSION {
+            return Err(DepositSyncWireError::InvalidRelease);
+        }
+        Ok(())
+    }
+
+    /// Authenticate the original lease under the source's stable local capability key.
+    pub fn authenticate_for(
+        self,
+        mac_key: &[u8; 32],
+        source: PartyId,
+        requester: PartyId,
+    ) -> Result<(), DepositSyncWireError> {
+        self.validate()?;
+        self.lease.authenticate_for(mac_key, source, requester)
+    }
+
+    #[must_use]
+    pub const fn lease(self) -> DepositSyncAnchorLease {
+        self.lease
+    }
+
+    #[must_use]
+    pub const fn context(self) -> DepositSyncContext {
+        self.lease.context()
+    }
+
+    #[must_use]
+    pub const fn source(self) -> PartyId {
+        self.lease.source()
+    }
+
+    #[must_use]
+    pub const fn requester(self) -> PartyId {
+        self.lease.requester()
+    }
+
+    #[must_use]
+    pub fn lease_digest(self) -> [u8; 32] {
+        self.lease.digest()
+    }
+
+    #[must_use]
+    pub fn digest(self) -> [u8; 32] {
+        let bytes = postcard::to_allocvec(&self).expect("validated release request serializes");
+        length_prefixed_hash(RELEASE_REQUEST_DIGEST_DOMAIN, &bytes)
+    }
+
+    pub fn to_bytes(self) -> Result<Vec<u8>, DepositSyncWireError> {
+        self.validate()?;
+        encode_canonical(&self, MAX_DEPOSIT_SYNC_RELEASE_REQUEST_BYTES)
+    }
+
+    pub fn from_bytes(
+        source: PartyId,
+        requester: PartyId,
+        mac_key: &[u8; 32],
+        bytes: &[u8],
+    ) -> Result<Self, DepositSyncWireError> {
+        let request = decode_canonical::<Self>(bytes, MAX_DEPOSIT_SYNC_RELEASE_REQUEST_BYTES)?;
+        request.authenticate_for(mac_key, source, requester)?;
+        require_canonical(&request, bytes, MAX_DEPOSIT_SYNC_RELEASE_REQUEST_BYTES)?;
+        Ok(request)
+    }
+
+    /// Extract the deployment/wallet binding under the same strict canonical bound before the
+    /// source derives its stable MAC key. This grants no release authority by itself; callers
+    /// must immediately pass the bytes through [`Self::from_bytes`].
+    pub fn context_from_bytes(bytes: &[u8]) -> Result<DepositSyncContext, DepositSyncWireError> {
+        let request = decode_canonical::<Self>(bytes, MAX_DEPOSIT_SYNC_RELEASE_REQUEST_BYTES)?;
+        request.validate()?;
+        require_canonical(&request, bytes, MAX_DEPOSIT_SYNC_RELEASE_REQUEST_BYTES)?;
+        Ok(request.context())
+    }
+}
+
+/// Typed acknowledgement for one exact durable release request.
+///
+/// An absent slot is an idempotent success only when no different lease currently occupies the
+/// same requester slot. The source-side store enforces that rule before issuing this response.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct DepositSyncReleaseAck {
+    version: u16,
+    context: DepositSyncContext,
+    source: PartyId,
+    requester: PartyId,
+    request: [u8; 32],
+}
+
+impl DepositSyncReleaseAck {
+    pub fn issue(request: DepositSyncReleaseRequest) -> Result<Self, DepositSyncWireError> {
+        request.validate()?;
+        let acknowledgement = Self {
+            version: DEPOSIT_SYNC_WIRE_VERSION,
+            context: request.context(),
+            source: request.source(),
+            requester: request.requester(),
+            request: request.digest(),
+        };
+        acknowledgement.validate_for(request)?;
+        Ok(acknowledgement)
+    }
+
+    fn validate_for(self, request: DepositSyncReleaseRequest) -> Result<(), DepositSyncWireError> {
+        request.validate()?;
+        self.context.validate()?;
+        if self.version != DEPOSIT_SYNC_WIRE_VERSION
+            || self.context != request.context()
+            || self.source != request.source()
+            || self.requester != request.requester()
+            || self.request != request.digest()
+        {
+            return Err(DepositSyncWireError::InvalidRelease);
+        }
+        Ok(())
+    }
+
+    #[must_use]
+    pub const fn context(self) -> DepositSyncContext {
+        self.context
+    }
+
+    #[must_use]
+    pub const fn source(self) -> PartyId {
+        self.source
+    }
+
+    #[must_use]
+    pub const fn requester(self) -> PartyId {
+        self.requester
+    }
+
+    #[must_use]
+    pub const fn request_digest(self) -> [u8; 32] {
+        self.request
+    }
+
+    pub fn to_bytes(
+        self,
+        request: DepositSyncReleaseRequest,
+    ) -> Result<Vec<u8>, DepositSyncWireError> {
+        self.validate_for(request)?;
+        encode_canonical(&self, MAX_DEPOSIT_SYNC_RELEASE_ACK_BYTES)
+    }
+
+    pub fn from_bytes(
+        request: DepositSyncReleaseRequest,
+        bytes: &[u8],
+    ) -> Result<Self, DepositSyncWireError> {
+        let acknowledgement = decode_canonical::<Self>(bytes, MAX_DEPOSIT_SYNC_RELEASE_ACK_BYTES)?;
+        acknowledgement.validate_for(request)?;
+        require_canonical(&acknowledgement, bytes, MAX_DEPOSIT_SYNC_RELEASE_ACK_BYTES)?;
+        Ok(acknowledgement)
     }
 }
 
@@ -1056,6 +1562,159 @@ impl DepositSyncObjectRef {
                 Ok(reference)
             }
         }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+pub enum DepositSyncArchiveLeafKind {
+    CertifiedLedger,
+    CertifiedObservation,
+    LedgerCheckpoint,
+    ObservationCheckpoint,
+}
+
+/// Canonical, restart-persistable semantic position for one object in the leased graph.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+pub enum DepositSyncTraversalTarget {
+    Registry(CompactRegistryTraversalTarget),
+    PortableIndex(PortableIndexTraversalTarget),
+    ArchiveSegment {
+        reference: WalletArtifactRef,
+        expected_end_ordinal: u64,
+        expected_last_event: Option<WalletArtifactRef>,
+    },
+    ArchiveEvent {
+        reference: WalletArtifactRef,
+        expected_ordinal: u64,
+    },
+    ArchiveLeaf {
+        reference: WalletArtifactRef,
+        checkpoint_sequence: u64,
+        kind: DepositSyncArchiveLeafKind,
+    },
+}
+
+impl DepositSyncTraversalTarget {
+    #[must_use]
+    pub const fn reference(self) -> DepositSyncObjectRef {
+        match self {
+            Self::Registry(target) => DepositSyncObjectRef::Registry(target.reference()),
+            Self::PortableIndex(target) => DepositSyncObjectRef::Index(target.id()),
+            Self::ArchiveSegment { reference, .. }
+            | Self::ArchiveEvent { reference, .. }
+            | Self::ArchiveLeaf { reference, .. } => {
+                DepositSyncObjectRef::CertificateArchive(reference)
+            }
+        }
+    }
+
+    fn validate_for(self, lease: DepositSyncAnchorLease) -> Result<(), DepositSyncWireError> {
+        lease.validate()?;
+        self.reference().validate_for(lease.context.wallet)?;
+        let anchor = lease.anchor;
+        match self {
+            Self::Registry(CompactRegistryTraversalTarget::Index {
+                depth, semantic_hash, ..
+            }) => {
+                if depth > COMPACT_REGISTRY_INDEX_DEPTH || semantic_hash == [0; 32] {
+                    return Err(DepositSyncWireError::InvalidTraversalTarget);
+                }
+            }
+            Self::Registry(CompactRegistryTraversalTarget::Link { epoch, chain_root, .. }) => {
+                if epoch > anchor.registry_active_epoch || chain_root == [0; 32] {
+                    return Err(DepositSyncWireError::InvalidTraversalTarget);
+                }
+            }
+            Self::Registry(CompactRegistryTraversalTarget::HandoffWitness {
+                target_epoch, ..
+            }) => {
+                if target_epoch == 0 || target_epoch > anchor.registry_active_epoch {
+                    return Err(DepositSyncWireError::InvalidTraversalTarget);
+                }
+            }
+            Self::PortableIndex(PortableIndexTraversalTarget::Node {
+                depth,
+                expected_entries,
+                ..
+            }) => {
+                if depth > MAX_HAMT_DEPTH || expected_entries == Some(0) {
+                    return Err(DepositSyncWireError::InvalidTraversalTarget);
+                }
+            }
+            Self::PortableIndex(PortableIndexTraversalTarget::Value { .. }) => {}
+            Self::ArchiveSegment { reference, expected_end_ordinal, expected_last_event } => {
+                if reference.kind() != DEPOSIT_ARCHIVE_SEGMENT_ARTIFACT
+                    || expected_end_ordinal == 0
+                    || expected_end_ordinal > anchor.checkpoint_sequence
+                    || expected_last_event.is_some_and(|event| {
+                        event.kind() != DEPOSIT_ARCHIVE_EVENT_ARTIFACT
+                            || event.wallet_id() != WalletId(anchor.wallet.0)
+                    })
+                {
+                    return Err(DepositSyncWireError::InvalidTraversalTarget);
+                }
+            }
+            Self::ArchiveEvent { reference, expected_ordinal } => {
+                if reference.kind() != DEPOSIT_ARCHIVE_EVENT_ARTIFACT
+                    || expected_ordinal >= anchor.checkpoint_sequence
+                {
+                    return Err(DepositSyncWireError::InvalidTraversalTarget);
+                }
+            }
+            Self::ArchiveLeaf { reference, checkpoint_sequence, kind } => {
+                let expected_kind = match kind {
+                    DepositSyncArchiveLeafKind::CertifiedLedger => CERTIFIED_LEDGER_ENTRY_ARTIFACT,
+                    DepositSyncArchiveLeafKind::CertifiedObservation => {
+                        CERTIFIED_DEPOSIT_OBSERVATION_ARTIFACT
+                    }
+                    DepositSyncArchiveLeafKind::LedgerCheckpoint
+                    | DepositSyncArchiveLeafKind::ObservationCheckpoint => {
+                        DEPOSIT_INDEX_CHECKPOINT_CERTIFICATE_ARTIFACT
+                    }
+                };
+                if reference.kind() != expected_kind
+                    || checkpoint_sequence == 0
+                    || checkpoint_sequence > anchor.checkpoint_sequence
+                {
+                    return Err(DepositSyncWireError::InvalidTraversalTarget);
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+impl DepositSyncAnchorLease {
+    pub fn root_targets(self) -> Result<Vec<DepositSyncTraversalTarget>, DepositSyncWireError> {
+        self.validate()?;
+        let mut roots = Vec::with_capacity(3);
+        roots.push(DepositSyncTraversalTarget::Registry(CompactRegistryTraversalTarget::Index {
+            reference: self.anchor.registry_root,
+            depth: 0,
+            semantic_hash: self.anchor.registry_semantic_root,
+        }));
+        if let Some(id) = self.anchor.portable_root {
+            roots.push(DepositSyncTraversalTarget::PortableIndex(
+                PortableIndexTraversalTarget::Node {
+                    id,
+                    depth: 0,
+                    expected_entries: Some(self.anchor.portable_entries),
+                },
+            ));
+        }
+        if let Some(reference) = self.anchor.certificate_segment_root {
+            roots.push(DepositSyncTraversalTarget::ArchiveSegment {
+                reference,
+                expected_end_ordinal: self.anchor.checkpoint_sequence,
+                expected_last_event: self.anchor.certificate_event_root,
+            });
+        }
+        Ok(roots)
+    }
+
+    #[must_use]
+    pub fn is_root_target(self, target: DepositSyncTraversalTarget) -> bool {
+        self.root_targets().is_ok_and(|roots| roots.contains(&target))
     }
 }
 
@@ -1169,539 +1828,544 @@ impl DepositSyncObject {
         &self.bytes
     }
 
-    fn children(&self) -> Result<Vec<DepositSyncObjectRef>, DepositSyncWireError> {
-        match self.reference {
-            DepositSyncObjectRef::Registry(reference) => {
-                let verified = verify_compact_registry_object(reference, &self.bytes)
-                    .map_err(|_| DepositSyncWireError::InvalidObject)?;
-                Ok(verified
-                    .children()
-                    .iter()
-                    .copied()
-                    .map(DepositSyncObjectRef::Registry)
+    /// Authenticate this object at an exact semantic position and derive its successor positions.
+    pub fn authenticated_semantic_children(
+        &self,
+        target: DepositSyncTraversalTarget,
+    ) -> Result<Vec<DepositSyncTraversalTarget>, DepositSyncWireError> {
+        if target.reference() != self.reference {
+            return Err(DepositSyncWireError::InvalidTraversalTarget);
+        }
+        match target {
+            DepositSyncTraversalTarget::Registry(target) => {
+                Ok(verify_compact_registry_traversal_object(target, &self.bytes)
+                    .map_err(|_| DepositSyncWireError::InvalidTraversalTarget)?
+                    .into_iter()
+                    .map(DepositSyncTraversalTarget::Registry)
                     .collect())
             }
-            DepositSyncObjectRef::Index(id) => {
-                let verified =
-                    verify_portable_index_object(self.reference.wallet(), id, &self.bytes)
-                        .map_err(|_| DepositSyncWireError::InvalidObject)?;
-                Ok(verified.children().iter().copied().map(DepositSyncObjectRef::Index).collect())
+            DepositSyncTraversalTarget::PortableIndex(target) => {
+                Ok(verify_portable_index_traversal_object(
+                    self.reference.wallet(),
+                    target,
+                    &self.bytes,
+                )
+                .map_err(|_| DepositSyncWireError::InvalidTraversalTarget)?
+                .into_iter()
+                .map(DepositSyncTraversalTarget::PortableIndex)
+                .collect())
             }
-            DepositSyncObjectRef::CertificateArchive(reference) => match reference.kind() {
-                DEPOSIT_ARCHIVE_EVENT_ARTIFACT => {
-                    let event = DepositArchiveEvent::from_bytes(&self.bytes)
-                        .map_err(|_| DepositSyncWireError::InvalidObject)?;
-                    let mut children = Vec::with_capacity(3);
-                    children.extend(event.previous().map(DepositSyncObjectRef::CertificateArchive));
-                    children.push(DepositSyncObjectRef::CertificateArchive(
-                        event.operation_reference(),
-                    ));
-                    children.push(DepositSyncObjectRef::CertificateArchive(
-                        event.checkpoint_reference(),
-                    ));
-                    Ok(children)
+            DepositSyncTraversalTarget::ArchiveSegment {
+                expected_end_ordinal,
+                expected_last_event,
+                ..
+            } => {
+                let segment = DepositArchiveSegment::from_bytes(&self.bytes)
+                    .map_err(|_| DepositSyncWireError::InvalidTraversalTarget)?;
+                if segment.wallet_id() != self.reference.wallet()
+                    || segment
+                        .end_ordinal()
+                        .map_err(|_| DepositSyncWireError::InvalidTraversalTarget)?
+                        != expected_end_ordinal
+                    || expected_last_event.is_some_and(|expected| {
+                        segment.event_references().last().copied() != Some(expected)
+                    })
+                {
+                    return Err(DepositSyncWireError::InvalidTraversalTarget);
                 }
-                DEPOSIT_ARCHIVE_SEGMENT_ARTIFACT => {
-                    let segment = DepositArchiveSegment::from_bytes(&self.bytes)
-                        .map_err(|_| DepositSyncWireError::InvalidObject)?;
-                    let mut children = Vec::with_capacity(
-                        segment.event_references().len()
-                            + usize::from(segment.previous().is_some()),
-                    );
-                    children
-                        .extend(segment.previous().map(DepositSyncObjectRef::CertificateArchive));
-                    children.extend(
-                        segment
-                            .event_references()
-                            .iter()
-                            .copied()
-                            .map(DepositSyncObjectRef::CertificateArchive),
-                    );
-                    Ok(children)
+                let mut children = Vec::with_capacity(
+                    segment.event_references().len() + usize::from(segment.previous().is_some()),
+                );
+                children.extend(segment.previous().map(|reference| {
+                    DepositSyncTraversalTarget::ArchiveSegment {
+                        reference,
+                        expected_end_ordinal: segment.start_ordinal(),
+                        expected_last_event: None,
+                    }
+                }));
+                for (offset, reference) in segment.event_references().iter().copied().enumerate() {
+                    let expected_ordinal = segment
+                        .start_ordinal()
+                        .checked_add(
+                            u64::try_from(offset)
+                                .map_err(|_| DepositSyncWireError::InvalidTraversalTarget)?,
+                        )
+                        .ok_or(DepositSyncWireError::InvalidTraversalTarget)?;
+                    children.push(DepositSyncTraversalTarget::ArchiveEvent {
+                        reference,
+                        expected_ordinal,
+                    });
                 }
-                CERTIFIED_LEDGER_ENTRY_ARTIFACT
-                | CERTIFIED_DEPOSIT_OBSERVATION_ARTIFACT
-                | DEPOSIT_INDEX_CHECKPOINT_CERTIFICATE_ARTIFACT => Ok(Vec::new()),
-                _ => Err(DepositSyncWireError::InvalidObjectReference),
-            },
+                Ok(children)
+            }
+            DepositSyncTraversalTarget::ArchiveEvent { expected_ordinal, .. } => {
+                let event = DepositArchiveEvent::from_bytes(&self.bytes)
+                    .map_err(|_| DepositSyncWireError::InvalidTraversalTarget)?;
+                if event.wallet_id() != self.reference.wallet()
+                    || event.ordinal() != expected_ordinal
+                {
+                    return Err(DepositSyncWireError::InvalidTraversalTarget);
+                }
+                let checkpoint_sequence = expected_ordinal
+                    .checked_add(1)
+                    .ok_or(DepositSyncWireError::InvalidTraversalTarget)?;
+                let (operation_kind, checkpoint_kind) = match event.operation() {
+                    DepositArchiveOperation::Ledger => (
+                        DepositSyncArchiveLeafKind::CertifiedLedger,
+                        DepositSyncArchiveLeafKind::LedgerCheckpoint,
+                    ),
+                    DepositArchiveOperation::DepositObservation => (
+                        DepositSyncArchiveLeafKind::CertifiedObservation,
+                        DepositSyncArchiveLeafKind::ObservationCheckpoint,
+                    ),
+                };
+                Ok(vec![
+                    DepositSyncTraversalTarget::ArchiveLeaf {
+                        reference: event.operation_reference(),
+                        checkpoint_sequence,
+                        kind: operation_kind,
+                    },
+                    DepositSyncTraversalTarget::ArchiveLeaf {
+                        reference: event.checkpoint_reference(),
+                        checkpoint_sequence,
+                        kind: checkpoint_kind,
+                    },
+                ])
+            }
+            DepositSyncTraversalTarget::ArchiveLeaf { checkpoint_sequence, kind, .. } => {
+                match kind {
+                    DepositSyncArchiveLeafKind::CertifiedLedger => {
+                        let ledger = CertifiedLedgerEntry::from_bytes(&self.bytes)
+                            .map_err(|_| DepositSyncWireError::InvalidTraversalTarget)?;
+                        if ledger.statement.wallet != self.reference.wallet() {
+                            return Err(DepositSyncWireError::InvalidTraversalTarget);
+                        }
+                    }
+                    DepositSyncArchiveLeafKind::CertifiedObservation => {
+                        let observation = CertifiedDepositObservation::from_bytes(&self.bytes)
+                            .map_err(|_| DepositSyncWireError::InvalidTraversalTarget)?;
+                        if observation.statement.wallet_id() != self.reference.wallet() {
+                            return Err(DepositSyncWireError::InvalidTraversalTarget);
+                        }
+                    }
+                    DepositSyncArchiveLeafKind::LedgerCheckpoint
+                    | DepositSyncArchiveLeafKind::ObservationCheckpoint => {
+                        let checkpoint = DepositIndexCheckpointCertificate::from_bytes(&self.bytes)
+                            .map_err(|_| DepositSyncWireError::InvalidTraversalTarget)?;
+                        let statement = checkpoint.statement();
+                        let operation_matches = matches!(
+                            (kind, statement.operation()),
+                            (
+                                DepositSyncArchiveLeafKind::LedgerCheckpoint,
+                                DepositIndexCheckpointOperation::Ledger { .. }
+                            ) | (
+                                DepositSyncArchiveLeafKind::ObservationCheckpoint,
+                                DepositIndexCheckpointOperation::DepositObservation { .. }
+                            )
+                        );
+                        if statement.context().wallet_id() != self.reference.wallet()
+                            || statement.sequence() != checkpoint_sequence
+                            || !operation_matches
+                        {
+                            return Err(DepositSyncWireError::InvalidTraversalTarget);
+                        }
+                    }
+                }
+                Ok(Vec::new())
+            }
         }
     }
 }
 
-/// Cursor bound to one exact finite object manifest and advertisement.
+/// Opaque source-issued authority for one exact authenticated parent-child edge.
+///
+/// The tag is source-local and may only be checked with that source's 32-byte MAC key. All
+/// security-relevant bindings remain in the authenticated material so a token cannot be replayed
+/// across versions, deployments, wallets, advertisements, sources, requesters, or graph edges.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct DepositSyncObjectCursor {
+pub struct DepositSyncObjectCapability {
     version: u16,
     domain: [u8; 16],
-    wallet: DepositWalletId,
+    context: DepositSyncContext,
     advertisement: [u8; 32],
-    manifest: [u8; 32],
-    position: u16,
+    lease: [u8; 32],
+    source: PartyId,
+    requester: PartyId,
+    parent: DepositSyncTraversalTarget,
+    child: DepositSyncTraversalTarget,
+    tag: [u8; 32],
 }
 
-impl DepositSyncObjectCursor {
-    fn new(
-        context: DepositSyncContext,
-        anchor: DepositSyncObjectAnchor,
-        manifest: [u8; 32],
-        position: usize,
+impl DepositSyncObjectCapability {
+    pub fn issue(
+        mac_key: &[u8; 32],
+        lease: DepositSyncAnchorLease,
+        parent: DepositSyncTraversalTarget,
+        child: DepositSyncTraversalTarget,
     ) -> Result<Self, DepositSyncWireError> {
-        let cursor = Self {
+        reject_zero_mac_key(mac_key)?;
+        lease.authenticate_for(mac_key, lease.source, lease.requester)?;
+        let mut capability = Self {
             version: DEPOSIT_SYNC_WIRE_VERSION,
             domain: DEPOSIT_SYNC_WIRE_DOMAIN,
-            wallet: context.wallet,
-            advertisement: anchor.advertisement,
-            manifest,
-            position: u16::try_from(position).map_err(|_| DepositSyncWireError::InvalidCursor)?,
+            context: lease.context,
+            advertisement: lease.anchor.advertisement,
+            lease: lease.digest(),
+            source: lease.source,
+            requester: lease.requester,
+            parent,
+            child,
+            tag: [0; 32],
         };
-        cursor.validate(context, anchor, manifest, MAX_DEPOSIT_SYNC_REQUEST_OBJECTS)?;
-        Ok(cursor)
+        capability.validate_binding(lease, parent, child)?;
+        capability.tag = capability_mac(mac_key, &capability)?;
+        Ok(capability)
     }
 
-    fn validate(
-        self,
-        context: DepositSyncContext,
-        anchor: DepositSyncObjectAnchor,
-        manifest: [u8; 32],
-        reference_count: usize,
+    fn validate_binding(
+        &self,
+        lease: DepositSyncAnchorLease,
+        parent: DepositSyncTraversalTarget,
+        child: DepositSyncTraversalTarget,
     ) -> Result<(), DepositSyncWireError> {
-        let position = usize::from(self.position);
+        lease.validate()?;
+        self.context.validate()?;
+        self.parent.validate_for(lease)?;
+        self.child.validate_for(lease)?;
         if self.version != DEPOSIT_SYNC_WIRE_VERSION
             || self.domain != DEPOSIT_SYNC_WIRE_DOMAIN
-            || self.wallet != context.wallet
-            || self.advertisement != anchor.advertisement
-            || self.manifest != manifest
-            || position >= reference_count
+            || self.context != lease.context
+            || self.advertisement != lease.anchor.advertisement
+            || self.lease != lease.digest()
+            || self.source != lease.source
+            || self.requester != lease.requester
+            || self.parent != parent
+            || self.child != child
+            || self.parent == self.child
         {
-            return Err(DepositSyncWireError::InvalidCursor);
+            return Err(DepositSyncWireError::InvalidObjectCapability);
+        }
+        Ok(())
+    }
+
+    /// Verify all exact bindings and compare the keyed BLAKE3 tag in constant time.
+    pub fn authenticate_for(
+        &self,
+        mac_key: &[u8; 32],
+        lease: DepositSyncAnchorLease,
+        parent: DepositSyncTraversalTarget,
+        child: DepositSyncTraversalTarget,
+    ) -> Result<(), DepositSyncWireError> {
+        reject_zero_mac_key(mac_key)?;
+        self.validate_binding(lease, parent, child)?;
+        let expected = capability_mac(mac_key, self)?;
+        if !bool::from(self.tag.ct_eq(&expected)) {
+            return Err(DepositSyncWireError::InvalidObjectCapability);
         }
         Ok(())
     }
 
     #[must_use]
-    pub const fn position(self) -> u16 {
-        self.position
+    pub const fn source(self) -> PartyId {
+        self.source
+    }
+
+    #[must_use]
+    pub const fn requester(self) -> PartyId {
+        self.requester
+    }
+
+    #[must_use]
+    pub const fn parent(self) -> DepositSyncTraversalTarget {
+        self.parent
+    }
+
+    #[must_use]
+    pub const fn child(self) -> DepositSyncTraversalTarget {
+        self.child
     }
 }
 
-/// One finite, root-pinned object frontier with deterministic pagination limits.
+/// One exact object request. Advertised roots carry no capability; every other object carries the
+/// exact source-issued parent-child capability returned by an earlier page.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct DepositSyncObjectRequestEntry {
+    target: DepositSyncTraversalTarget,
+    capability: Option<DepositSyncObjectCapability>,
+}
+
+impl DepositSyncObjectRequestEntry {
+    pub fn advertised_root(
+        lease: DepositSyncAnchorLease,
+        target: DepositSyncTraversalTarget,
+    ) -> Result<Self, DepositSyncWireError> {
+        lease.validate()?;
+        target.validate_for(lease)?;
+        if !lease.is_root_target(target) {
+            return Err(DepositSyncWireError::InvalidObjectRequest);
+        }
+        Ok(Self { target, capability: None })
+    }
+
+    #[must_use]
+    pub const fn authorized(capability: DepositSyncObjectCapability) -> Self {
+        Self { target: capability.child, capability: Some(capability) }
+    }
+
+    #[must_use]
+    pub const fn target(self) -> DepositSyncTraversalTarget {
+        self.target
+    }
+
+    #[must_use]
+    pub const fn reference(self) -> DepositSyncObjectRef {
+        self.target.reference()
+    }
+
+    #[must_use]
+    pub const fn capability(self) -> Option<DepositSyncObjectCapability> {
+        self.capability
+    }
+}
+
+/// One cursorless, hard-bounded object page request.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct DepositSyncObjectPageRequest {
     version: u16,
-    context: DepositSyncContext,
-    anchor: DepositSyncObjectAnchor,
-    #[serde(deserialize_with = "deserialize_object_references")]
-    references: Vec<DepositSyncObjectRef>,
-    maximum_objects: u16,
-    maximum_plaintext_bytes: u32,
-    cursor: DepositSyncObjectCursor,
+    lease: DepositSyncAnchorLease,
+    #[serde(deserialize_with = "deserialize_object_request_entries")]
+    entries: Vec<DepositSyncObjectRequestEntry>,
 }
 
 impl DepositSyncObjectPageRequest {
     pub fn new(
-        advertisement: &DepositSyncAdvertisement,
-        references: Vec<DepositSyncObjectRef>,
-        maximum_objects: u16,
-        maximum_plaintext_bytes: u32,
+        lease: DepositSyncAnchorLease,
+        entries: Vec<DepositSyncObjectRequestEntry>,
     ) -> Result<Self, DepositSyncWireError> {
-        advertisement.validate()?;
-        let context = advertisement.context;
-        let anchor = advertisement.object_anchor();
-        let manifest = object_manifest_digest(
-            context,
-            anchor,
-            &references,
-            maximum_objects,
-            maximum_plaintext_bytes,
-        )?;
-        let cursor = DepositSyncObjectCursor::new(context, anchor, manifest, 0)?;
-        let request = Self {
-            version: DEPOSIT_SYNC_WIRE_VERSION,
-            context,
-            anchor,
-            references,
-            maximum_objects,
-            maximum_plaintext_bytes,
-            cursor,
-        };
-        request.validate_for(advertisement)?;
+        let request = Self { version: DEPOSIT_SYNC_WIRE_VERSION, lease, entries };
+        request.validate()?;
         Ok(request)
     }
 
-    pub fn with_cursor(
-        &self,
-        advertisement: &DepositSyncAdvertisement,
-        cursor: DepositSyncObjectCursor,
-    ) -> Result<Self, DepositSyncWireError> {
-        let mut request = self.clone();
-        request.cursor = cursor;
-        request.validate_for(advertisement)?;
-        Ok(request)
-    }
-
-    pub fn validate_for(
-        &self,
-        advertisement: &DepositSyncAdvertisement,
-    ) -> Result<(), DepositSyncWireError> {
-        self.context.validate()?;
-        self.anchor.validate_for(self.context, advertisement)?;
+    /// Validate bounded canonical structure without trusting capability tags.
+    ///
+    /// This is sufficient for a requester serializing capabilities previously returned by the
+    /// source. The source must additionally call [`Self::authenticate_capabilities`].
+    pub fn validate(&self) -> Result<(), DepositSyncWireError> {
+        self.lease.validate()?;
         if self.version != DEPOSIT_SYNC_WIRE_VERSION
-            || self.references.is_empty()
-            || self.references.len() > MAX_DEPOSIT_SYNC_REQUEST_OBJECTS
-            || self.maximum_objects == 0
-            || usize::from(self.maximum_objects) > MAX_DEPOSIT_SYNC_PAGE_OBJECTS
-            || self.maximum_plaintext_bytes == 0
-            || usize::try_from(self.maximum_plaintext_bytes)
-                .map_err(|_| DepositSyncWireError::InvalidObjectRequest)?
-                > MAX_DEPOSIT_SYNC_PAGE_PLAINTEXT_BYTES
+            || self.entries.is_empty()
+            || self.entries.len() > MAX_DEPOSIT_SYNC_REQUEST_OBJECTS
         {
             return Err(DepositSyncWireError::InvalidObjectRequest);
         }
-        let first = self.references[0];
-        let starts_at_advertised_root = first
-            == DepositSyncObjectRef::Registry(self.anchor.registry_root)
-            || self
-                .anchor
-                .portable_root
-                .is_some_and(|root| first == DepositSyncObjectRef::Index(root))
-            || self
-                .anchor
-                .certificate_event_root
-                .is_some_and(|root| first == DepositSyncObjectRef::CertificateArchive(root))
-            || self
-                .anchor
-                .certificate_segment_root
-                .is_some_and(|root| first == DepositSyncObjectRef::CertificateArchive(root));
-        if !starts_at_advertised_root {
-            return Err(DepositSyncWireError::InvalidObjectRequest);
-        }
-        let mut unique = BTreeSet::new();
-        let mut manifest_bytes = 0_usize;
-        for reference in &self.references {
-            reference.validate_for(self.context.wallet)?;
-            if !unique.insert(*reference) {
+
+        let mut targets = BTreeSet::new();
+        let mut plaintext_bytes = 0_usize;
+        for entry in &self.entries {
+            entry.target.validate_for(self.lease)?;
+            if !targets.insert(entry.target) {
                 return Err(DepositSyncWireError::InvalidObjectRequest);
             }
-            manifest_bytes = manifest_bytes
+            plaintext_bytes = plaintext_bytes
                 .checked_add(
-                    usize::try_from(reference.plaintext_len())
+                    usize::try_from(entry.reference().plaintext_len())
                         .map_err(|_| DepositSyncWireError::InvalidObjectRequest)?,
                 )
                 .ok_or(DepositSyncWireError::InvalidObjectRequest)?;
+            if self.lease.is_root_target(entry.target) {
+                if entry.capability.is_some() {
+                    return Err(DepositSyncWireError::InvalidObjectRequest);
+                }
+            } else {
+                let capability =
+                    entry.capability.ok_or(DepositSyncWireError::InvalidObjectCapability)?;
+                capability.validate_binding(self.lease, capability.parent, entry.target)?;
+            }
         }
-        if manifest_bytes > MAX_DEPOSIT_SYNC_MANIFEST_PLAINTEXT_BYTES {
+        if plaintext_bytes > MAX_DEPOSIT_SYNC_PAGE_PLAINTEXT_BYTES {
             return Err(DepositSyncWireError::InvalidObjectRequest);
         }
-        let manifest = object_manifest_digest(
-            self.context,
-            self.anchor,
-            &self.references,
-            self.maximum_objects,
-            self.maximum_plaintext_bytes,
-        )?;
-        self.cursor.validate(self.context, self.anchor, manifest, self.references.len())
+        Ok(())
+    }
+
+    /// Authenticate every non-root entry with the source's local MAC key.
+    pub fn authenticate_capabilities(
+        &self,
+        source: PartyId,
+        requester: PartyId,
+        mac_key: &[u8; 32],
+    ) -> Result<(), DepositSyncWireError> {
+        self.validate()?;
+        self.lease.authenticate_for(mac_key, source, requester)?;
+        reject_zero_mac_key(mac_key)?;
+        for entry in &self.entries {
+            if let Some(capability) = entry.capability {
+                capability.authenticate_for(
+                    mac_key,
+                    self.lease,
+                    capability.parent,
+                    entry.target,
+                )?;
+            }
+        }
+        Ok(())
     }
 
     #[must_use]
     pub const fn context(&self) -> DepositSyncContext {
-        self.context
+        self.lease.context
     }
 
     #[must_use]
     pub const fn anchor(&self) -> DepositSyncObjectAnchor {
-        self.anchor
+        self.lease.anchor
     }
 
     #[must_use]
-    pub fn references(&self) -> &[DepositSyncObjectRef] {
-        &self.references
+    pub const fn lease(&self) -> DepositSyncAnchorLease {
+        self.lease
     }
 
     #[must_use]
-    pub const fn cursor(&self) -> DepositSyncObjectCursor {
-        self.cursor
+    pub const fn source(&self) -> PartyId {
+        self.lease.source
     }
 
     #[must_use]
-    pub const fn maximum_objects(&self) -> u16 {
-        self.maximum_objects
+    pub const fn requester(&self) -> PartyId {
+        self.lease.requester
     }
 
     #[must_use]
-    pub const fn maximum_plaintext_bytes(&self) -> u32 {
-        self.maximum_plaintext_bytes
+    pub fn entries(&self) -> &[DepositSyncObjectRequestEntry] {
+        &self.entries
     }
 
-    pub fn to_bytes(
-        &self,
-        advertisement: &DepositSyncAdvertisement,
-    ) -> Result<Vec<u8>, DepositSyncWireError> {
-        self.validate_for(advertisement)?;
-        encode_canonical(self, MAX_OBJECT_REQUEST_BYTES)
+    #[must_use]
+    pub fn digest(&self) -> [u8; 32] {
+        let bytes = postcard::to_allocvec(self).expect("validated object request serializes");
+        length_prefixed_hash(OBJECT_REQUEST_DIGEST_DOMAIN, &bytes)
     }
 
+    pub fn to_bytes(&self) -> Result<Vec<u8>, DepositSyncWireError> {
+        self.validate()?;
+        encode_canonical(self, MAX_DEPOSIT_SYNC_OBJECT_REQUEST_BYTES)
+    }
+
+    /// Decode and authenticate a request for the exact transport-authenticated parties.
     pub fn from_bytes(
-        advertisement: &DepositSyncAdvertisement,
+        source: PartyId,
+        requester: PartyId,
+        mac_key: &[u8; 32],
         bytes: &[u8],
     ) -> Result<Self, DepositSyncWireError> {
-        let request = decode_canonical::<Self>(bytes, MAX_OBJECT_REQUEST_BYTES)?;
-        request.validate_for(advertisement)?;
-        require_canonical(&request, bytes, MAX_OBJECT_REQUEST_BYTES)?;
+        let request = decode_canonical::<Self>(bytes, MAX_DEPOSIT_SYNC_OBJECT_REQUEST_BYTES)?;
+        request.authenticate_capabilities(source, requester, mac_key)?;
+        require_canonical(&request, bytes, MAX_DEPOSIT_SYNC_OBJECT_REQUEST_BYTES)?;
         Ok(request)
     }
 
     /// Decode only enough bounded canonical structure to select the local wallet authority.
     ///
-    /// The returned context does not authenticate the request's advertisement anchor. A handler
-    /// must immediately load its exact local advertisement and call [`Self::from_bytes`] again.
+    /// The returned context does not authenticate the lease or capabilities. A handler must call
+    /// [`Self::from_bytes`] immediately with its stable source key and authenticated peer IDs.
     pub fn context_from_bytes(bytes: &[u8]) -> Result<DepositSyncContext, DepositSyncWireError> {
-        let request = decode_canonical::<Self>(bytes, MAX_OBJECT_REQUEST_BYTES)?;
-        request.context.validate()?;
-        if request.version != DEPOSIT_SYNC_WIRE_VERSION {
-            return Err(DepositSyncWireError::UnsupportedVersion);
-        }
-        require_canonical(&request, bytes, MAX_OBJECT_REQUEST_BYTES)?;
-        Ok(request.context)
-    }
-
-    fn manifest_digest(&self) -> Result<[u8; 32], DepositSyncWireError> {
-        object_manifest_digest(
-            self.context,
-            self.anchor,
-            &self.references,
-            self.maximum_objects,
-            self.maximum_plaintext_bytes,
-        )
-    }
-
-    /// Authenticate the complete ordered frontier before any of its plaintext may be returned.
-    ///
-    /// Every reference must be either an exact advertised root or a child edge decoded from an
-    /// earlier authenticated object. The callback is therefore never invoked for a detached
-    /// reference. Portable-index decoding also rejects the party-local safety namespace.
-    pub fn verify_reachable_manifest<F>(
-        &self,
-        advertisement: &DepositSyncAdvertisement,
-        mut load: F,
-    ) -> Result<VerifiedDepositSyncObjectManifest, DepositSyncWireError>
-    where
-        F: FnMut(DepositSyncObjectRef) -> Result<Option<Vec<u8>>, DepositSyncWireError>,
-    {
-        self.validate_for(advertisement)?;
-        let mut reachable = BTreeSet::new();
-        reachable.insert(DepositSyncObjectRef::Registry(self.anchor.registry_root));
-        if let Some(root) = self.anchor.portable_root {
-            reachable.insert(DepositSyncObjectRef::Index(root));
-        }
-        if let Some(root) = self.anchor.certificate_event_root {
-            reachable.insert(DepositSyncObjectRef::CertificateArchive(root));
-        }
-        if let Some(root) = self.anchor.certificate_segment_root {
-            reachable.insert(DepositSyncObjectRef::CertificateArchive(root));
-        }
-
-        let mut objects = Vec::with_capacity(self.references.len());
-        for reference in self.references.iter().copied() {
-            if !reachable.remove(&reference) {
-                return Err(DepositSyncWireError::UnreachableObjectReference);
-            }
-            let bytes = load(reference)?.ok_or(DepositSyncWireError::ObjectUnavailable)?;
-            let object = DepositSyncObject::new(reference, bytes)?;
-            if self
-                .anchor
-                .portable_root
-                .is_some_and(|root| reference == DepositSyncObjectRef::Index(root))
-            {
-                let DepositSyncObjectRef::Index(id) = reference else {
-                    return Err(DepositSyncWireError::InvalidObject);
-                };
-                let verified =
-                    verify_portable_index_object(self.context.wallet, id, object.bytes())
-                        .map_err(|_| DepositSyncWireError::InvalidObject)?;
-                if !verified.is_node() {
-                    return Err(DepositSyncWireError::InvalidObject);
-                }
-            }
-            for child in object.children()? {
-                child.validate_for(self.context.wallet)?;
-                reachable.insert(child);
-            }
-            objects.push(object);
-        }
-        let verified = VerifiedDepositSyncObjectManifest {
-            context: self.context,
-            advertisement: self.anchor.advertisement,
-            manifest: self.manifest_digest()?,
-            objects,
-        };
-        verified.validate_for(self, advertisement)?;
-        Ok(verified)
-    }
-}
-
-/// Non-deserializable proof that one complete finite object manifest is connected to advertised
-/// roots and contains no party-local index values.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct VerifiedDepositSyncObjectManifest {
-    context: DepositSyncContext,
-    advertisement: [u8; 32],
-    manifest: [u8; 32],
-    objects: Vec<DepositSyncObject>,
-}
-
-impl VerifiedDepositSyncObjectManifest {
-    fn validate_for(
-        &self,
-        request: &DepositSyncObjectPageRequest,
-        advertisement: &DepositSyncAdvertisement,
-    ) -> Result<(), DepositSyncWireError> {
-        request.validate_for(advertisement)?;
-        if self.context != request.context
-            || self.advertisement != request.anchor.advertisement
-            || self.manifest != request.manifest_digest()?
-            || self.objects.len() != request.references.len()
-            || self
-                .objects
-                .iter()
-                .zip(&request.references)
-                .any(|(object, reference)| object.reference != *reference)
+        let request = decode_canonical::<Self>(bytes, MAX_DEPOSIT_SYNC_OBJECT_REQUEST_BYTES)?;
+        request.lease.context.validate()?;
+        if request.version != DEPOSIT_SYNC_WIRE_VERSION
+            || request.entries.is_empty()
+            || request.entries.len() > MAX_DEPOSIT_SYNC_REQUEST_OBJECTS
         {
-            return Err(DepositSyncWireError::InvalidObjectManifest);
+            return Err(DepositSyncWireError::InvalidObjectRequest);
         }
-        for object in &self.objects {
-            object.validate_for(request.context.wallet)?;
-        }
-        Ok(())
-    }
-
-    #[must_use]
-    pub fn objects(&self) -> &[DepositSyncObject] {
-        &self.objects
-    }
-
-    /// Derive both exact operation and checkpoint-certificate references from the directly
-    /// advertised latest archive event. No caller-supplied payload reference is accepted.
-    pub fn checkpoint_artifacts(
-        &self,
-        request: &DepositSyncObjectPageRequest,
-        advertisement: &DepositSyncAdvertisement,
-    ) -> Result<VerifiedDepositCheckpointArtifacts, DepositSyncWireError> {
-        self.validate_for(request, advertisement)?;
-        let head = advertisement.certificate_archive;
-        let event_reference =
-            head.event_reference().ok_or(DepositSyncWireError::InvalidCertifiedArtifact)?;
-        let expected = DepositSyncObjectRef::CertificateArchive(event_reference);
-        let object = self
-            .objects
-            .iter()
-            .find(|object| object.reference == expected)
-            .ok_or(DepositSyncWireError::InvalidCertifiedArtifact)?;
-        VerifiedDepositCheckpointArtifacts::from_checkpoint_event(advertisement, object.bytes())
+        require_canonical(&request, bytes, MAX_DEPOSIT_SYNC_OBJECT_REQUEST_BYTES)?;
+        Ok(request.lease.context)
     }
 }
 
-/// Deterministic, hard-bounded page for one exact object manifest.
+/// One exact response page plus newly issued child capabilities.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct DepositSyncObjectPage {
     version: u16,
     context: DepositSyncContext,
     anchor: DepositSyncObjectAnchor,
-    manifest: [u8; 32],
-    start: u16,
+    source: PartyId,
+    requester: PartyId,
+    request: [u8; 32],
     #[serde(deserialize_with = "deserialize_objects")]
     objects: Vec<DepositSyncObject>,
-    next: Option<DepositSyncObjectCursor>,
+    #[serde(deserialize_with = "deserialize_object_capabilities")]
+    capabilities: Vec<DepositSyncObjectCapability>,
 }
 
 impl DepositSyncObjectPage {
-    /// Build one deterministic page only from a previously verified connected manifest.
     pub fn build(
         request: &DepositSyncObjectPageRequest,
-        advertisement: &DepositSyncAdvertisement,
-        verified: &VerifiedDepositSyncObjectManifest,
+        objects: Vec<DepositSyncObject>,
+        capabilities: Vec<DepositSyncObjectCapability>,
     ) -> Result<Self, DepositSyncWireError> {
-        request.validate_for(advertisement)?;
-        verified.validate_for(request, advertisement)?;
-        let start = usize::from(request.cursor.position);
-        let end = deterministic_page_end(request)?;
-        let objects = verified.objects[start..end].to_vec();
-        let manifest = request.manifest_digest()?;
-        let next = if end < request.references.len() {
-            Some(DepositSyncObjectCursor::new(request.context, request.anchor, manifest, end)?)
-        } else {
-            None
-        };
         let page = Self {
             version: DEPOSIT_SYNC_WIRE_VERSION,
-            context: request.context,
-            anchor: request.anchor,
-            manifest,
-            start: u16::try_from(start).map_err(|_| DepositSyncWireError::InvalidCursor)?,
+            context: request.context(),
+            anchor: request.anchor(),
+            source: request.source(),
+            requester: request.requester(),
+            request: request.digest(),
             objects,
-            next,
+            capabilities,
         };
-        page.validate_for(request, advertisement)?;
+        page.validate_for(request)?;
         Ok(page)
     }
 
+    /// Validate exact request/response correspondence and every typed semantic edge before merge.
     pub fn validate_for(
         &self,
         request: &DepositSyncObjectPageRequest,
-        advertisement: &DepositSyncAdvertisement,
     ) -> Result<(), DepositSyncWireError> {
-        request.validate_for(advertisement)?;
+        request.validate()?;
         self.context.validate()?;
-        let manifest = request.manifest_digest()?;
-        let start = usize::from(self.start);
         if self.version != DEPOSIT_SYNC_WIRE_VERSION
-            || self.context != request.context
-            || self.anchor != request.anchor
-            || self.manifest != manifest
-            || start != usize::from(request.cursor.position)
-            || self.objects.is_empty()
-            || self.objects.len() > usize::from(request.maximum_objects)
+            || self.context != request.context()
+            || self.anchor != request.anchor()
+            || self.source != request.source()
+            || self.requester != request.requester()
+            || self.request != request.digest()
+            || self.objects.len() != request.entries.len()
             || self.objects.len() > MAX_DEPOSIT_SYNC_PAGE_OBJECTS
-            || start
-                .checked_add(self.objects.len())
-                .is_none_or(|end| end > request.references.len())
+            || self.capabilities.len() > MAX_DEPOSIT_SYNC_PAGE_CAPABILITIES
         {
             return Err(DepositSyncWireError::InvalidObjectPage);
         }
+
+        let mut expected_edges = BTreeSet::new();
         let mut plaintext_bytes = 0_usize;
-        for (offset, object) in self.objects.iter().enumerate() {
-            if object.reference
-                != request.references
-                    [start.checked_add(offset).ok_or(DepositSyncWireError::InvalidObjectPage)?]
-            {
+        for (object, entry) in self.objects.iter().zip(&request.entries) {
+            if object.reference != entry.reference() {
                 return Err(DepositSyncWireError::InvalidObjectPage);
             }
-            object.validate_for(request.context.wallet)?;
+            object.validate_for(request.context().wallet)?;
+            for child in object.authenticated_semantic_children(entry.target)? {
+                child.validate_for(request.lease)?;
+                expected_edges.insert((entry.target, child));
+            }
             plaintext_bytes = plaintext_bytes
                 .checked_add(object.bytes.len())
                 .ok_or(DepositSyncWireError::InvalidObjectPage)?;
         }
-        if plaintext_bytes
-            > usize::try_from(request.maximum_plaintext_bytes)
-                .map_err(|_| DepositSyncWireError::InvalidObjectPage)?
-            || plaintext_bytes > MAX_DEPOSIT_SYNC_PAGE_PLAINTEXT_BYTES
-        {
+        if plaintext_bytes > MAX_DEPOSIT_SYNC_PAGE_PLAINTEXT_BYTES {
             return Err(DepositSyncWireError::InvalidObjectPage);
         }
-        let end = start + self.objects.len();
-        if end != deterministic_page_end(request)? {
-            return Err(DepositSyncWireError::InvalidObjectPage);
+
+        let mut edges = BTreeSet::new();
+        for capability in &self.capabilities {
+            capability.validate_binding(request.lease, capability.parent, capability.child)?;
+            if !edges.insert((capability.parent, capability.child)) {
+                return Err(DepositSyncWireError::InvalidObjectPage);
+            }
         }
-        match (self.next, end == request.references.len()) {
-            (None, true) => {}
-            (Some(cursor), false) => cursor.validate(
-                request.context,
-                request.anchor,
-                manifest,
-                request.references.len(),
-            )?,
-            _ => return Err(DepositSyncWireError::InvalidObjectPage),
-        }
-        if self.next.is_some_and(|cursor| usize::from(cursor.position) != end) {
+        if edges != expected_edges {
             return Err(DepositSyncWireError::InvalidObjectPage);
         }
         Ok(())
@@ -1713,26 +2377,34 @@ impl DepositSyncObjectPage {
     }
 
     #[must_use]
-    pub const fn next_cursor(&self) -> Option<DepositSyncObjectCursor> {
-        self.next
+    pub fn capabilities(&self) -> &[DepositSyncObjectCapability] {
+        &self.capabilities
+    }
+
+    /// Exact replay identity for this ordered request-bound response.
+    ///
+    /// Objects already commit to their plaintext. The canonical page bytes additionally bind
+    /// their order and every issued source-local child capability.
+    #[must_use]
+    pub fn digest(&self) -> [u8; 32] {
+        let bytes = postcard::to_allocvec(self).expect("validated object response serializes");
+        length_prefixed_hash(OBJECT_RESPONSE_DIGEST_DOMAIN, &bytes)
     }
 
     pub fn to_bytes(
         &self,
         request: &DepositSyncObjectPageRequest,
-        advertisement: &DepositSyncAdvertisement,
     ) -> Result<Vec<u8>, DepositSyncWireError> {
-        self.validate_for(request, advertisement)?;
+        self.validate_for(request)?;
         encode_canonical(self, MAX_DEPOSIT_SYNC_WIRE_BYTES)
     }
 
     pub fn from_bytes(
         request: &DepositSyncObjectPageRequest,
-        advertisement: &DepositSyncAdvertisement,
         bytes: &[u8],
     ) -> Result<Self, DepositSyncWireError> {
         let page = decode_canonical::<Self>(bytes, MAX_DEPOSIT_SYNC_WIRE_BYTES)?;
-        page.validate_for(request, advertisement)?;
+        page.validate_for(request)?;
         require_canonical(&page, bytes, MAX_DEPOSIT_SYNC_WIRE_BYTES)?;
         Ok(page)
     }
@@ -2125,65 +2797,77 @@ fn validate_certificate_archive_reference(
     Ok(())
 }
 
-fn object_manifest_digest(
-    context: DepositSyncContext,
-    anchor: DepositSyncObjectAnchor,
-    references: &[DepositSyncObjectRef],
-    maximum_objects: u16,
-    maximum_plaintext_bytes: u32,
+fn capability_mac(
+    mac_key: &[u8; 32],
+    capability: &DepositSyncObjectCapability,
 ) -> Result<[u8; 32], DepositSyncWireError> {
     #[derive(Serialize)]
-    struct Manifest<'a> {
+    struct Material {
         version: u16,
+        domain: [u8; 16],
         context: DepositSyncContext,
-        anchor: DepositSyncObjectAnchor,
-        references: &'a [DepositSyncObjectRef],
-        maximum_objects: u16,
-        maximum_plaintext_bytes: u32,
+        advertisement: [u8; 32],
+        lease: [u8; 32],
+        source: PartyId,
+        requester: PartyId,
+        parent: DepositSyncTraversalTarget,
+        child: DepositSyncTraversalTarget,
     }
-    let bytes = postcard::to_allocvec(&Manifest {
-        version: DEPOSIT_SYNC_WIRE_VERSION,
-        context,
-        anchor,
-        references,
-        maximum_objects,
-        maximum_plaintext_bytes,
+    let bytes = postcard::to_allocvec(&Material {
+        version: capability.version,
+        domain: capability.domain,
+        context: capability.context,
+        advertisement: capability.advertisement,
+        lease: capability.lease,
+        source: capability.source,
+        requester: capability.requester,
+        parent: capability.parent,
+        child: capability.child,
     })
     .map_err(|_| DepositSyncWireError::Serialization)?;
-    Ok(length_prefixed_hash(OBJECT_MANIFEST_DIGEST_DOMAIN, &bytes))
+    let mut hasher = blake3::Hasher::new_keyed(mac_key);
+    hasher.update(&(OBJECT_CAPABILITY_MAC_DOMAIN.len() as u64).to_le_bytes());
+    hasher.update(OBJECT_CAPABILITY_MAC_DOMAIN);
+    hasher.update(&(bytes.len() as u64).to_le_bytes());
+    hasher.update(&bytes);
+    Ok(*hasher.finalize().as_bytes())
 }
 
-fn deterministic_page_end(
-    request: &DepositSyncObjectPageRequest,
-) -> Result<usize, DepositSyncWireError> {
-    let start = usize::from(request.cursor.position);
-    let count_limit = usize::from(request.maximum_objects);
-    let byte_limit = usize::try_from(request.maximum_plaintext_bytes)
-        .map_err(|_| DepositSyncWireError::InvalidObjectRequest)?;
-    let mut count = 0_usize;
-    let mut plaintext_bytes = 0_usize;
-    for reference in request.references.iter().copied().skip(start) {
-        if count == count_limit {
-            break;
-        }
-        let expected = usize::try_from(reference.plaintext_len())
-            .map_err(|_| DepositSyncWireError::InvalidObjectReference)?;
-        let next_total = plaintext_bytes
-            .checked_add(expected)
-            .ok_or(DepositSyncWireError::InvalidObjectRequest)?;
-        if next_total > byte_limit {
-            if count == 0 {
-                return Err(DepositSyncWireError::PageLimitTooSmall);
-            }
-            break;
-        }
-        plaintext_bytes = next_total;
-        count += 1;
+fn anchor_lease_mac(
+    mac_key: &[u8; 32],
+    lease: &DepositSyncAnchorLease,
+) -> Result<[u8; 32], DepositSyncWireError> {
+    #[derive(Serialize)]
+    struct Material {
+        version: u16,
+        domain: [u8; 16],
+        context: DepositSyncContext,
+        anchor: DepositSyncObjectAnchor,
+        source: PartyId,
+        requester: PartyId,
     }
-    if count == 0 {
-        return Err(DepositSyncWireError::InvalidObjectPage);
+    let bytes = postcard::to_allocvec(&Material {
+        version: lease.version,
+        domain: lease.domain,
+        context: lease.context,
+        anchor: lease.anchor,
+        source: lease.source,
+        requester: lease.requester,
+    })
+    .map_err(|_| DepositSyncWireError::Serialization)?;
+    let mut hasher = blake3::Hasher::new_keyed(mac_key);
+    hasher.update(&(ANCHOR_LEASE_MAC_DOMAIN.len() as u64).to_le_bytes());
+    hasher.update(ANCHOR_LEASE_MAC_DOMAIN);
+    hasher.update(&(bytes.len() as u64).to_le_bytes());
+    hasher.update(&bytes);
+    Ok(*hasher.finalize().as_bytes())
+}
+
+fn reject_zero_mac_key(mac_key: &[u8; 32]) -> Result<(), DepositSyncWireError> {
+    if *mac_key == [0; 32] {
+        return Err(DepositSyncWireError::InvalidObjectCapability);
     }
-    start.checked_add(count).ok_or(DepositSyncWireError::InvalidObjectPage)
+    Ok(())
 }
 
 fn certificate_archive_digest(head: DepositArchiveHead) -> [u8; 32] {
@@ -2236,21 +2920,21 @@ fn require_canonical<T: Serialize>(
     Ok(())
 }
 
-fn deserialize_object_references<'de, D>(
+fn deserialize_object_request_entries<'de, D>(
     deserializer: D,
-) -> Result<Vec<DepositSyncObjectRef>, D::Error>
+) -> Result<Vec<DepositSyncObjectRequestEntry>, D::Error>
 where
     D: Deserializer<'de>,
 {
-    struct ReferencesVisitor;
+    struct EntriesVisitor;
 
-    impl<'de> Visitor<'de> for ReferencesVisitor {
-        type Value = Vec<DepositSyncObjectRef>;
+    impl<'de> Visitor<'de> for EntriesVisitor {
+        type Value = Vec<DepositSyncObjectRequestEntry>;
 
         fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
             write!(
                 formatter,
-                "at most {MAX_DEPOSIT_SYNC_REQUEST_OBJECTS} deposit object references"
+                "at most {MAX_DEPOSIT_SYNC_REQUEST_OBJECTS} deposit object request entries"
             )
         }
 
@@ -2259,22 +2943,63 @@ where
             A: SeqAccess<'de>,
         {
             if sequence.size_hint().is_some_and(|hint| hint > MAX_DEPOSIT_SYNC_REQUEST_OBJECTS) {
-                return Err(A::Error::custom("too many deposit object references"));
+                return Err(A::Error::custom("too many deposit object request entries"));
             }
-            let mut references = Vec::with_capacity(
+            let mut entries = Vec::with_capacity(
                 sequence.size_hint().unwrap_or(0).min(MAX_DEPOSIT_SYNC_REQUEST_OBJECTS),
             );
-            while let Some(reference) = sequence.next_element()? {
-                if references.len() == MAX_DEPOSIT_SYNC_REQUEST_OBJECTS {
-                    return Err(A::Error::custom("too many deposit object references"));
+            while let Some(entry) = sequence.next_element()? {
+                if entries.len() == MAX_DEPOSIT_SYNC_REQUEST_OBJECTS {
+                    return Err(A::Error::custom("too many deposit object request entries"));
                 }
-                references.push(reference);
+                entries.push(entry);
             }
-            Ok(references)
+            Ok(entries)
         }
     }
 
-    deserializer.deserialize_seq(ReferencesVisitor)
+    deserializer.deserialize_seq(EntriesVisitor)
+}
+
+fn deserialize_object_capabilities<'de, D>(
+    deserializer: D,
+) -> Result<Vec<DepositSyncObjectCapability>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    struct CapabilitiesVisitor;
+
+    impl<'de> Visitor<'de> for CapabilitiesVisitor {
+        type Value = Vec<DepositSyncObjectCapability>;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(
+                formatter,
+                "at most {MAX_DEPOSIT_SYNC_PAGE_CAPABILITIES} deposit object capabilities"
+            )
+        }
+
+        fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+        where
+            A: SeqAccess<'de>,
+        {
+            if sequence.size_hint().is_some_and(|hint| hint > MAX_DEPOSIT_SYNC_PAGE_CAPABILITIES) {
+                return Err(A::Error::custom("too many deposit object capabilities"));
+            }
+            let mut capabilities = Vec::with_capacity(
+                sequence.size_hint().unwrap_or(0).min(MAX_DEPOSIT_SYNC_PAGE_CAPABILITIES),
+            );
+            while let Some(capability) = sequence.next_element()? {
+                if capabilities.len() == MAX_DEPOSIT_SYNC_PAGE_CAPABILITIES {
+                    return Err(A::Error::custom("too many deposit object capabilities"));
+                }
+                capabilities.push(capability);
+            }
+            Ok(capabilities)
+        }
+    }
+
+    deserializer.deserialize_seq(CapabilitiesVisitor)
 }
 
 fn deserialize_objects<'de, D>(deserializer: D) -> Result<Vec<DepositSyncObject>, D::Error>
@@ -2325,28 +3050,28 @@ pub enum DepositSyncWireError {
     MissingRegistryHead,
     #[error("the compact catch-up advertisement is malformed or internally inconsistent")]
     InvalidAdvertisement,
+    #[error("the source-issued exact-anchor lease is malformed or unauthenticated")]
+    InvalidHeadLease,
+    #[error("the source-pin release request or acknowledgement is malformed or mismatched")]
+    InvalidRelease,
     #[error("the request is not bound to the supplied advertised roots")]
     WrongAdvertisement,
-    #[error("the finite object request is malformed or exceeds its limits")]
+    #[error("the object-page request is malformed or exceeds its limits")]
     InvalidObjectRequest,
-    #[error("the object cursor is malformed or belongs to another request")]
-    InvalidCursor,
+    #[error("the source-issued object capability is malformed or unauthenticated")]
+    InvalidObjectCapability,
+    #[error("the object traversal target has the wrong semantic position")]
+    InvalidTraversalTarget,
     #[error("a content-addressed object reference is malformed or wallet-mismatched")]
     InvalidObjectReference,
-    #[error("an object reference is not an advertised root or child of an earlier object")]
-    UnreachableObjectReference,
     #[error("a returned content-addressed object is malformed")]
     InvalidObject,
     #[error("returned object bytes do not authenticate to their exact reference")]
     ObjectAuthentication,
     #[error("a requested immutable object is unavailable")]
     ObjectUnavailable,
-    #[error("the requested byte limit cannot hold the next exact object")]
-    PageLimitTooSmall,
     #[error("the returned object page is malformed or does not match the request")]
     InvalidObjectPage,
-    #[error("the finite object manifest has not been authenticated from advertised roots")]
-    InvalidObjectManifest,
     #[error("the certified archive artifact is malformed")]
     InvalidCertifiedArtifact,
     #[error("the index checkpoint is not bound to one exact certified ledger decision")]
@@ -2367,10 +3092,7 @@ pub enum DepositSyncWireError {
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        cell::Cell,
-        collections::{BTreeMap, VecDeque},
-    };
+    use std::collections::{BTreeMap, VecDeque};
 
     use crate::{
         committee::{Committee, Member, PartyId},
@@ -2439,6 +3161,20 @@ mod tests {
         Fixture { advertisement, objects }
     }
 
+    fn leased_head(
+        fixture: &Fixture,
+        mac_key: &[u8; 32],
+    ) -> (DepositSyncHeadRequest, DepositSyncHeadResponse, DepositSyncAnchorLease) {
+        let request =
+            DepositSyncHeadRequest::new(fixture.advertisement.context(), PartyId(1), PartyId(2))
+                .unwrap();
+        let response =
+            DepositSyncHeadResponse::issue(request, fixture.advertisement.clone(), mac_key)
+                .unwrap();
+        let lease = response.lease();
+        (request, response, lease)
+    }
+
     fn connected_registry_references(
         fixture: &Fixture,
         maximum: usize,
@@ -2467,6 +3203,28 @@ mod tests {
 
     fn raw_encode<T: Serialize>(value: &T) -> Vec<u8> {
         postcard::to_allocvec(value).unwrap()
+    }
+
+    #[test]
+    fn successor_boundary_accepts_postterminal_digest_with_exact_ledger_position() {
+        assert!(portable_index_respects_registry_boundary(9, 9, true, None));
+        assert!(
+            !portable_index_respects_registry_boundary(9, 9, false, None),
+            "a successor boundary still requires the exact predecessor ledger head and next index",
+        );
+        assert!(
+            !portable_index_respects_registry_boundary(8, 9, true, None),
+            "an advertisement cannot precede its active registry boundary",
+        );
+    }
+
+    #[test]
+    fn epoch_zero_boundary_requires_the_exact_committed_checkpoint() {
+        assert!(portable_index_respects_registry_boundary(0, 0, true, Some(true)));
+        assert!(
+            !portable_index_respects_registry_boundary(0, 0, true, Some(false)),
+            "epoch zero directly commits the exact portable checkpoint digest",
+        );
     }
 
     fn observation_certificate(
@@ -2519,30 +3277,126 @@ mod tests {
     }
 
     #[test]
-    fn head_and_advertisement_are_canonical_and_bound() {
-        let fixture = fixture(7);
-        let request = DepositSyncHeadRequest::new(fixture.advertisement.context()).unwrap();
+    fn head_response_and_restart_stable_anchor_lease_are_canonical_and_bound() {
+        assert_eq!(MAX_DEPOSIT_SYNC_HEAD_REQUEST_BYTES, 256);
+        let test_fixture = fixture(7);
+        let mac_key = [0x71; 32];
+        let (request, response, lease) = leased_head(&test_fixture, &mac_key);
         let bytes = request.to_bytes().unwrap();
-        assert_eq!(DepositSyncHeadRequest::from_bytes(&bytes).unwrap(), request);
-
-        let advertisement_bytes = fixture.advertisement.to_bytes(request).unwrap();
+        assert!(bytes.len() <= MAX_DEPOSIT_SYNC_HEAD_REQUEST_BYTES);
         assert_eq!(
-            DepositSyncAdvertisement::from_bytes(request, &advertisement_bytes).unwrap(),
-            fixture.advertisement
+            DepositSyncHeadRequest::from_bytes(PartyId(1), PartyId(2), &bytes).unwrap(),
+            request
         );
+        assert!(matches!(
+            DepositSyncHeadRequest::from_bytes(
+                PartyId(1),
+                PartyId(2),
+                &vec![0; MAX_DEPOSIT_SYNC_HEAD_REQUEST_BYTES + 1],
+            ),
+            Err(DepositSyncWireError::WireTooLarge {
+                actual,
+                maximum: MAX_DEPOSIT_SYNC_HEAD_REQUEST_BYTES,
+            }) if actual == MAX_DEPOSIT_SYNC_HEAD_REQUEST_BYTES + 1
+        ));
+
+        let response_bytes = response.to_bytes(request).unwrap();
+        assert_eq!(
+            DepositSyncHeadResponse::from_bytes(request, &response_bytes).unwrap(),
+            response
+        );
+        assert_eq!(response.advertisement(), &test_fixture.advertisement);
+        lease.authenticate_for(&mac_key, PartyId(1), PartyId(2)).unwrap();
 
         let mut trailing = bytes.clone();
         trailing.push(0);
         assert!(matches!(
-            DepositSyncHeadRequest::from_bytes(&trailing),
+            DepositSyncHeadRequest::from_bytes(PartyId(1), PartyId(2), &trailing),
             Err(DepositSyncWireError::TrailingBytes)
         ));
+        assert!(DepositSyncHeadRequest::from_bytes(PartyId(3), PartyId(2), &bytes).is_err());
+        assert!(lease.authenticate_for(&[0x72; 32], PartyId(1), PartyId(2)).is_err());
+
+        let anchor = response.advertisement().object_anchor();
+        anchor.validate_context(request.context()).unwrap();
+        assert!(anchor.validate_context(fixture(9).advertisement.context()).is_err());
+        let mut malformed_anchor = postcard::to_allocvec(&anchor).unwrap();
+        malformed_anchor[0] = u8::try_from(DEPOSIT_SYNC_WIRE_VERSION.saturating_add(1)).unwrap();
+        let malformed_anchor: DepositSyncObjectAnchor =
+            postcard::from_bytes(&malformed_anchor).unwrap();
+        assert!(malformed_anchor.validate_context(request.context()).is_err());
 
         // Postcard's unsigned varint decoder must not let an overlong representation become a
         // second encoding of the current version.
         let mut overlong = bytes;
         overlong.splice(0..1, [0x81, 0x00]);
-        assert!(DepositSyncHeadRequest::from_bytes(&overlong).is_err());
+        assert!(DepositSyncHeadRequest::from_bytes(PartyId(1), PartyId(2), &overlong).is_err());
+    }
+
+    #[test]
+    fn source_pin_release_and_typed_ack_are_exact_canonical_and_restart_stable() {
+        assert_eq!(MAX_DEPOSIT_SYNC_RELEASE_REQUEST_BYTES, 2 * 1024);
+        let test_fixture = fixture(8);
+        let mac_key = [0x81; 32];
+        let (_, _, lease) = leased_head(&test_fixture, &mac_key);
+        let request = DepositSyncReleaseRequest::new(lease).unwrap();
+        let bytes = request.to_bytes().unwrap();
+        assert!(bytes.len() <= MAX_DEPOSIT_SYNC_RELEASE_REQUEST_BYTES);
+        assert_eq!(
+            DepositSyncReleaseRequest::from_bytes(PartyId(1), PartyId(2), &mac_key, &bytes,)
+                .unwrap(),
+            request,
+        );
+        assert_eq!(request.lease_digest(), lease.digest());
+
+        let acknowledgement = DepositSyncReleaseAck::issue(request).unwrap();
+        let acknowledgement_bytes = acknowledgement.to_bytes(request).unwrap();
+        assert!(acknowledgement_bytes.len() <= MAX_DEPOSIT_SYNC_RELEASE_ACK_BYTES);
+        assert_eq!(
+            DepositSyncReleaseAck::from_bytes(request, &acknowledgement_bytes).unwrap(),
+            acknowledgement,
+        );
+        assert_eq!(acknowledgement.request_digest(), request.digest());
+
+        assert!(
+            DepositSyncReleaseRequest::from_bytes(PartyId(3), PartyId(2), &mac_key, &bytes,)
+                .is_err()
+        );
+        assert!(
+            DepositSyncReleaseRequest::from_bytes(PartyId(1), PartyId(3), &mac_key, &bytes,)
+                .is_err()
+        );
+        assert!(
+            DepositSyncReleaseRequest::from_bytes(PartyId(1), PartyId(2), &[0x82; 32], &bytes,)
+                .is_err()
+        );
+
+        let mut trailing = bytes.clone();
+        trailing.push(0);
+        assert!(matches!(
+            DepositSyncReleaseRequest::from_bytes(PartyId(1), PartyId(2), &mac_key, &trailing,),
+            Err(DepositSyncWireError::TrailingBytes)
+        ));
+
+        let other = fixture(9);
+        let (_, _, other_lease) = leased_head(&other, &[0x83; 32]);
+        let other_request = DepositSyncReleaseRequest::new(other_lease).unwrap();
+        assert!(
+            DepositSyncReleaseAck::from_bytes(other_request, &acknowledgement_bytes).is_err(),
+            "an acknowledgement for one lease must not retire another source pin",
+        );
+
+        let mut corrupted = request;
+        corrupted.lease.tag[0] ^= 1;
+        assert!(
+            DepositSyncReleaseRequest::from_bytes(
+                PartyId(1),
+                PartyId(2),
+                &mac_key,
+                &raw_encode(&corrupted),
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -2585,25 +3439,42 @@ mod tests {
         let object =
             DepositSyncObject::new(DepositSyncObjectRef::CertificateArchive(reference), bytes)
                 .unwrap();
-        assert!(object.children().unwrap().is_empty());
+        let target = DepositSyncTraversalTarget::ArchiveLeaf {
+            reference,
+            checkpoint_sequence: 17,
+            kind: DepositSyncArchiveLeafKind::CertifiedObservation,
+        };
+        assert!(object.authenticated_semantic_children(target).unwrap().is_empty());
     }
 
     #[test]
     fn wrong_domain_wallet_and_version_fail_closed() {
         let fixture = fixture(9);
-        let request = DepositSyncHeadRequest::new(fixture.advertisement.context()).unwrap();
+        let request =
+            DepositSyncHeadRequest::new(fixture.advertisement.context(), PartyId(1), PartyId(2))
+                .unwrap();
 
         let mut wrong_version = request;
         wrong_version.version = DEPOSIT_SYNC_WIRE_VERSION + 1;
-        assert!(DepositSyncHeadRequest::from_bytes(&raw_encode(&wrong_version)).is_err());
+        assert!(
+            DepositSyncHeadRequest::from_bytes(
+                PartyId(1),
+                PartyId(2),
+                &raw_encode(&wrong_version),
+            )
+            .is_err()
+        );
 
         let mut wrong_domain = request;
         wrong_domain.context.domain[0] ^= 1;
-        assert!(DepositSyncHeadRequest::from_bytes(&raw_encode(&wrong_domain)).is_err());
+        assert!(
+            DepositSyncHeadRequest::from_bytes(PartyId(1), PartyId(2), &raw_encode(&wrong_domain),)
+                .is_err()
+        );
 
         let mut wrong_wallet = fixture.advertisement.clone();
         wrong_wallet.context.wallet = DepositWalletId([0x44; 32]);
-        assert!(DepositSyncAdvertisement::from_bytes(request, &raw_encode(&wrong_wallet)).is_err());
+        assert!(DepositSyncHeadResponse::issue(request, wrong_wallet, &[0x91; 32]).is_err());
     }
 
     #[test]
@@ -2611,54 +3482,70 @@ mod tests {
         let fixture = fixture(11);
         let root =
             DepositSyncObjectRef::Registry(fixture.advertisement.object_anchor().registry_root());
-        let request =
-            DepositSyncObjectPageRequest::new(&fixture.advertisement, vec![root], 1, 1024 * 1024)
-                .unwrap();
+        let source = PartyId(1);
+        let requester = PartyId(2);
+        let mac_key = [0x91; 32];
+        let (_, _, lease) = leased_head(&fixture, &mac_key);
+        let root_target = lease
+            .root_targets()
+            .unwrap()
+            .into_iter()
+            .find(|target| target.reference() == root)
+            .unwrap();
+        let root_entry =
+            DepositSyncObjectRequestEntry::advertised_root(lease, root_target).unwrap();
+        let request = DepositSyncObjectPageRequest::new(lease, vec![root_entry]).unwrap();
 
         let mut oversized = request.clone();
-        oversized.references = vec![root; MAX_DEPOSIT_SYNC_REQUEST_OBJECTS + 1];
+        oversized.entries = vec![root_entry; MAX_DEPOSIT_SYNC_REQUEST_OBJECTS + 1];
         let bytes = raw_encode(&oversized);
-        assert!(DepositSyncObjectPageRequest::from_bytes(&fixture.advertisement, &bytes).is_err());
-
         assert!(
-            DepositSyncObjectPageRequest::new(&fixture.advertisement, vec![root], 0, 1024,)
-                .is_err()
-        );
-        assert!(
-            DepositSyncObjectPageRequest::new(
-                &fixture.advertisement,
-                vec![root],
-                1,
-                u32::try_from(MAX_DEPOSIT_SYNC_PAGE_PLAINTEXT_BYTES + 1).unwrap(),
-            )
-            .is_err()
+            DepositSyncObjectPageRequest::from_bytes(source, requester, &mac_key, &bytes,).is_err()
         );
 
-        let verified = request
-            .verify_reachable_manifest(&fixture.advertisement, |reference| {
-                Ok(fixture.objects.get(&reference).cloned())
+        assert!(DepositSyncObjectPageRequest::new(lease, Vec::new()).is_err());
+
+        let object = DepositSyncObject::new(root, fixture.objects[&root].clone()).unwrap();
+        let children = object.authenticated_semantic_children(root_target).unwrap();
+        let capabilities = children
+            .into_iter()
+            .map(|child| {
+                DepositSyncObjectCapability::issue(&mac_key, lease, root_target, child).unwrap()
             })
-            .unwrap();
-        let page =
-            DepositSyncObjectPage::build(&request, &fixture.advertisement, &verified).unwrap();
+            .collect();
+        let page = DepositSyncObjectPage::build(&request, vec![object], capabilities).unwrap();
         let mut oversized_page = page.clone();
         oversized_page.objects = vec![page.objects()[0].clone(); MAX_DEPOSIT_SYNC_PAGE_OBJECTS + 1];
         assert!(
-            DepositSyncObjectPage::from_bytes(
-                &request,
-                &fixture.advertisement,
-                &raw_encode(&oversized_page),
-            )
-            .is_err()
+            DepositSyncObjectPage::from_bytes(&request, &raw_encode(&oversized_page),).is_err()
+        );
+
+        let mut oversized_capabilities = page;
+        let capability = oversized_capabilities.capabilities()[0];
+        oversized_capabilities.capabilities =
+            vec![capability; MAX_DEPOSIT_SYNC_PAGE_CAPABILITIES + 1];
+        assert!(
+            DepositSyncObjectPage::from_bytes(&request, &raw_encode(&oversized_capabilities),)
+                .is_err()
         );
     }
 
     #[test]
-    fn object_authentication_and_root_binding_fail_closed() {
+    fn object_authentication_root_admission_and_capabilities_fail_closed() {
         let current = fixture(13);
         let other = fixture(14);
         let root =
             DepositSyncObjectRef::Registry(current.advertisement.object_anchor().registry_root());
+        let source = PartyId(1);
+        let requester = PartyId(2);
+        let mac_key = [0xa1; 32];
+        let (head_request, _, lease) = leased_head(&current, &mac_key);
+        let root_target = lease
+            .root_targets()
+            .unwrap()
+            .into_iter()
+            .find(|target| target.reference() == root)
+            .unwrap();
         let mut bad = current.objects[&root].clone();
         bad[0] ^= 1;
         assert!(matches!(
@@ -2673,92 +3560,307 @@ mod tests {
             &detached_bytes,
         )
         .unwrap();
+        let detached_target =
+            DepositSyncTraversalTarget::Registry(CompactRegistryTraversalTarget::Link {
+                reference: detached_ref,
+                epoch: 0,
+                chain_root: [0x33; 32],
+            });
+        assert!(DepositSyncObjectRequestEntry::advertised_root(lease, detached_target).is_err());
+
+        assert!(lease.validate_for_advertisement(head_request, &other.advertisement).is_err());
+        let root_entry =
+            DepositSyncObjectRequestEntry::advertised_root(lease, root_target).unwrap();
+        let request = DepositSyncObjectPageRequest::new(lease, vec![root_entry]).unwrap();
+        request.authenticate_capabilities(source, requester, &mac_key).unwrap();
+
+        let root_object =
+            DepositSyncObject::new(root, current.objects.get(&root).unwrap().clone()).unwrap();
+        let child = root_object.authenticated_semantic_children(root_target).unwrap()[0];
+        let capability =
+            DepositSyncObjectCapability::issue(&mac_key, lease, root_target, child).unwrap();
+        let child_request = DepositSyncObjectPageRequest::new(
+            lease,
+            vec![DepositSyncObjectRequestEntry::authorized(capability)],
+        )
+        .unwrap();
+        let bytes = child_request.to_bytes().unwrap();
+        assert_eq!(
+            DepositSyncObjectPageRequest::from_bytes(source, requester, &mac_key, &bytes,).unwrap(),
+            child_request
+        );
         assert!(
-            DepositSyncObjectPageRequest::new(
-                &current.advertisement,
-                vec![DepositSyncObjectRef::Registry(detached_ref)],
-                1,
-                1024,
+            DepositSyncObjectPageRequest::from_bytes(source, requester, &[0xa2; 32], &bytes,)
+                .is_err()
+        );
+        assert!(
+            DepositSyncObjectPageRequest::from_bytes(PartyId(3), requester, &mac_key, &bytes,)
+                .is_err()
+        );
+        assert!(
+            DepositSyncObjectPageRequest::from_bytes(source, PartyId(3), &mac_key, &bytes,)
+                .is_err()
+        );
+        assert!(DepositSyncObjectCapability::issue(&[0; 32], lease, root_target, child).is_err());
+
+        let mut corrupted = child_request.clone();
+        corrupted.entries[0].capability.as_mut().unwrap().tag[0] ^= 1;
+        assert!(
+            DepositSyncObjectPageRequest::from_bytes(
+                source,
+                requester,
+                &mac_key,
+                &raw_encode(&corrupted),
             )
             .is_err()
         );
 
-        let request =
-            DepositSyncObjectPageRequest::new(&current.advertisement, vec![root], 1, 1024 * 1024)
-                .unwrap();
-        assert!(request.validate_for(&other.advertisement).is_err());
-
-        // A same-wallet local-safety artifact cannot be smuggled behind an authentic root. The
-        // reachability verifier rejects it before invoking the plaintext loader for that ref.
-        let local_bytes = b"party-local-safety-object".to_vec();
-        let local_storage = WalletArtifactRef::for_contents(
-            WalletId(current.advertisement.context().wallet().0),
-            DEPOSIT_INDEX_ARTIFACT_KIND,
-            &local_bytes,
-        )
-        .unwrap();
-        let local_id = DepositIndexObjectId::from_storage_reference(local_storage).unwrap();
-        let local_ref = DepositSyncObjectRef::Index(local_id);
-        let exfiltration_request = DepositSyncObjectPageRequest::new(
-            &current.advertisement,
-            vec![root, local_ref],
-            2,
-            1024 * 1024,
-        )
-        .unwrap();
-        let local_was_loaded = Cell::new(false);
-        assert!(matches!(
-            exfiltration_request.verify_reachable_manifest(&current.advertisement, |reference| {
-                if reference == local_ref {
-                    local_was_loaded.set(true);
-                    return Ok(Some(local_bytes.clone()));
-                }
-                Ok(current.objects.get(&reference).cloned())
-            },),
-            Err(DepositSyncWireError::UnreachableObjectReference)
-        ));
-        assert!(!local_was_loaded.get());
+        let root_with_capability =
+            DepositSyncObjectRequestEntry { target: root_target, capability: Some(capability) };
+        assert!(DepositSyncObjectPageRequest::new(lease, vec![root_with_capability]).is_err());
+        let child_without_capability =
+            DepositSyncObjectRequestEntry { target: child, capability: None };
+        assert!(DepositSyncObjectPageRequest::new(lease, vec![child_without_capability]).is_err());
     }
 
     #[test]
-    fn pagination_is_deterministic_and_cursor_is_manifest_bound() {
+    fn response_is_exact_request_bound_and_parent_structured() {
         let fixture = fixture(17);
-        let references = connected_registry_references(&fixture, 5);
-        assert_eq!(references.len(), 5);
-        let request =
-            DepositSyncObjectPageRequest::new(&fixture.advertisement, references, 2, 1024 * 1024)
-                .unwrap();
-        let verified = request
-            .verify_reachable_manifest(&fixture.advertisement, |reference| {
-                Ok(fixture.objects.get(&reference).cloned())
-            })
+        let source = PartyId(1);
+        let requester = PartyId(2);
+        let mac_key = [0xb1; 32];
+        let references = connected_registry_references(&fixture, 2);
+        assert_eq!(references.len(), 2);
+        let root = references[0];
+        let (_, _, lease) = leased_head(&fixture, &mac_key);
+        let root_target = lease
+            .root_targets()
+            .unwrap()
+            .into_iter()
+            .find(|target| target.reference() == root)
             .unwrap();
-        let build = |request: &DepositSyncObjectPageRequest| {
-            DepositSyncObjectPage::build(request, &fixture.advertisement, &verified).unwrap()
-        };
-        let first = build(&request);
-        assert_eq!(first, build(&request));
-        assert_eq!(first.objects().len(), 2);
-        let first_bytes = first.to_bytes(&request, &fixture.advertisement).unwrap();
+        let root_entry =
+            DepositSyncObjectRequestEntry::advertised_root(lease, root_target).unwrap();
+        let request = DepositSyncObjectPageRequest::new(lease, vec![root_entry]).unwrap();
+        let object = DepositSyncObject::new(root, fixture.objects[&root].clone()).unwrap();
+        let children = object.authenticated_semantic_children(root_target).unwrap();
+        assert!(children.iter().any(|target| target.reference() == references[1]));
+        let capabilities: Vec<_> = children
+            .iter()
+            .copied()
+            .map(|child| {
+                DepositSyncObjectCapability::issue(&mac_key, lease, root_target, child).unwrap()
+            })
+            .collect();
+        let page =
+            DepositSyncObjectPage::build(&request, vec![object.clone()], capabilities).unwrap();
+        let page_bytes = page.to_bytes(&request).unwrap();
+        let response_digest = page.digest();
         assert_eq!(
-            DepositSyncObjectPage::from_bytes(&request, &fixture.advertisement, &first_bytes,)
-                .unwrap(),
-            first
+            DepositSyncObjectPage::from_bytes(&request, &page_bytes).unwrap().digest(),
+            response_digest,
+            "canonical response replay must retain its exact identity",
         );
+        assert_eq!(DepositSyncObjectPage::from_bytes(&request, &page_bytes).unwrap(), page);
 
-        let second_request =
-            request.with_cursor(&fixture.advertisement, first.next_cursor().unwrap()).unwrap();
-        let second = build(&second_request);
-        assert_eq!(second.objects().len(), 2);
-        let third_request =
-            request.with_cursor(&fixture.advertisement, second.next_cursor().unwrap()).unwrap();
-        let third = build(&third_request);
-        assert_eq!(third.objects().len(), 1);
-        assert!(third.next_cursor().is_none());
+        let child_capability = page
+            .capabilities()
+            .iter()
+            .find(|capability| capability.child().reference() == references[1]);
+        let next_request = DepositSyncObjectPageRequest::new(
+            lease,
+            vec![DepositSyncObjectRequestEntry::authorized(child_capability.copied().unwrap())],
+        )
+        .unwrap();
+        next_request.authenticate_capabilities(source, requester, &mac_key).unwrap();
 
-        let mut changed = request.clone();
-        changed.maximum_objects = 3;
-        assert!(changed.with_cursor(&fixture.advertisement, first.next_cursor().unwrap()).is_err());
+        let mut missing = page.clone();
+        missing.objects.clear();
+        assert!(missing.validate_for(&request).is_err());
+
+        let mut extra = page.clone();
+        extra.objects.push(object);
+        assert!(extra.validate_for(&request).is_err());
+
+        let mut unbound_parent = page;
+        unbound_parent.capabilities[0].parent = unbound_parent.capabilities[0].child;
+        assert_ne!(
+            unbound_parent.digest(),
+            response_digest,
+            "issued capability order and bindings must enter the response identity",
+        );
+        assert!(unbound_parent.validate_for(&request).is_err());
+    }
+
+    #[test]
+    fn registry_child_semantic_hash_and_depth_are_checked_before_merge() {
+        let fixture = fixture(18);
+        let (_, _, lease) = leased_head(&fixture, &[0xc1; 32]);
+        let root_target = lease.root_targets().unwrap()[0];
+        let root = root_target.reference();
+        let root_object = DepositSyncObject::new(root, fixture.objects[&root].clone()).unwrap();
+        let honest_child = root_object.authenticated_semantic_children(root_target).unwrap()[0];
+        let references = connected_registry_references(&fixture, 3);
+        let swapped_reference = references[2];
+        let DepositSyncTraversalTarget::Registry(CompactRegistryTraversalTarget::Index {
+            depth,
+            semantic_hash,
+            ..
+        }) = honest_child
+        else {
+            panic!("registry root must yield an index target");
+        };
+        let swapped_target =
+            DepositSyncTraversalTarget::Registry(CompactRegistryTraversalTarget::Index {
+                reference: match swapped_reference {
+                    DepositSyncObjectRef::Registry(reference) => reference,
+                    _ => unreachable!(),
+                },
+                depth,
+                semantic_hash,
+            });
+        let swapped =
+            DepositSyncObject::new(swapped_reference, fixture.objects[&swapped_reference].clone())
+                .unwrap();
+        assert!(matches!(
+            swapped.authenticated_semantic_children(swapped_target),
+            Err(DepositSyncWireError::InvalidTraversalTarget)
+        ));
+
+        let wrong_depth =
+            DepositSyncTraversalTarget::Registry(CompactRegistryTraversalTarget::Index {
+                reference: match honest_child.reference() {
+                    DepositSyncObjectRef::Registry(reference) => reference,
+                    _ => unreachable!(),
+                },
+                depth: depth.saturating_add(1),
+                semantic_hash,
+            });
+        let honest_reference = honest_child.reference();
+        let honest =
+            DepositSyncObject::new(honest_reference, fixture.objects[&honest_reference].clone())
+                .unwrap();
+        assert!(matches!(
+            honest.authenticated_semantic_children(wrong_depth),
+            Err(DepositSyncWireError::InvalidTraversalTarget)
+        ));
+    }
+
+    #[test]
+    fn archive_segment_end_and_event_ordinal_are_checked_before_merge() {
+        #[derive(Serialize)]
+        enum PayloadEncoding {
+            LedgerCheckpoint { ledger: WalletArtifactRef, checkpoint: WalletArtifactRef },
+        }
+        #[derive(Serialize)]
+        struct EventEncoding {
+            version: u16,
+            wallet: DepositWalletId,
+            ordinal: u64,
+            previous: Option<WalletArtifactRef>,
+            payload: PayloadEncoding,
+        }
+        #[derive(Serialize)]
+        struct SegmentEncoding {
+            version: u16,
+            wallet: DepositWalletId,
+            start_ordinal: u64,
+            previous: Option<WalletArtifactRef>,
+            events: Vec<WalletArtifactRef>,
+        }
+
+        let wallet = DepositWalletId([0xd1; 32]);
+        let ledger = WalletArtifactRef::for_contents(
+            WalletId(wallet.0),
+            CERTIFIED_LEDGER_ENTRY_ARTIFACT,
+            b"ledger",
+        )
+        .unwrap();
+        let checkpoint = WalletArtifactRef::for_contents(
+            WalletId(wallet.0),
+            DEPOSIT_INDEX_CHECKPOINT_CERTIFICATE_ARTIFACT,
+            b"checkpoint",
+        )
+        .unwrap();
+        let event_bytes = raw_encode(&EventEncoding {
+            version: 2,
+            wallet,
+            ordinal: 0,
+            previous: None,
+            payload: PayloadEncoding::LedgerCheckpoint { ledger, checkpoint },
+        });
+        DepositArchiveEvent::from_bytes(&event_bytes).unwrap();
+        let event_reference = WalletArtifactRef::for_contents(
+            WalletId(wallet.0),
+            DEPOSIT_ARCHIVE_EVENT_ARTIFACT,
+            &event_bytes,
+        )
+        .unwrap();
+        let event_object = DepositSyncObject::new(
+            DepositSyncObjectRef::CertificateArchive(event_reference),
+            event_bytes,
+        )
+        .unwrap();
+        let event_target = DepositSyncTraversalTarget::ArchiveEvent {
+            reference: event_reference,
+            expected_ordinal: 0,
+        };
+        assert_eq!(event_object.authenticated_semantic_children(event_target).unwrap().len(), 2);
+        assert!(matches!(
+            event_object.authenticated_semantic_children(
+                DepositSyncTraversalTarget::ArchiveEvent {
+                    reference: event_reference,
+                    expected_ordinal: 1,
+                },
+            ),
+            Err(DepositSyncWireError::InvalidTraversalTarget)
+        ));
+
+        let segment_bytes = raw_encode(&SegmentEncoding {
+            version: 2,
+            wallet,
+            start_ordinal: 0,
+            previous: None,
+            events: vec![event_reference],
+        });
+        DepositArchiveSegment::from_bytes(&segment_bytes).unwrap();
+        let segment_reference = WalletArtifactRef::for_contents(
+            WalletId(wallet.0),
+            DEPOSIT_ARCHIVE_SEGMENT_ARTIFACT,
+            &segment_bytes,
+        )
+        .unwrap();
+        let segment_object = DepositSyncObject::new(
+            DepositSyncObjectRef::CertificateArchive(segment_reference),
+            segment_bytes,
+        )
+        .unwrap();
+        assert!(matches!(
+            segment_object.authenticated_semantic_children(
+                DepositSyncTraversalTarget::ArchiveSegment {
+                    reference: segment_reference,
+                    expected_end_ordinal: 2,
+                    expected_last_event: Some(event_reference),
+                },
+            ),
+            Err(DepositSyncWireError::InvalidTraversalTarget)
+        ));
+        let other_event = WalletArtifactRef::for_contents(
+            WalletId(wallet.0),
+            DEPOSIT_ARCHIVE_EVENT_ARTIFACT,
+            b"other-event",
+        )
+        .unwrap();
+        assert!(matches!(
+            segment_object.authenticated_semantic_children(
+                DepositSyncTraversalTarget::ArchiveSegment {
+                    reference: segment_reference,
+                    expected_end_ordinal: 1,
+                    expected_last_event: Some(other_event),
+                },
+            ),
+            Err(DepositSyncWireError::InvalidTraversalTarget)
+        ));
     }
 
     #[test]

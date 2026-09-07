@@ -115,8 +115,8 @@ impl RingSignature {
       );
       buf.extend_from_slice(Li.compress().as_bytes());
       #[expect(non_snake_case)]
-      let Ri = (sig.s.into() * Point::biased_hash(ring_member.to_bytes()).into()) +
-        (sig.c.into() * key_image);
+      let Ri = (sig.s.into() * Point::biased_hash(ring_member.to_bytes()).into())
+        + (sig.c.into() * key_image);
       buf.extend_from_slice(Ri.compress().as_bytes());
 
       sum += sig.c.into();

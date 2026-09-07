@@ -17,6 +17,7 @@ use crate::{
         KeyRotationError, KeyRotationTargetPolicy, eligibility_reference_key,
         valid_x25519_public_key,
     },
+    receiver_key_accumulator::{ReceiverKeyAccumulatorCommitment, ReceiverKeyAccumulatorError},
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -54,7 +55,7 @@ pub const DEFAULT_DEPOSIT_MAXIMUM_FEE_ATOMIC_UNITS: u64 = 1_000_000_000;
 pub const DEFAULT_PROACTIVE_REFRESH_INTERVAL_SECONDS: u64 = 24 * 60 * 60;
 
 /// Only accepted scenario schema. Earlier schemas are intentionally unsupported.
-pub const SCENARIO_SCHEMA_VERSION: u16 = 6;
+pub const SCENARIO_SCHEMA_VERSION: u16 = 7;
 
 /// Hard deployment bound for independently addressed daemon fallbacks assigned to one party.
 ///
@@ -63,13 +64,39 @@ pub const SCENARIO_SCHEMA_VERSION: u16 = 6;
 /// into an attacker-controlled availability loop.
 pub const MAX_MONEROD_ENDPOINTS_PER_PARTY: usize = 4;
 
+/// Hard deployment bound for parties which can accumulate in durable transport cursors.
+///
+/// Individual committees are smaller, but proactive resharing can rotate through distinct
+/// participants over time. Bounding the complete configured identity set keeps those monotonic
+/// cursors within their fixed authenticated-storage records.
+pub const MAX_SCENARIO_PARTIES: usize = 32;
+
 /// A zero interval would disable the mobile-adversary boundary while looking like a configured
 /// refresh policy. Keep the on-wire policy explicit and positive instead.
 pub const MIN_PROACTIVE_REFRESH_INTERVAL_SECONDS: u64 = 1;
 
+/// Minimum sustainable proactive-refresh interval outside a demo-only private Regtest harness.
+///
+/// Every refresh permanently reserves the successor committee's receiver keys. Production-like
+/// deployments therefore need a storage-rate floor even though short intervals remain useful for
+/// deterministic acceptance and resilience campaigns.
+pub const MIN_NON_DEMO_PROACTIVE_REFRESH_INTERVAL_SECONDS: u64 = 60 * 60;
+
 /// Resource-policy ceiling rather than a cryptographic limit. Longer intervals can be represented
 /// by stopping the service; a live configured network is expected to refresh at least yearly.
 pub const MAX_PROACTIVE_REFRESH_INTERVAL_SECONDS: u64 = 365 * 24 * 60 * 60;
+
+/// Maximum exponential pacemaker backoff applied to one BFT consensus view.
+///
+/// The cap bounds both durable timer state and the delay before an honest leader can make
+/// progress after a run of Byzantine or unavailable leaders.
+pub(crate) const MAX_BFT_VIEW_TIMEOUT_SHIFT: u32 = 6;
+
+/// Largest Unix timestamp accepted by the persistent protocol state.
+pub(crate) const MAX_SUPPORTED_UNIX_SECONDS: u64 = 253_402_300_799;
+
+/// Largest millisecond value whose truncated seconds remain in the supported timestamp range.
+pub(crate) const MAX_SUPPORTED_UNIX_MILLISECONDS: u64 = MAX_SUPPORTED_UNIX_SECONDS * 1_000 + 999;
 
 impl NetworkKind {
     /// Exact `get_info.nettype` value required from the configured daemon.
@@ -173,29 +200,26 @@ pub struct CommitteeSpec {
     pub epoch: u64,
     pub operation: Operation,
     pub threshold: u16,
-    /// Explicit Byzantine bound used by CKLS AVSS; it is intentionally not inferred from `n`.
+    /// Explicit Byzantine bound used by CKLS AVSS and threshold-signing recovery; it is
+    /// intentionally not inferred from `n`. For post-genesis receiver-key selection, this bound is
+    /// also a governance assumption over the entire `eligible_members` roster: no more than this
+    /// many eligible stable identities may be Byzantine, regardless of which subset is selected.
     pub fault_bound: u16,
-    /// Preferred stable identities defining the desired committee size and threshold layout.
-    /// Receiver-key agreement may substitute another freshly advertising identity from
-    /// `eligible_members`; no key from a missing preferred member is carried forward.
+    /// Governance shape defining only the desired committee size and threshold layout.
+    ///
+    /// Receiver-key agreement may certificate-select any exact `members.len()` subset of fresh
+    /// advertisers from `eligible_members`. This list is not a priority roster.
     pub members: Vec<PartyId>,
     /// Canonical stable-identity pool authorized to advertise for this epoch. A post-genesis pool
     /// must contain at least `members.len() + fault_bound` identities.
     pub eligible_members: Vec<PartyId>,
-    /// For a reshare, the canonical old-epoch candidates allowed to start AVSS. The exact
-    /// `old.threshold` interpolation subset is chosen later from availability-certified dealers.
-    #[serde(default)]
-    pub old_dealers: Vec<PartyId>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone, Debug, Serialize)]
 pub struct Scenario {
     pub schema_version: u16,
-    #[serde(default)]
     pub demo_only: bool,
     pub network: NetworkKind,
-    #[serde(default)]
     pub deposit_birth_anchor: Option<DepositBirthAnchor>,
     /// Private-Regtest mining/submission RPC used only by the one-shot acceptance driver.
     ///
@@ -208,10 +232,179 @@ pub struct Scenario {
     /// Hard policy ceiling for one autonomous deposit-consolidation transaction fee.
     pub deposit_maximum_fee_atomic_units: u64,
     pub poll_interval_ms: u64,
+    /// Base timeout for one BFT view. Deployment liveness requires the complete honest-leader
+    /// proposal, vote, delivery, reducer, and durable-storage pipeline to finish before the
+    /// deadline capped at 64 times this value.
     pub protocol_timeout_seconds: u64,
     /// Fixed, scenario-bound wall-clock interval for proactive resharing. The deadline itself is
     /// persisted locally against the active activation certificate so a restart cannot reset it.
     pub proactive_refresh_interval_seconds: u64,
+}
+
+/// Serde treats every `Option<T>` field as implicitly optional, even without `#[serde(default)]`.
+/// Wrap this one field during deserialization so the current schema must spell it explicitly;
+/// `null` remains the canonical representation for a deployment which resolves its anchor at
+/// first start.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum RequiredDepositBirthAnchor {
+    Present(DepositBirthAnchor),
+    ExplicitNull(()),
+}
+
+impl RequiredDepositBirthAnchor {
+    const fn into_option(self) -> Option<DepositBirthAnchor> {
+        match self {
+            Self::Present(anchor) => Some(anchor),
+            Self::ExplicitNull(()) => None,
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ScenarioWire {
+    schema_version: u16,
+    demo_only: bool,
+    network: NetworkKind,
+    deposit_birth_anchor: RequiredDepositBirthAnchor,
+    acceptance_monerod_rpc_url: Url,
+    parties: Vec<ScenarioParty>,
+    committees: Vec<CommitteeSpec>,
+    funding_blocks: u64,
+    confirmation_blocks: u64,
+    deposit_maximum_fee_atomic_units: u64,
+    poll_interval_ms: u64,
+    protocol_timeout_seconds: u64,
+    proactive_refresh_interval_seconds: u64,
+}
+
+impl<'de> Deserialize<'de> for Scenario {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let wire = ScenarioWire::deserialize(deserializer)?;
+        Ok(Self {
+            schema_version: wire.schema_version,
+            demo_only: wire.demo_only,
+            network: wire.network,
+            deposit_birth_anchor: wire.deposit_birth_anchor.into_option(),
+            acceptance_monerod_rpc_url: wire.acceptance_monerod_rpc_url,
+            parties: wire.parties,
+            committees: wire.committees,
+            funding_blocks: wire.funding_blocks,
+            confirmation_blocks: wire.confirmation_blocks,
+            deposit_maximum_fee_atomic_units: wire.deposit_maximum_fee_atomic_units,
+            poll_interval_ms: wire.poll_interval_ms,
+            protocol_timeout_seconds: wire.protocol_timeout_seconds,
+            proactive_refresh_interval_seconds: wire.proactive_refresh_interval_seconds,
+        })
+    }
+}
+
+/// Static governance shape for one configured receiver-key rotation.
+///
+/// This intentionally contains no receiver-key accumulator. Configuration can validate future
+/// committee sizes, stable identities, and Byzantine spare capacity, but only authenticated epoch
+/// history can supply the accumulator commitment for a live transition.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ConfiguredKeyRotationTargetShape {
+    eligible: Committee,
+    desired_n: u16,
+    target_fault_bound: u16,
+}
+
+impl ConfiguredKeyRotationTargetShape {
+    fn new(
+        source: &Committee,
+        mut eligible: Committee,
+        desired_n: u16,
+        target_fault_bound: u16,
+    ) -> Result<Self, ConfigError> {
+        source.validate()?;
+        let target_epoch = source.epoch.checked_add(1).ok_or(ConfigError::NonContiguousEpochs)?;
+        if eligible.epoch != target_epoch {
+            return Err(KeyRotationError::InvalidTargetPolicy(
+                "target epoch must immediately follow the source",
+            )
+            .into());
+        }
+        for member in &mut eligible.members {
+            member.encryption_key =
+                eligibility_reference_key(target_epoch, member.id, member.signing_key);
+        }
+        let eligible = eligible.canonicalized()?;
+        let minimum_eligible = desired_n
+            .checked_add(target_fault_bound)
+            .ok_or(KeyRotationError::InvalidTargetPolicy("eligible target size overflow"))?;
+        if desired_n == 0 || eligible.n() < minimum_eligible {
+            return Err(KeyRotationError::InsufficientEligibleCandidates {
+                actual: eligible.n(),
+                desired: desired_n,
+                fault_bound: target_fault_bound,
+            }
+            .into());
+        }
+        let selected_shape = Committee {
+            epoch: eligible.epoch,
+            threshold: eligible.threshold,
+            members: eligible.members.iter().take(usize::from(desired_n)).cloned().collect(),
+        };
+        selected_shape.validate_async_security_with_faults(target_fault_bound)?;
+
+        for member in &source.members {
+            if !valid_x25519_public_key(member.encryption_key) {
+                return Err(KeyRotationError::InvalidSourceKey(member.id).into());
+            }
+        }
+        for member in &eligible.members {
+            match source.member(member.id) {
+                Ok(source_member) => {
+                    if member.signing_key != source_member.signing_key {
+                        return Err(KeyRotationError::TargetChangedStableIdentity(member.id).into());
+                    }
+                }
+                Err(CommitteeError::UnknownParty(_)) => {
+                    if source
+                        .members
+                        .iter()
+                        .any(|source_member| source_member.signing_key == member.signing_key)
+                    {
+                        return Err(KeyRotationError::ReusedSourceSigningKey(member.id).into());
+                    }
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+
+        Ok(Self { eligible, desired_n, target_fault_bound })
+    }
+
+    #[must_use]
+    pub const fn eligible(&self) -> &Committee {
+        &self.eligible
+    }
+
+    #[must_use]
+    pub const fn target_epoch(&self) -> u64 {
+        self.eligible.epoch
+    }
+
+    #[must_use]
+    pub const fn desired_n(&self) -> u16 {
+        self.desired_n
+    }
+
+    #[must_use]
+    pub const fn selection_size(&self) -> usize {
+        self.desired_n as usize
+    }
+
+    #[must_use]
+    pub const fn target_fault_bound(&self) -> u16 {
+        self.target_fault_bound
+    }
 }
 
 #[derive(Debug, Error)]
@@ -228,10 +421,14 @@ pub enum ConfigError {
     Avss(#[from] AvssError),
     #[error("key-rotation policy error: {0}")]
     KeyRotation(#[from] KeyRotationError),
+    #[error("receiver-key accumulator error: {0}")]
+    ReceiverKeyAccumulator(#[from] ReceiverKeyAccumulatorError),
     #[error("unknown party {0} in scenario")]
     UnknownParty(PartyId),
     #[error("duplicate party {0} in scenario")]
     DuplicateParty(PartyId),
+    #[error("scenario has {actual} parties; maximum is {maximum}")]
+    TooManyParties { actual: usize, maximum: usize },
     #[error("party {0} has an invalid bootstrap X25519 public key")]
     InvalidBootstrapEncryptionKey(PartyId),
     #[error("bootstrap X25519 public keys must be unique across parties")]
@@ -258,10 +455,16 @@ pub enum ConfigError {
     InvalidDepositBirthAnchor,
     #[error("deposit maximum fee must be positive")]
     InvalidDepositMaximumFee,
+    #[error("protocol timeout must be positive and fit every bounded BFT deadline")]
+    InvalidProtocolTimeout,
     #[error(
         "proactive refresh interval must be in {MIN_PROACTIVE_REFRESH_INTERVAL_SECONDS}..={MAX_PROACTIVE_REFRESH_INTERVAL_SECONDS} seconds"
     )]
     InvalidProactiveRefreshInterval,
+    #[error(
+        "proactive refresh intervals below {MIN_NON_DEMO_PROACTIVE_REFRESH_INTERVAL_SECONDS} seconds are restricted to demo-only Regtest scenarios"
+    )]
+    NonDemoProactiveRefreshIntervalTooShort,
     #[error("QUIC endpoints must be unique across parties")]
     DuplicateQuicEndpoint,
     #[error("QUIC TLS server names must be unique across parties")]
@@ -273,11 +476,9 @@ pub enum ConfigError {
     #[error("epoch zero must be a DKG and later epochs must be reshares")]
     InvalidOperations,
     #[error(
-        "reshare epoch {epoch} needs at least {minimum} eligible old dealers and at most {maximum}, found {actual}"
+        "epoch {epoch} threshold {threshold} cannot safely abandon a signing attempt with fault bound {fault_bound}; threshold must exceed 2f"
     )]
-    WrongDealerCount { epoch: u64, minimum: u16, maximum: u16, actual: usize },
-    #[error("reshare epoch {epoch} old dealer candidates must be unique and canonical")]
-    NonCanonicalDealers { epoch: u64 },
+    InsufficientSigningThreshold { epoch: u64, threshold: u16, fault_bound: u16 },
     #[error("epoch {epoch} eligible target candidates must be unique and canonical")]
     NonCanonicalEligibleMembers { epoch: u64 },
     #[error("epoch {epoch} desired target members are not all eligible")]
@@ -306,10 +507,26 @@ impl Scenario {
         if self.deposit_maximum_fee_atomic_units == 0 {
             return Err(ConfigError::InvalidDepositMaximumFee);
         }
+        let protocol_timeout_ms =
+            self.protocol_timeout_seconds.checked_mul(1_000).filter(|timeout| *timeout != 0);
+        if protocol_timeout_ms.is_none_or(|timeout| {
+            timeout
+                .checked_mul(1_u64 << MAX_BFT_VIEW_TIMEOUT_SHIFT)
+                .and_then(|backoff| MAX_SUPPORTED_UNIX_MILLISECONDS.checked_add(backoff))
+                .is_none()
+        }) {
+            return Err(ConfigError::InvalidProtocolTimeout);
+        }
         if !(MIN_PROACTIVE_REFRESH_INTERVAL_SECONDS..=MAX_PROACTIVE_REFRESH_INTERVAL_SECONDS)
             .contains(&self.proactive_refresh_interval_seconds)
         {
             return Err(ConfigError::InvalidProactiveRefreshInterval);
+        }
+        if !(self.demo_only && self.network == NetworkKind::Regtest)
+            && self.proactive_refresh_interval_seconds
+                < MIN_NON_DEMO_PROACTIVE_REFRESH_INTERVAL_SECONDS
+        {
+            return Err(ConfigError::NonDemoProactiveRefreshIntervalTooShort);
         }
         if !valid_monerod_endpoint(&self.acceptance_monerod_rpc_url) {
             return Err(ConfigError::InvalidAcceptanceMonerodEndpoint);
@@ -354,17 +571,6 @@ impl Scenario {
                 }
                 .into());
             }
-            let dealer_count = match spec.operation {
-                Operation::Dkg => spec.members.len(),
-                Operation::Reshare => spec.old_dealers.len(),
-            };
-            if dealer_count > MAX_AVSS_DEALERS {
-                return Err(ConfigError::TooManyDealers {
-                    epoch: spec.epoch,
-                    actual: dealer_count,
-                    maximum: MAX_AVSS_DEALERS,
-                });
-            }
             if spec.epoch != expected as u64 {
                 return Err(ConfigError::NonContiguousEpochs);
             }
@@ -373,40 +579,47 @@ impl Scenario {
             {
                 return Err(ConfigError::InvalidOperations);
             }
+            // Every member of the actually certified source committee is eligible to deal during
+            // a reshare. A certificate may substitute identities within the configured target
+            // pool, but its exact size is fixed by the preceding governance shape.
+            let dealer_count = if spec.epoch == 0 {
+                spec.members.len()
+            } else {
+                committees[expected - 1].members.len()
+            };
+            if dealer_count > MAX_AVSS_DEALERS {
+                return Err(ConfigError::TooManyDealers {
+                    epoch: spec.epoch,
+                    actual: dealer_count,
+                    maximum: MAX_AVSS_DEALERS,
+                });
+            }
             let committee = self.configured_committee_shape(spec.epoch)?;
             committee.validate_async_security_with_faults(spec.fault_bound)?;
+            if spec.threshold <= spec.fault_bound.saturating_mul(2) {
+                return Err(ConfigError::InsufficientSigningThreshold {
+                    epoch: spec.epoch,
+                    threshold: spec.threshold,
+                    fault_bound: spec.fault_bound,
+                });
+            }
             preflight_avss_resources(&committee, dealer_count)?;
             if spec.epoch > 0 {
                 let old = self.configured_committee_shape(spec.epoch - 1)?;
-                let configured_policy = self
-                    .configured_key_rotation_target_policy(&old)?
+                let configured_shape = self
+                    .configured_key_rotation_target_shape(&old)?
                     .ok_or(ConfigError::NonContiguousEpochs)?;
-                if configured_policy.target_epoch() != spec.epoch {
+                if configured_shape.target_epoch() != spec.epoch {
                     return Err(ConfigError::NonContiguousEpochs);
-                }
-                let old_fault_bound = self.committee_spec(spec.epoch - 1)?.fault_bound;
-                let minimum = old.threshold.saturating_add(old_fault_bound);
-                if spec.old_dealers.len() < usize::from(minimum)
-                    || spec.old_dealers.len() > usize::from(old.n())
-                {
-                    return Err(ConfigError::WrongDealerCount {
-                        epoch: spec.epoch,
-                        minimum,
-                        maximum: old.n(),
-                        actual: spec.old_dealers.len(),
-                    });
-                }
-                let mut canonical = spec.old_dealers.clone();
-                canonical.sort_unstable();
-                canonical.dedup();
-                if canonical != spec.old_dealers {
-                    return Err(ConfigError::NonCanonicalDealers { epoch: spec.epoch });
-                }
-                for dealer in &spec.old_dealers {
-                    old.member(*dealer)?;
                 }
             }
         }
+        // The static schedule eventually hands off to the indefinite same-layout refresh policy.
+        // Validate its spare floor now instead of allowing a deployment which activates its final
+        // configured epoch and then can never tolerate one silent receiver-key advertiser.
+        let terminal = committees.last().ok_or(ConfigError::NonContiguousEpochs)?;
+        let source = self.configured_committee_shape(terminal.epoch)?;
+        drop(self.proactive_refresh_target_shape(&source, terminal.fault_bound)?);
         Ok(())
     }
 
@@ -414,8 +627,8 @@ impl Scenario {
     ///
     /// Routing, operator endpoints, daemon URLs, and TLS certificate paths are deliberately
     /// excluded. They may be rotated without creating a new cryptographic network. Committee
-    /// cryptographic material, Byzantine bounds, transition operations, resharing dealer
-    /// eligibility, deposit birth anchor, and consolidation fee policy are included.
+    /// cryptographic material, Byzantine bounds, transition operations, source committee shapes,
+    /// deposit birth anchor, and consolidation fee policy are included.
     ///
     /// # Errors
     ///
@@ -425,7 +638,7 @@ impl Scenario {
         let mut specifications = self.committees.iter().collect::<Vec<_>>();
         specifications.sort_unstable_by_key(|specification| specification.epoch);
 
-        let mut hasher = blake3::Hasher::new_derive_key("threshold-monero/quic-network-id/v2");
+        let mut hasher = blake3::Hasher::new_derive_key("threshold-monero/quic-network-id/v3");
         hasher.update(&self.schema_version.to_le_bytes());
         hasher.update(&[match self.network {
             NetworkKind::Regtest => 0,
@@ -450,6 +663,7 @@ impl Scenario {
             }
         }
         hasher.update(&self.deposit_maximum_fee_atomic_units.to_le_bytes());
+        hasher.update(&self.protocol_timeout_seconds.to_le_bytes());
         hasher.update(&self.proactive_refresh_interval_seconds.to_le_bytes());
         let mut parties = self.parties.iter().collect::<Vec<_>>();
         parties.sort_unstable_by_key(|party| party.id);
@@ -472,15 +686,17 @@ impl Scenario {
             for eligible in &specification.eligible_members {
                 hasher.update(&eligible.0.to_le_bytes());
             }
-            hasher.update(&(specification.old_dealers.len() as u64).to_le_bytes());
-            for dealer in &specification.old_dealers {
-                hasher.update(&dealer.0.to_le_bytes());
-            }
         }
         Ok(*hasher.finalize().as_bytes())
     }
 
     fn validate_parties(&self) -> Result<(), ConfigError> {
+        if self.parties.len() > MAX_SCENARIO_PARTIES {
+            return Err(ConfigError::TooManyParties {
+                actual: self.parties.len(),
+                maximum: MAX_SCENARIO_PARTIES,
+            });
+        }
         let mut ids = BTreeSet::new();
         let mut quic_endpoints = BTreeSet::new();
         let mut quic_server_names = BTreeSet::new();
@@ -560,16 +776,33 @@ impl Scenario {
         self.configured_committee_shape(0)
     }
 
-    /// Materialize the configured immediate successor policy against a certified source.
+    /// Commit every configured bootstrap receiver key, including keys owned by shareless spares.
     ///
-    /// Every eligible identity must advertise a fresh durable key to be selected. `members`
-    /// supplies the desired size and threshold layout; `eligible_members` supplies enough stable
-    /// identities to replace up to `f` silent candidates without carrying any source/bootstrap
-    /// receiver key. `None` means the static governance schedule is exhausted.
-    pub fn configured_key_rotation_target_policy(
+    /// The returned root is the deterministic epoch-zero boundary for receiver-key freshness.
+    /// Later policies must use the commitment authenticated by their source epoch-history link,
+    /// never reconstruct or extend this bootstrap commitment from configuration.
+    pub fn bootstrap_receiver_key_accumulator(
+        &self,
+        network: [u8; 32],
+    ) -> Result<ReceiverKeyAccumulatorCommitment, ConfigError> {
+        let mut bootstrap_keys = self
+            .parties
+            .iter()
+            .map(|party| (party.id, party.bootstrap_encryption_key.0))
+            .collect::<Vec<_>>();
+        bootstrap_keys.sort_unstable_by_key(|(party, _)| *party);
+        Ok(ReceiverKeyAccumulatorCommitment::from_bootstrap_keys(network, &bootstrap_keys)?)
+    }
+
+    /// Materialize the accumulator-independent governance shape of a configured successor.
+    ///
+    /// This is suitable for static configuration preflight and for code which only needs to
+    /// validate membership shape. It cannot authorize receiver keys or produce a rotation
+    /// certificate.
+    pub fn configured_key_rotation_target_shape(
         &self,
         source: &Committee,
-    ) -> Result<Option<KeyRotationTargetPolicy>, ConfigError> {
+    ) -> Result<Option<ConfiguredKeyRotationTargetShape>, ConfigError> {
         source.validate()?;
         let target_epoch = source.epoch.checked_add(1).ok_or(ConfigError::NonContiguousEpochs)?;
         let Ok(spec) = self.committee_spec(target_epoch) else {
@@ -597,11 +830,74 @@ impl Scenario {
                 members: spec.members.len(),
                 maximum: MAX_COMMITTEE_MEMBERS,
             })?;
-        Ok(Some(KeyRotationTargetPolicy::new(source, eligible, desired_n, spec.fault_bound)?))
+        Ok(Some(ConfiguredKeyRotationTargetShape::new(
+            source,
+            eligible,
+            desired_n,
+            spec.fault_bound,
+        )?))
     }
 
-    /// Static membership/threshold resource shape. For epochs after zero, these bootstrap keys are
-    /// validation placeholders only and must never be treated as an activated committee.
+    /// Materialize the configured immediate successor policy against a certified source.
+    ///
+    /// Every eligible identity must advertise a fresh durable key to be selected. `members`
+    /// supplies the desired size and threshold layout; `eligible_members` supplies enough stable
+    /// identities to replace up to `f` silent candidates without carrying any source/bootstrap
+    /// receiver key. `source_receiver_keys` must be the accumulator commitment authenticated by
+    /// the source epoch-history link. `None` means the static governance schedule is exhausted.
+    pub fn configured_key_rotation_target_policy(
+        &self,
+        source: &Committee,
+        source_receiver_keys: ReceiverKeyAccumulatorCommitment,
+    ) -> Result<Option<KeyRotationTargetPolicy>, ConfigError> {
+        let Some(shape) = self.configured_key_rotation_target_shape(source)? else {
+            return Ok(None);
+        };
+        let source_fault_bound = self.committee_spec(source.epoch)?.fault_bound;
+        let selection_fallback_window_ms = self
+            .protocol_timeout_seconds
+            .checked_mul(1_000)
+            .ok_or(ConfigError::InvalidProtocolTimeout)?;
+        Ok(Some(KeyRotationTargetPolicy::new(
+            source,
+            source_fault_bound,
+            shape.eligible,
+            shape.desired_n,
+            shape.target_fault_bound,
+            source_receiver_keys,
+            selection_fallback_window_ms,
+        )?))
+    }
+
+    fn proactive_refresh_target_shape(
+        &self,
+        source: &Committee,
+        fault_bound: u16,
+    ) -> Result<ConfiguredKeyRotationTargetShape, ConfigError> {
+        let target_epoch = source.epoch.checked_add(1).ok_or(ConfigError::NonContiguousEpochs)?;
+        let eligible = Committee {
+            epoch: target_epoch,
+            threshold: source.threshold,
+            members: self
+                .parties
+                .iter()
+                .map(|party| Member {
+                    id: party.id,
+                    signing_key: party.signing_key.0,
+                    encryption_key: eligibility_reference_key(
+                        target_epoch,
+                        party.id,
+                        party.signing_key.0,
+                    ),
+                })
+                .collect(),
+        };
+        ConfiguredKeyRotationTargetShape::new(source, eligible, source.n(), fault_bound)
+    }
+
+    /// Static membership/threshold resource shape used only for configuration preflight.
+    /// Post-genesis X25519 bytes are non-activated public sentinels and are also permanently
+    /// forbidden as advertisement keys.
     fn configured_committee_shape(&self, epoch: u64) -> Result<Committee, ConfigError> {
         let spec = self.committee_spec(epoch)?;
         let members = spec
@@ -668,7 +964,7 @@ mod tests {
             network: NetworkKind::Regtest,
             deposit_birth_anchor: None,
             acceptance_monerod_rpc_url: "http://monerod-miner:18081".parse().unwrap(),
-            parties: (1..=4)
+            parties: (1..=6)
                 .map(|id| ScenarioParty {
                     id: PartyId(id),
                     admin_endpoint: format!("http://p{id}:8080").parse().unwrap(),
@@ -685,11 +981,10 @@ mod tests {
             committees: vec![CommitteeSpec {
                 epoch: 0,
                 operation: Operation::Dkg,
-                threshold: 2,
+                threshold: 3,
                 fault_bound: 1,
-                members: vec![PartyId(1), PartyId(2), PartyId(3), PartyId(4)],
-                eligible_members: vec![PartyId(1), PartyId(2), PartyId(3), PartyId(4)],
-                old_dealers: vec![],
+                members: (1..=5).map(PartyId).collect(),
+                eligible_members: (1..=5).map(PartyId).collect(),
             }],
             funding_blocks: 1,
             confirmation_blocks: 1,
@@ -731,7 +1026,6 @@ mod tests {
                 fault_bound: 1,
                 members: (1..=5).map(PartyId).collect(),
                 eligible_members: (1..=5).map(PartyId).collect(),
-                old_dealers: vec![],
             },
             CommitteeSpec {
                 epoch: 1,
@@ -740,16 +1034,14 @@ mod tests {
                 fault_bound: 1,
                 members: (1..=7).map(PartyId).collect(),
                 eligible_members: (1..=8).map(PartyId).collect(),
-                old_dealers: (1..=5).map(PartyId).collect(),
             },
             CommitteeSpec {
                 epoch: 2,
                 operation: Operation::Reshare,
-                threshold: 2,
+                threshold: 3,
                 fault_bound: 1,
-                members: [2, 4, 6, 7].into_iter().map(PartyId).collect(),
+                members: [2, 3, 4, 6, 7].into_iter().map(PartyId).collect(),
                 eligible_members: [2, 3, 4, 6, 7, 8].into_iter().map(PartyId).collect(),
-                old_dealers: (1..=7).map(PartyId).collect(),
             },
         ];
         scenario
@@ -758,9 +1050,25 @@ mod tests {
     #[test]
     fn rejects_previous_schema_and_removed_fields() {
         let mut previous = serde_json::to_value(scenario()).unwrap();
-        previous["schema_version"] = serde_json::json!(4);
+        previous["schema_version"] = serde_json::json!(6);
         let previous: Scenario = serde_json::from_value(previous).unwrap();
-        assert!(matches!(previous.validate(), Err(ConfigError::Schema(4))));
+        assert!(matches!(previous.validate(), Err(ConfigError::Schema(6))));
+
+        let mut missing_demo_only = serde_json::to_value(scenario()).unwrap();
+        missing_demo_only.as_object_mut().unwrap().remove("demo_only");
+        assert!(serde_json::from_value::<Scenario>(missing_demo_only).is_err());
+
+        let mut missing_birth_anchor = serde_json::to_value(scenario()).unwrap();
+        missing_birth_anchor.as_object_mut().unwrap().remove("deposit_birth_anchor");
+        assert!(serde_json::from_value::<Scenario>(missing_birth_anchor).is_err());
+
+        let mut missing_eligible = serde_json::to_value(scenario()).unwrap();
+        missing_eligible["committees"][0].as_object_mut().unwrap().remove("eligible_members");
+        assert!(serde_json::from_value::<Scenario>(missing_eligible).is_err());
+
+        let mut removed_dealers = serde_json::to_value(scenario()).unwrap();
+        removed_dealers["committees"][0]["old_dealers"] = serde_json::json!([]);
+        assert!(serde_json::from_value::<Scenario>(removed_dealers).is_err());
 
         let mut shared_daemon = serde_json::to_value(scenario()).unwrap();
         shared_daemon["monerod_rpc_url"] = serde_json::json!("http://shared-daemon:18081");
@@ -793,6 +1101,23 @@ mod tests {
     }
 
     #[test]
+    fn scenario_party_set_is_bounded_for_durable_transport_cursors() {
+        let mut maximum = scenario();
+        maximum.parties =
+            scenario_with_parties(u16::try_from(MAX_SCENARIO_PARTIES).unwrap()).parties;
+        maximum.validate_parties().unwrap();
+
+        let oversized_count = MAX_SCENARIO_PARTIES.checked_add(1).unwrap();
+        let mut oversized = scenario();
+        oversized.parties = scenario_with_parties(u16::try_from(oversized_count).unwrap()).parties;
+        assert!(matches!(
+            oversized.validate(),
+            Err(ConfigError::TooManyParties { actual, maximum })
+                if actual == oversized_count && maximum == MAX_SCENARIO_PARTIES
+        ));
+    }
+
+    #[test]
     fn scenario_rejects_resource_dimensions_before_protocol_construction() {
         let oversized_count = MAX_COMMITTEE_THRESHOLD + 1;
         let mut too_many_members = scenario_with_parties(oversized_count);
@@ -816,26 +1141,19 @@ mod tests {
                 maximum: MAX_COMMITTEE_THRESHOLD,
             })) if threshold == MAX_COMMITTEE_THRESHOLD + 1
         ));
+    }
 
-        let mut too_many_dealers = scenario_with_parties(MAX_COMMITTEE_THRESHOLD);
-        too_many_dealers.committees[0].threshold = MAX_COMMITTEE_THRESHOLD;
-        too_many_dealers.committees[0].fault_bound = 0;
-        too_many_dealers.committees.push(CommitteeSpec {
-            epoch: 1,
-            operation: Operation::Reshare,
-            threshold: MAX_COMMITTEE_THRESHOLD,
-            fault_bound: 0,
-            members: (1..=MAX_COMMITTEE_THRESHOLD).map(PartyId).collect(),
-            eligible_members: (1..=MAX_COMMITTEE_THRESHOLD).map(PartyId).collect(),
-            old_dealers: (1..=MAX_COMMITTEE_THRESHOLD + 1).map(PartyId).collect(),
-        });
+    #[test]
+    fn scenario_rejects_a_threshold_that_cannot_safely_abandon_byzantine_signers() {
+        let mut invalid = scenario();
+        invalid.committees[0].threshold = 2;
         assert!(matches!(
-            too_many_dealers.validate(),
-            Err(ConfigError::TooManyDealers {
-                epoch: 1,
-                actual,
-                maximum: MAX_AVSS_DEALERS,
-            }) if actual == MAX_AVSS_DEALERS + 1
+            invalid.validate(),
+            Err(ConfigError::InsufficientSigningThreshold {
+                epoch: 0,
+                threshold: 2,
+                fault_bound: 1,
+            })
         ));
     }
 
@@ -939,6 +1257,54 @@ mod tests {
     }
 
     #[test]
+    fn protocol_timeout_is_positive_and_bound_into_the_transport_network() {
+        let baseline_scenario = scenario();
+        let baseline = baseline_scenario.quic_network_id().unwrap();
+
+        let mut changed = baseline_scenario.clone();
+        changed.protocol_timeout_seconds = changed.protocol_timeout_seconds.checked_add(1).unwrap();
+        changed.validate().unwrap();
+        assert_ne!(changed.quic_network_id().unwrap(), baseline);
+
+        let mut zero = baseline_scenario;
+        zero.protocol_timeout_seconds = 0;
+        assert!(matches!(zero.validate(), Err(ConfigError::InvalidProtocolTimeout)));
+
+        let maximum_seconds = (u64::MAX - MAX_SUPPORTED_UNIX_MILLISECONDS)
+            / (1_u64 << MAX_BFT_VIEW_TIMEOUT_SHIFT)
+            / 1_000;
+        let mut maximum = scenario();
+        maximum.protocol_timeout_seconds = maximum_seconds;
+        maximum.validate().unwrap();
+
+        let mut overflow = maximum;
+        overflow.protocol_timeout_seconds = maximum_seconds + 1;
+        assert!(matches!(overflow.validate(), Err(ConfigError::InvalidProtocolTimeout)));
+    }
+
+    #[test]
+    fn non_demo_proactive_refresh_interval_enforces_storage_rate_floor() {
+        assert_eq!(MIN_NON_DEMO_PROACTIVE_REFRESH_INTERVAL_SECONDS, 3_600);
+
+        let mut below_minimum = scenario();
+        below_minimum.demo_only = false;
+        below_minimum.proactive_refresh_interval_seconds = 3_599;
+        assert!(matches!(
+            below_minimum.validate(),
+            Err(ConfigError::NonDemoProactiveRefreshIntervalTooShort)
+        ));
+
+        let mut minimum = scenario();
+        minimum.demo_only = false;
+        minimum.proactive_refresh_interval_seconds = 3_600;
+        minimum.validate().unwrap();
+
+        let mut demo_regtest = scenario();
+        demo_regtest.proactive_refresh_interval_seconds = 1;
+        demo_regtest.validate().unwrap();
+    }
+
+    #[test]
     fn rejects_zero_deposit_fee_policy() {
         let mut invalid = scenario();
         invalid.deposit_maximum_fee_atomic_units = 0;
@@ -1018,7 +1384,7 @@ mod tests {
                 scenario.party(member.id).unwrap().bootstrap_encryption_key.0
             );
         }
-        assert!(scenario.configured_key_rotation_target_policy(&genesis).unwrap().is_none());
+        assert!(scenario.configured_key_rotation_target_shape(&genesis).unwrap().is_none());
 
         let mut invalid = scenario.clone();
         invalid.parties[0].bootstrap_encryption_key = Hex32([0_u8; 32]);
@@ -1034,6 +1400,61 @@ mod tests {
     }
 
     #[test]
+    fn bootstrap_accumulator_commits_every_configured_party_including_spares() {
+        let scenario = scenario();
+        scenario.validate().unwrap();
+        let network = scenario.quic_network_id().unwrap();
+        let commitment = scenario.bootstrap_receiver_key_accumulator(network).unwrap();
+
+        let all_bootstrap_keys = scenario
+            .parties
+            .iter()
+            .map(|party| (party.id, party.bootstrap_encryption_key.0))
+            .collect::<Vec<_>>();
+        let expected =
+            ReceiverKeyAccumulatorCommitment::from_bootstrap_keys(network, &all_bootstrap_keys)
+                .unwrap();
+        assert_eq!(commitment, expected);
+
+        let genesis = scenario.genesis_committee().unwrap();
+        let genesis_only = genesis
+            .members
+            .iter()
+            .map(|member| (member.id, member.encryption_key))
+            .collect::<Vec<_>>();
+        let missing_spare =
+            ReceiverKeyAccumulatorCommitment::from_bootstrap_keys(network, &genesis_only).unwrap();
+        assert_ne!(commitment, missing_spare);
+
+        let mut reordered = scenario;
+        reordered.parties.reverse();
+        assert_eq!(
+            commitment,
+            reordered.bootstrap_receiver_key_accumulator(network).unwrap(),
+            "scenario ordering must not alter the bootstrap accumulator"
+        );
+    }
+
+    #[test]
+    fn configured_policy_requires_an_explicit_authenticated_source_accumulator() {
+        let scenario = reconfiguration_scenario();
+        scenario.validate().unwrap();
+        let source = scenario.genesis_committee().unwrap();
+        let source_receiver_keys = scenario
+            .bootstrap_receiver_key_accumulator(scenario.quic_network_id().unwrap())
+            .unwrap();
+        let policy = scenario
+            .configured_key_rotation_target_policy(&source, source_receiver_keys)
+            .unwrap()
+            .expect("configured grow policy");
+
+        assert_eq!(policy.target_epoch(), 1);
+        assert_eq!(policy.desired_n(), 7);
+        assert_eq!(policy.target_fault_bound(), 1);
+        assert_eq!(policy.eligible().n(), 8);
+    }
+
+    #[test]
     fn configured_rotation_policy_materializes_spare_backed_eligible_pools() {
         let scenario = reconfiguration_scenario();
         scenario.validate().unwrap();
@@ -1044,13 +1465,13 @@ mod tests {
         }
         source.validate().unwrap();
         let grow = scenario
-            .configured_key_rotation_target_policy(&source)
+            .configured_key_rotation_target_shape(&source)
             .unwrap()
-            .expect("configured grow policy");
+            .expect("configured grow shape");
         assert_eq!(grow.eligible().epoch, 1);
         assert_eq!(grow.eligible().threshold, 4);
         assert_eq!(grow.target_fault_bound(), 1);
-        assert_eq!(grow.selection_size(), 7);
+        assert_eq!(grow.desired_n(), 7);
         for party in 1..=8 {
             let party = PartyId(party);
             assert_eq!(
@@ -1077,9 +1498,13 @@ mod tests {
         }
         certified_grow.validate().unwrap();
         let shrink = scenario
-            .configured_key_rotation_target_policy(&certified_grow)
+            .configured_key_rotation_target_shape(&certified_grow)
             .unwrap()
-            .expect("configured shrink policy");
+            .expect("configured shrink shape");
+        assert_eq!(shrink.eligible().threshold, 3);
+        assert_eq!(shrink.desired_n(), 5);
+        assert_eq!(shrink.target_fault_bound(), 1);
+        assert_eq!(shrink.eligible().n(), 6);
         assert_eq!(
             shrink.eligible().members.iter().map(|member| member.id).collect::<Vec<_>>(),
             vec![PartyId(2), PartyId(3), PartyId(4), PartyId(6), PartyId(7), PartyId(8),]
@@ -1100,11 +1525,11 @@ mod tests {
     fn configured_party_can_reenter_only_through_the_fresh_advertisement_pool() {
         let mut scenario = reconfiguration_scenario();
         scenario.committees[1].members.retain(|party| *party != PartyId(1));
+        scenario.committees[2].members.retain(|party| *party != PartyId(2));
         scenario.committees[2].members.push(PartyId(1));
         scenario.committees[2].members.sort_unstable();
         scenario.committees[2].eligible_members.push(PartyId(1));
         scenario.committees[2].eligible_members.sort_unstable();
-        scenario.committees[2].old_dealers.retain(|party| *party != PartyId(1));
         scenario.validate().unwrap();
     }
 }

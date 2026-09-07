@@ -46,7 +46,7 @@ fn test_weighted_inner_product() {
     assert_eq!(generators.len(), i);
     let mut g_bold = vec![];
     let mut h_bold = vec![];
-    for i in 0 .. i {
+    for i in 0..i {
       g_bold.push(generators.generator(GeneratorsList::GBold, i));
       h_bold.push(generators.generator(GeneratorsList::HBold, i));
     }
@@ -60,20 +60,20 @@ fn test_weighted_inner_product() {
     let y = Scalar::random(&mut OsRng).into();
     let mut y_vec = ScalarVector::new(g_bold.len());
     y_vec[0] = y;
-    for i in 1 .. y_vec.len() {
+    for i in 1..y_vec.len() {
       y_vec[i] = y_vec[i - 1] * y;
     }
 
-    for i in 0 .. i {
+    for i in 0..i {
       a[i] = Scalar::random(&mut OsRng).into();
       b[i] = Scalar::random(&mut OsRng).into();
     }
 
     #[allow(non_snake_case)]
-    let P = g_bold.multiexp(&a) +
-      h_bold.multiexp(&b) +
-      (g * a.clone().weighted_inner_product(&b, &y_vec)) +
-      (h * alpha);
+    let P = g_bold.multiexp(&a)
+      + h_bold.multiexp(&b)
+      + (g * a.clone().weighted_inner_product(&b, &y_vec))
+      + (h * alpha);
 
     let statement = WipStatement::new(generators, P, y);
     let witness = WipWitness::new(a, b, alpha).unwrap();

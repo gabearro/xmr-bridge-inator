@@ -43,10 +43,11 @@ impl Decoys {
   /// This is not a public function as it is not part of our API commitment.
   #[doc(hidden)]
   pub fn ct_eq(&self, other: &Self) -> Choice {
-    let ring = self.ring.len().ct_eq(&other.ring.len()) &
-      self.ring.iter().zip(&other.ring).fold(Choice::from(1u8), |accum, (lhs, rhs)| {
-        accum & lhs.as_slice().ct_eq(rhs.as_slice())
-      });
+    let ring =
+      self.ring.len().ct_eq(&other.ring.len())
+        & self.ring.iter().zip(&other.ring).fold(Choice::from(1u8), |accum, (lhs, rhs)| {
+          accum & lhs.as_slice().ct_eq(rhs.as_slice())
+        });
     self.offsets.ct_eq(&other.offsets) & self.signer_index.ct_eq(&other.signer_index) & ring
   }
 
@@ -83,10 +84,10 @@ impl Decoys {
     }
 
     bool::from(
-      ring_len_does_not_exceed_max &
-        signer_index_points_to_ring_member &
-        offsets_align_with_ring &
-        offsets_representable,
+      ring_len_does_not_exceed_max
+        & signer_index_points_to_ring_member
+        & offsets_align_with_ring
+        & offsets_representable,
     )
     .then_some(Decoys { offsets, signer_index, ring })
   }
@@ -110,7 +111,7 @@ impl Decoys {
   pub fn positions(&self) -> Vec<u64> {
     let mut res = Vec::with_capacity(self.len());
     res.push(self.offsets[0]);
-    for m in 1 .. self.len() {
+    for m in 1..self.len() {
       res.push(res[m - 1] + self.offsets[m]);
     }
     res

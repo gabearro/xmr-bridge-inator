@@ -21,7 +21,7 @@ static H_POW_2_CELL: LazyLock<[EdwardsPoint; 64]> = LazyLock::new(|| {
   #[allow(non_snake_case)]
   let H = CompressedEdwardsY(monero_ed25519::CompressedPoint::H.to_bytes()).decompress().unwrap();
   let mut res = [H; 64];
-  for i in 1 .. 64 {
+  for i in 1..64 {
     res[i] = res[i - 1] + res[i - 1];
   }
   res
@@ -70,7 +70,7 @@ impl BorromeanSignatures {
   fn verify(&self, keys_a: &[EdwardsPoint], keys_b: &[EdwardsPoint]) -> bool {
     let mut transcript = [0; 2048];
 
-    for i in 0 .. 64 {
+    for i in 0..64 {
       #[allow(non_snake_case)]
       let LL = EdwardsPoint::vartime_double_scalar_mul_basepoint(
         &self.ee.into(),
@@ -83,7 +83,7 @@ impl BorromeanSignatures {
         &keys_b[i],
         &self.s1[i].ref10_slide_scalar_vartime().into(),
       );
-      transcript[(i * 32) .. ((i + 1) * 32)].copy_from_slice(&LV.compress().to_bytes());
+      transcript[(i * 32)..((i + 1) * 32)].copy_from_slice(&LV.compress().to_bytes());
     }
 
     Scalar::hash(transcript) == self.ee
@@ -131,7 +131,7 @@ impl BorromeanRange {
     #[allow(non_snake_case)]
     let H_pow_2 = H_pow_2();
     let mut commitments_sub_one = [EdwardsPoint::identity(); 64];
-    for i in 0 .. 64 {
+    for i in 0..64 {
       commitments_sub_one[i] = bit_commitments[i] - H_pow_2[i];
     }
 

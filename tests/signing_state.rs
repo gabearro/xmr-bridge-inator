@@ -1,4 +1,7 @@
-use std::{collections::HashMap, io::Cursor};
+use std::{
+    collections::{BTreeMap, HashMap},
+    io::Cursor,
+};
 
 use curve25519_dalek::{
     EdwardsPoint, Scalar as DalekScalar,
@@ -20,10 +23,14 @@ use monero_wallet::{
     ringct::{RctType, clsag::Decoys},
     send::{Change, Eventuality, SendError, SignableTransaction},
 };
-use rand_chacha::{ChaCha20Rng, rand_core::SeedableRng};
+use rand_chacha::{
+    ChaCha20Rng,
+    rand_core::{CryptoRng, Error as RandError, RngCore, SeedableRng},
+};
 use threshold_monero::{
     Committee, Member, PartyId, SessionId,
     committee::CommitteeError,
+    keys::{EpochShare, EpochShareMaterial, PointBytes, ScalarBytes},
     signing::{
         BoundPreprocessMessage, BoundSignatureShareMessage, CanonicalSignerSet, FrostlassSigner,
         MAX_FROSTLASS_MESSAGE_BYTES, PreprocessMessage, ProofVerifiedKeyImagePreview,
@@ -89,6 +96,52 @@ fn threshold_keys() -> Vec<ThresholdKeys<Ed25519>> {
         })
         .collect()
 }
+
+fn epoch_share(committee: Committee, local_party: PartyId, slope: u64) -> EpochShare {
+    let constant = DalekScalar::from(42_u64);
+    let slope = DalekScalar::from(slope);
+    let verification_shares = committee
+        .members
+        .iter()
+        .map(|member| {
+            let index = DalekScalar::from(u64::from(committee.frost_index(member.id).unwrap()));
+            let share = constant + (slope * index);
+            (member.id, PointBytes((ED25519_BASEPOINT_POINT * share).compress().to_bytes()))
+        })
+        .collect::<BTreeMap<_, _>>();
+    let local_index = DalekScalar::from(u64::from(committee.frost_index(local_party).unwrap()));
+    EpochShare::from_material(EpochShareMaterial {
+        key_id: [71; 32],
+        committee,
+        local_party,
+        secret_share: ScalarBytes((constant + (slope * local_index)).to_bytes()),
+        verification_shares,
+        group_key: PointBytes((ED25519_BASEPOINT_POINT * constant).compress().to_bytes()),
+    })
+    .unwrap()
+}
+
+struct RejectNonceRng;
+
+impl RngCore for RejectNonceRng {
+    fn next_u32(&mut self) -> u32 {
+        panic!("stale epoch key validation reached nonce generation")
+    }
+
+    fn next_u64(&mut self) -> u64 {
+        panic!("stale epoch key validation reached nonce generation")
+    }
+
+    fn fill_bytes(&mut self, _destination: &mut [u8]) {
+        panic!("stale epoch key validation reached nonce generation")
+    }
+
+    fn try_fill_bytes(&mut self, _destination: &mut [u8]) -> Result<(), RandError> {
+        panic!("stale epoch key validation reached nonce generation")
+    }
+}
+
+impl CryptoRng for RejectNonceRng {}
 
 fn malformed_keys(
     local_participant: Participant,
@@ -521,6 +574,41 @@ fn rejects_inconsistent_threshold_keys_before_nonce_generation() {
 }
 
 #[test]
+fn authenticated_successor_epoch_rejects_old_refresh_share_before_preprocess_generation() {
+    let old_committee = committee();
+    let mut successor_committee = old_committee.clone();
+    successor_committee.epoch += 1;
+    for member in &mut successor_committee.members {
+        member.encryption_key[0] = member.encryption_key[0].wrapping_add(64);
+    }
+
+    // A proactive refresh preserves the constant term while replacing every non-constant
+    // coefficient. The old share is therefore internally valid and has the right wallet key, but
+    // its complete verification table is not valid for the authenticated successor epoch.
+    let old = epoch_share(old_committee, PARTIES[0], 17);
+    let successor = epoch_share(successor_committee, PARTIES[0], 29);
+    assert_eq!(old.group_key_bytes(), successor.group_key_bytes());
+    assert_ne!(old.public().verification_shares, successor.public().verification_shares);
+    assert_ne!(old.activation_digest().unwrap(), successor.activation_digest().unwrap());
+
+    let transaction = signable_transaction(&successor.to_threshold_keys().unwrap());
+    let mut reject_nonce_rng = RejectNonceRng;
+    let result = FrostlassSigner::start_in_authenticated_epoch_session(
+        transaction,
+        &old,
+        &successor.public(),
+        PARTIES[0],
+        [PARTIES[0], PARTIES[2]],
+        SessionId([113; 32]),
+        &mut reject_nonce_rng,
+    );
+    assert!(matches!(
+        result,
+        Err(SigningError::EpochKeyMismatch { expected_epoch: 8, supplied_epoch: 7 })
+    ));
+}
+
+#[test]
 fn rejects_noncanonical_signer_sets() {
     let committee = committee();
 
@@ -572,6 +660,34 @@ fn durable_preprocess_shape_parser_matches_the_live_monero_wallet_encoding() {
 
     assert_eq!(validate_frostlass_preprocess_shape(PARTIES[0], first.message(), 2).unwrap(), 512);
     assert_eq!(validate_frostlass_preprocess_shape(PARTIES[2], third.message(), 2).unwrap(), 512);
+
+    // Warm successful replays must still bind every point, scalar, and the input count.
+    for _ in 0..2 {
+        assert_eq!(
+            validate_frostlass_preprocess_shape(PARTIES[0], first.message(), 2).unwrap(),
+            512
+        );
+        assert_eq!(
+            validate_frostlass_preprocess_shape(PARTIES[2], third.message(), 2).unwrap(),
+            512
+        );
+    }
+    assert!(matches!(
+        validate_frostlass_preprocess_shape(PARTIES[0], first.message(), 1),
+        Err(SigningError::WrongMessageLength { expected: 256, actual: 512, .. })
+    ));
+    for field in 0..16 {
+        let mut corrupt = first.message().as_bytes().to_vec();
+        corrupt[field * 32..(field + 1) * 32].fill(0xff);
+        let corrupt = PreprocessMessage::from_bytes(corrupt);
+        for _ in 0..2 {
+            assert!(matches!(
+                validate_frostlass_preprocess_shape(PARTIES[0], &corrupt, 2),
+                Err(SigningError::MalformedMessage { kind: SigningMessageKind::Preprocess, .. })
+            ));
+        }
+    }
+    assert_eq!(validate_frostlass_preprocess_shape(PARTIES[0], first.message(), 2).unwrap(), 512);
 
     let mut identity_commitment = first.message().as_bytes().to_vec();
     identity_commitment[..32]

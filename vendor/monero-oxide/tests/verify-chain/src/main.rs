@@ -101,8 +101,8 @@ async fn check_block<T: HttpTransport>(rpc: MoneroDaemon<T>, block_i: usize) {
           // making sure the verification functions are valid is appreciated
           match &proofs.prunable {
             RctPrunable::AggregateMlsagBorromean { .. } | RctPrunable::MlsagBorromean { .. } => {}
-            RctPrunable::MlsagBulletproofs { bulletproof, .. } |
-            RctPrunable::MlsagBulletproofsCompactAmount { bulletproof, .. } => {
+            RctPrunable::MlsagBulletproofs { bulletproof, .. }
+            | RctPrunable::MlsagBulletproofsCompactAmount { bulletproof, .. } => {
               assert!(bulletproof.batch_verify(
                 &mut rand_core::OsRng,
                 &mut batch,
@@ -250,7 +250,7 @@ async fn main() {
   };
   let main_rpc = rpc(nodes[0].clone()).await;
   let mut rpcs = vec![];
-  for i in 0 .. async_parallelism {
+  for i in 0..async_parallelism {
     rpcs.push(rpc(nodes[i % nodes.len()].clone()).await);
   }
 
